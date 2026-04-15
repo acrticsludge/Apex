@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.log
+apex_dual_state.json
+*.md
+apex_trading_agent.py

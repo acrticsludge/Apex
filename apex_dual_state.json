@@ -1,0 +1,23 @@
+{
+  "india": {
+    "cash": 50000.0,
+    "positions": {},
+    "realised_pnl": 0.0,
+    "wins": 0,
+    "losses": 0,
+    "peak_portfolio": 50000.0,
+    "max_drawdown": 0.0,
+    "trade_log": []
+  },
+  "us": {
+    "cash": 1800.0,
+    "positions": {},
+    "realised_pnl": 0.0,
+    "wins": 0,
+    "losses": 0,
+    "peak_portfolio": 1800.0,
+    "max_drawdown": 0.0,
+    "trade_log": []
+  },
+  "started_at": "2026-04-13T15:46:59.026735"
+}

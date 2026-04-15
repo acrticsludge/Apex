@@ -1,0 +1,29 @@
+2026-04-13 17:30:54,344 [INFO] Agent start requested via dashboard
+2026-04-13 17:30:57,884 [WARNING] Start requested but agent already running
+2026-04-13 17:31:00,146 [WARNING] Start requested but agent already running
+2026-04-13 17:31:08,744 [WARNING] Start requested but agent already running
+2026-04-13 17:31:20,402 [INFO] Agent stop requested via dashboard
+2026-04-13 17:31:29,931 [INFO] Agent stop requested via dashboard
+2026-04-13 17:31:56,055 [INFO] Agent stop requested via dashboard
+2026-04-13 17:31:57,767 [INFO] Agent paused via dashboard
+2026-04-13 17:32:03,848 [INFO] Agent resumed via dashboard
+2026-04-13 17:32:07,684 [INFO] Agent stop requested via dashboard
+2026-04-13 17:32:32,980 [INFO] Agent stop requested via dashboard
+2026-04-13 17:33:29,548 [INFO] Agent start requested via dashboard
+2026-04-13 17:33:29,549 [INFO] Agent started — dual-market cycle active
+2026-04-13 17:33:29,550 [INFO] Cycle  India=closed  US=closed
+2026-04-13 17:33:29,550 [DEBUG] India market closed — skipping
+2026-04-13 17:33:29,550 [DEBUG] US market closed — skipping
+2026-04-13 17:33:29,551 [INFO] State saved to disk
+2026-04-13 17:33:29,552 [INFO] Waiting 15 min — next check at 17:48
+2026-04-13 17:33:37,506 [INFO] Agent paused via dashboard
+2026-04-13 17:33:41,442 [INFO] Agent resumed via dashboard
+2026-04-13 17:33:43,908 [INFO] Agent stop requested via dashboard
+2026-04-13 17:33:44,555 [INFO] Agent stopped
+2026-04-13 17:33:52,228 [INFO] Agent start requested via dashboard
+2026-04-13 17:33:52,233 [INFO] Agent started — dual-market cycle active
+2026-04-13 17:33:52,234 [INFO] Cycle  India=closed  US=closed
+2026-04-13 17:33:52,240 [DEBUG] India market closed — skipping
+2026-04-13 17:33:52,244 [DEBUG] US market closed — skipping
+2026-04-13 17:33:52,245 [INFO] State saved to disk
+2026-04-13 17:33:52,245 [INFO] Waiting 15 min — next check at 17:48

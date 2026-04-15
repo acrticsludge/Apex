@@ -1,0 +1,2245 @@
+"""
+Apex Dashboard — Local Web Management Interface
+================================================
+Run:   pip install flask yfinance pandas numpy
+       python apex_dashboard.py
+Open:  http://localhost:7000
+
+Controls everything end-to-end:
+  • Start / Stop / Pause the trading agent
+  • Live positions with manual Sell buttons
+  • Signal board for both markets
+  • Settings panel (risk, SL, target, intervals)
+  • Full trade log
+"""
+
+import threading
+import json
+import os
+import time
+import warnings
+import logging
+from collections import deque
+from datetime import datetime, timezone, timedelta
+from flask import Flask, jsonify, request, render_template_string, session, redirect
+import yfinance as yf
+import pandas as pd
+import numpy as np
+
+warnings.filterwarnings("ignore")
+
+# ─── SUPABASE CLIENT ──────────────────────────────────────────────────────────
+try:
+    from supabase import create_client as _sb_create
+    _SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+    _SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
+    _sb = _sb_create(_SUPABASE_URL, _SUPABASE_KEY) if (_SUPABASE_URL and _SUPABASE_KEY) else None
+except ImportError:
+    _sb = None
+
+# ─── CONFIG (mutable at runtime via /api/config) ─────────────────────────────
+
+cfg = {
+    "india_capital":        50_000,
+    "us_capital":            1_800,
+    "india_max_positions":       4,
+    "us_max_positions":          4,
+    "risk_per_trade":         0.12,
+    "confidence_threshold":     62,
+    "stop_loss_pct":          0.03,
+    "target_pct":            0.045,
+    "check_interval_min":        3,
+    "idle_interval_min":        15,
+    "eod_harvest_min":          30,   # sell profitable positions this many min before close
+    "eod_exit_min":             15,   # force-exit everything this many min before close
+    "state_file":  "apex_dual_state.json",
+}
+
+INDIA_WATCHLIST = [
+    "RELIANCE.NS",   "TCS.NS",        "HDFCBANK.NS",   "INFY.NS",
+    "ICICIBANK.NS",  "HINDUNILVR.NS", "ITC.NS",        "SBIN.NS",
+    "BHARTIARTL.NS", "KOTAKBANK.NS",  "LT.NS",         "AXISBANK.NS",
+    "MARUTI.NS",     "TITAN.NS",      "WIPRO.NS",      "SUNPHARMA.NS",
+]
+US_WATCHLIST = [
+    "AAPL",  "MSFT",  "NVDA",  "GOOGL",
+    "AMZN",  "META",  "TSLA",  "AMD",
+    "NFLX",  "ORCL",  "INTC",  "CRM",
+    "UBER",  "SHOP",  "PYPL",  "PLTR",
+]
+
+IST = timezone(timedelta(hours=5,  minutes=30))
+EDT = timezone(timedelta(hours=-4))
+
+# ─── AGENT LOGGER ─────────────────────────────────────────────────────────────
+
+_log_buffer: deque = deque(maxlen=500)
+
+class _BufHandler(logging.Handler):
+    def emit(self, record):
+        _log_buffer.append({
+            "ts":    datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(timespec="seconds"),
+            "level": record.levelname,
+            "msg":   record.getMessage(),
+        })
+
+apex_log = logging.getLogger("apex")
+apex_log.setLevel(logging.DEBUG)
+if not apex_log.handlers:
+    _fh = logging.FileHandler("apex.log", encoding="utf-8")
+    _fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    apex_log.addHandler(_fh)
+    apex_log.addHandler(_BufHandler())
+
+# ─── SHARED STATE ─────────────────────────────────────────────────────────────
+
+_lock    = threading.Lock()
+_state   = {}                       # trading state (loaded from Supabase on startup)
+_signals = {                        # latest scan results
+    "india": [], "us": [],
+    "india_prices": {}, "us_prices": {},
+}
+_agent   = {
+    "running": False, "paused": False,
+    "status":  "idle", "last_update": None, "next_check": None,
+    "india_open": False, "us_open": False,
+}
+
+# ── Shared price store (Thread 1 writes, Thread 2 snapshots) ──────────────────
+_latest_prices: dict = {}
+_price_lock = threading.Lock()
+
+# ─── MARKET HOURS ─────────────────────────────────────────────────────────────
+
+def is_india_open() -> bool:
+    n = datetime.now(IST)
+    if n.weekday() >= 5:
+        return False
+    return (n.replace(hour=9,  minute=15, second=0, microsecond=0)
+            <= n <=
+            n.replace(hour=15, minute=30, second=0, microsecond=0))
+
+def is_us_open() -> bool:
+    n = datetime.now(EDT)
+    if n.weekday() >= 5:
+        return False
+    return (n.replace(hour=9,  minute=30, second=0, microsecond=0)
+            <= n <=
+            n.replace(hour=16, minute=0,  second=0, microsecond=0))
+
+def minutes_to_close(market_key: str):
+    """Returns minutes remaining until market close, or None if market is not currently open."""
+    if market_key == "india":
+        n       = datetime.now(IST)
+        open_t  = n.replace(hour=9,  minute=15, second=0, microsecond=0)
+        close_t = n.replace(hour=15, minute=30, second=0, microsecond=0)
+    else:
+        n       = datetime.now(EDT)
+        open_t  = n.replace(hour=9,  minute=30, second=0, microsecond=0)
+        close_t = n.replace(hour=16, minute=0,  second=0, microsecond=0)
+    if n.weekday() >= 5 or n < open_t or n > close_t:
+        return None
+    return (close_t - n).total_seconds() / 60
+
+# ─── DATA FETCHING ────────────────────────────────────────────────────────────
+
+def fetch_data(symbol: str):
+    try:
+        df = yf.download(symbol, period="5d", interval="5m",
+                         progress=False, auto_adjust=True)
+        if df.empty or len(df) < 30:
+            return None
+        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+        return df.rename(columns=str.lower).dropna()
+    except Exception:
+        return None
+
+def get_price(symbol: str):
+    try:
+        return float(yf.Ticker(symbol).fast_info.last_price)
+    except Exception:
+        df = fetch_data(symbol)
+        return float(df["close"].iloc[-1]) if df is not None else None
+
+def fetch_prices(symbols: list) -> dict:
+    try:
+        data = yf.download(" ".join(symbols), period="1d", interval="1m",
+                           progress=False, auto_adjust=True, group_by="ticker")
+        result = {}
+        for sym in symbols:
+            try:
+                if sym in data.columns.get_level_values(0):
+                    result[sym] = float(data[sym]["Close"].dropna().iloc[-1])
+                else:
+                    result[sym] = float(data["Close"].dropna().iloc[-1])
+            except Exception:
+                pass
+        return result
+    except Exception:
+        return {}
+
+# ─── THREAD 1: PRICE UPDATER (every 10 s) ────────────────────────────────────
+
+def _price_updater():
+    """Continuously polls yfinance every 10 s and writes to _latest_prices."""
+    all_symbols = INDIA_WATCHLIST + US_WATCHLIST
+    tickers     = " ".join(all_symbols)
+    sym_set     = set(all_symbols)
+    while True:
+        try:
+            data = yf.download(tickers, period="1d", interval="1m",
+                               progress=False, auto_adjust=True)
+            if not data.empty:
+                close = data["Close"]
+                fresh = {}
+                for sym in all_symbols:
+                    try:
+                        col = close[sym] if isinstance(close, pd.DataFrame) else close
+                        fresh[sym] = float(col.dropna().iloc[-1])
+                    except Exception:
+                        pass
+                if fresh:
+                    with _price_lock:
+                        _latest_prices.update(fresh)
+                    apex_log.info(
+                        f"[PRICE] tick — {len(fresh)}/{len(all_symbols)} symbols refreshed"
+                    )
+        except Exception as e:
+            apex_log.warning(f"Price updater error: {e}")
+        time.sleep(10)
+
+# ─── INDICATORS ───────────────────────────────────────────────────────────────
+
+def calc_rsi(close, p=14) -> float:
+    d = close.diff()
+    g = d.clip(lower=0).rolling(p).mean()
+    l = (-d.clip(upper=0)).rolling(p).mean()
+    return float((100 - 100 / (1 + g / l)).iloc[-1])
+
+def calc_macd(close):
+    e12  = close.ewm(span=12, adjust=False).mean()
+    e26  = close.ewm(span=26, adjust=False).mean()
+    line = e12 - e26
+    sig  = line.ewm(span=9, adjust=False).mean()
+    return float(line.iloc[-1]), float(sig.iloc[-1]), float((line - sig).iloc[-1])
+
+def calc_bb(close, p=20):
+    m = close.rolling(p).mean()
+    s = close.rolling(p).std()
+    return float((m + 2*s).iloc[-1]), float(m.iloc[-1]), float((m - 2*s).iloc[-1])
+
+def calc_ema(close, p) -> float:
+    return float(close.ewm(span=p, adjust=False).mean().iloc[-1])
+
+def calc_vol_ratio(volume, p=20) -> float:
+    avg = volume.rolling(p).mean().iloc[-1]
+    return float(volume.iloc[-1] / avg) if avg > 0 else 1.0
+
+# ─── SIGNAL ENGINE ────────────────────────────────────────────────────────────
+
+def analyse(symbol: str, df, live_price: float) -> dict:
+    close  = df["close"].astype(float)
+    volume = df["volume"].astype(float)
+    price  = live_price or float(close.iloc[-1])
+    sigs   = {}
+    score  = 0
+
+    r = calc_rsi(close)
+    sigs["RSI"] = {"value": f"{r:.1f}",
+                   "signal": ("OVERSOLD BUY" if r < 30 else
+                               "OVERBOUGHT SELL" if r > 70 else
+                               "Mildly bullish" if r < 50 else "Mildly bearish")}
+    score += 25 if r < 30 else -25 if r > 70 else 8 if r < 50 else -8
+
+    bu, bm, bl = calc_bb(close)
+    sigs["BB"] = {"value": f"U:{bu:.0f} L:{bl:.0f}",
+                  "signal": ("Below band BUY" if price < bl else
+                              "Above band SELL" if price > bu else "Inside band HOLD")}
+    score += 20 if price < bl else -20 if price > bu else 0
+
+    ml, ms, mh = calc_macd(close)
+    sigs["MACD"] = {"value": f"H:{mh:.2f}",
+                    "signal": ("Bullish BUY"  if mh > 0 and ml > ms else
+                                "Bearish SELL" if mh < 0 and ml < ms else "Neutral HOLD")}
+    score += 20 if (mh > 0 and ml > ms) else -20 if (mh < 0 and ml < ms) else 0
+
+    e9, e21 = calc_ema(close, 9), calc_ema(close, 21)
+    sigs["EMA"] = {"value": f"9:{e9:.0f} 21:{e21:.0f}",
+                   "signal": "Bull BUY" if e9 > e21 else "Bear SELL"}
+    score += 20 if e9 > e21 else -20
+
+    vr = calc_vol_ratio(volume)
+    sigs["Vol"] = {"value": f"{vr:.2f}x",
+                   "signal": ("High confirms" if vr > 1.5 else
+                               "Low volume"   if vr < 0.7 else "Normal")}
+    score += 15 if vr > 1.5 else -5 if vr < 0.7 else 0
+
+    return {
+        "symbol":     symbol,
+        "price":      price,
+        "score":      score,
+        "confidence": round(min(100, max(0, (score + 100) / 2)), 1),
+        "signals":    sigs,
+        "rsi":        r,
+        "bb_upper":   bu,
+        "bb_lower":   bl,
+    }
+
+# ─── STATE MANAGEMENT ─────────────────────────────────────────────────────────
+
+def _empty_mstate(capital: float, session_date: str = None) -> dict:
+    return {
+        "cash":               float(capital),
+        "positions":          {},
+        "realised_pnl":       0.0,
+        "wins":               0,
+        "losses":             0,
+        "peak_portfolio":     float(capital),
+        "max_drawdown":       0.0,
+        "trade_log":          [],
+        "session_date":       session_date or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "session_start_cash": float(capital),
+    }
+
+def _normalize_state(st: dict) -> dict:
+    """Backfill keys that were added after a state was first persisted."""
+    st.setdefault("sessions", [])
+    for mkt in ("india", "us"):
+        if mkt not in st:
+            continue
+        if "session_date" not in st[mkt]:
+            tz = IST if mkt == "india" else EDT
+            st[mkt]["session_date"] = datetime.now(tz).strftime("%Y-%m-%d")
+        if "session_start_cash" not in st[mkt]:
+            cap = cfg["india_capital"] if mkt == "india" else cfg["us_capital"]
+            st[mkt]["session_start_cash"] = float(cap)
+    return st
+
+def load_state() -> dict:
+    if _sb:
+        try:
+            resp = _sb.table("apex_state").select("data").eq("id", "singleton").execute()
+            if resp.data:
+                apex_log.info("State loaded from Supabase")
+                return _normalize_state(resp.data[0]["data"])
+        except Exception as e:
+            apex_log.warning(f"Supabase load error (falling back to JSON): {e}")
+    # JSON fallback (local dev / Supabase unavailable)
+    sf = cfg["state_file"]
+    if os.path.exists(sf):
+        try:
+            with open(sf) as f:
+                apex_log.info(f"State loaded from {sf}")
+                return _normalize_state(json.load(f))
+        except Exception as e:
+            apex_log.warning(f"JSON load error: {e}")
+    apex_log.info("Starting with fresh state")
+    return {
+        "india":      _empty_mstate(cfg["india_capital"], datetime.now(IST).strftime("%Y-%m-%d")),
+        "us":         _empty_mstate(cfg["us_capital"],    datetime.now(EDT).strftime("%Y-%m-%d")),
+        "sessions":   [],
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+def save_state(st: dict):
+    if _sb:
+        try:
+            _sb.table("apex_state").upsert({
+                "id":         "singleton",
+                "data":       json.loads(json.dumps(st, default=str)),
+                "updated_at": datetime.now().isoformat(),
+            }).execute()
+            return
+        except Exception as e:
+            apex_log.error(f"Supabase save error (falling back to JSON): {e}")
+    # JSON fallback
+    try:
+        with open(cfg["state_file"], "w") as f:
+            json.dump(st, f, indent=2, default=str)
+    except Exception as e:
+        apex_log.error(f"JSON save error: {e}")
+
+# ─── SESSION MANAGEMENT ───────────────────────────────────────────────────────
+
+def _close_session(market_key: str, prices: dict):
+    """Archive the current session and reset market state for the next day.
+    Must be called with _lock held. prices should be the latest price snapshot."""
+    tz      = IST if market_key == "india" else EDT
+    today   = datetime.now(tz).strftime("%Y-%m-%d")
+    mstate  = _state[market_key]
+    capital = cfg[f"{market_key}_capital"]
+    date    = mstate.get("session_date", today)
+    sym     = "₹" if market_key == "india" else "$"
+
+    # Force-close any remaining open positions (safety net — EOD should have cleared them)
+    for s in list(mstate["positions"].keys()):
+        price = prices.get(s) or mstate["positions"][s]["entry"]
+        execute_sell(s, price, "SESSION END", mstate)
+
+    start_c = mstate.get("session_start_cash", float(capital))
+    net_pnl = mstate["realised_pnl"]
+    n_trades = len(mstate["trade_log"])
+
+    record = {
+        "id":                  f"{market_key}_{date}",
+        "market":              market_key,
+        "date":                date,
+        "start_cash":          round(start_c, 2),
+        "end_cash":            round(mstate["cash"], 2),
+        "end_portfolio":       round(portfolio_value(mstate, prices), 2),
+        "net_pnl":             round(net_pnl, 2),
+        "pnl_pct":             round(net_pnl / start_c * 100, 2) if start_c > 0 else 0.0,
+        "wins":                mstate["wins"],
+        "losses":              mstate["losses"],
+        "n_trades":            n_trades,
+        "trades":              list(mstate["trade_log"]),
+        "archived_at":         datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+
+    sessions = _state.setdefault("sessions", [])
+    # Upsert: replace if same id (handles re-archiving same day)
+    idx = next((i for i, s in enumerate(sessions) if s["id"] == record["id"]), None)
+    if idx is not None:
+        sessions[idx] = record
+    else:
+        sessions.append(record)
+    if len(sessions) > 365:
+        _state["sessions"] = sessions[-365:]
+
+    tot = record["wins"] + record["losses"]
+    wr  = f"{record['wins']/tot*100:.0f}%" if tot else "—"
+    apex_log.info(
+        f"[SESSION] {market_key.upper()} {date} archived — "
+        f"P&L={sym}{net_pnl:+.0f} ({record['pnl_pct']:+.1f}%)  "
+        f"{record['wins']}W/{record['losses']}L  WR={wr}  {n_trades} trades"
+    )
+
+    # Reset for next session
+    _state[market_key] = _empty_mstate(capital, today)
+    apex_log.info(f"[SESSION] {market_key.upper()} reset — awaiting next session ({today})")
+
+
+def _check_session_rotation(prices: dict):
+    """If the calendar date has changed since the active session was started,
+    archive the old session and open a fresh one. Call with _lock held."""
+    for market_key in ("india", "us"):
+        tz        = IST if market_key == "india" else EDT
+        today     = datetime.now(tz).strftime("%Y-%m-%d")
+        sess_date = _state[market_key].get("session_date", today)
+        if sess_date == today:
+            continue
+        # Date rolled over
+        has_activity = (
+            _state[market_key]["wins"] + _state[market_key]["losses"] > 0
+            or len(_state[market_key]["trade_log"]) > 0
+        )
+        if has_activity:
+            apex_log.info(
+                f"[SESSION] New day for {market_key.upper()} "
+                f"({sess_date} → {today}) — archiving old session"
+            )
+            _close_session(market_key, prices)
+        else:
+            _state[market_key]["session_date"] = today
+            apex_log.debug(
+                f"[SESSION] {market_key.upper()} session date updated to {today} (no prior activity)"
+            )
+
+
+# ─── TRADE EXECUTION ──────────────────────────────────────────────────────────
+
+def log_trade(mstate: dict, msg: str, kind: str):
+    mstate["trade_log"].append({
+        "time":    datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "message": msg,
+        "kind":    kind,
+    })
+    if len(mstate["trade_log"]) > 200:
+        mstate["trade_log"] = mstate["trade_log"][-200:]
+
+def execute_buy(symbol: str, price: float, mstate: dict):
+    alloc = mstate["cash"] * cfg["risk_per_trade"]
+    qty   = max(1, int(alloc / price))
+    cost  = qty * price
+    if cost > mstate["cash"]:
+        return None
+    mstate["cash"] -= cost
+    mstate["positions"][symbol] = {
+        "qty":        qty,
+        "entry":      price,
+        "stop_loss":  round(price * (1 - cfg["stop_loss_pct"]), 2),
+        "target":     round(price * (1 + cfg["target_pct"]),    2),
+        "entered_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    sl  = price * (1 - cfg["stop_loss_pct"])
+    tgt = price * (1 + cfg["target_pct"])
+    log_trade(mstate,
+              f"BUY {qty} {symbol} @ {price:.2f}  SL:{sl:.2f}  T:{tgt:.2f}  Cost:{cost:.0f}",
+              "BUY")
+    apex_log.info(f"BUY  {qty}x {symbol} @ {price:.2f}  cost={cost:.0f}  SL={sl:.2f}  T={tgt:.2f}")
+    return qty
+
+def execute_sell(symbol: str, price: float, reason: str, mstate: dict):
+    pos = mstate["positions"].get(symbol)
+    if not pos:
+        return
+    pnl = (price - pos["entry"]) * pos["qty"]
+    mstate["cash"]         += pos["qty"] * price
+    mstate["realised_pnl"] += pnl
+    if pnl >= 0:
+        mstate["wins"]   += 1
+    else:
+        mstate["losses"] += 1
+    sign = "+" if pnl >= 0 else ""
+    log_trade(mstate,
+              f"SELL {pos['qty']} {symbol} @ {price:.2f}  P&L:{sign}{pnl:.0f}  ({reason})",
+              "SELL" if pnl >= 0 else "LOSS")
+    apex_log.info(f"SELL {pos['qty']}x {symbol} @ {price:.2f}  P&L={sign}{pnl:.0f}  reason={reason}")
+    del mstate["positions"][symbol]
+
+# ─── MARKET CYCLE ─────────────────────────────────────────────────────────────
+
+def fetch_cycle_data(watchlist: list, prices: dict) -> tuple:
+    """Phase 1: fetch OHLCV data (slow, no lock needed).
+    Prices come from the shared price-updater snapshot — never fetched mid-strategy."""
+    analyses = []
+    for symbol in watchlist:
+        df = fetch_data(symbol)
+        if df is None:
+            continue
+        live = prices.get(symbol) or float(df["close"].iloc[-1])
+        analyses.append(analyse(symbol, df, live))
+        time.sleep(0.2)
+    # Return only the symbols relevant to this watchlist
+    wl_prices = {s: prices[s] for s in watchlist if s in prices}
+    return analyses, wl_prices
+
+def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int):
+    """Phase 2: apply decisions to state (must be called with _lock held)."""
+    mstate       = _state[market_key]
+    mtc          = minutes_to_close(market_key)
+    harvest_min  = cfg["eod_harvest_min"]
+    exit_min     = cfg["eod_exit_min"]
+    _dc          = {"buy": 0, "sell": 0, "hold": 0, "watch": 0}
+    apex_log.info(
+        f"[{market_key.upper()}] think loop ▶  "
+        f"{len(analyses)} symbols scanned  "
+        f"{len(mstate['positions'])} positions open  "
+        f"cash={mstate['cash']:.0f}"
+    )
+
+    # ── EOD exit: runs before normal SL/target checks ────────────────────────
+    if mtc is not None:
+        for sym in list(mstate["positions"].keys()):
+            pos   = mstate["positions"].get(sym)
+            if not pos:
+                continue
+            price = prices.get(sym) or get_price(sym)
+            if price is None:
+                continue
+            pnl = (price - pos["entry"]) * pos["qty"]
+
+            if exit_min < mtc <= harvest_min and pnl > 0:
+                # Profit-harvest window: lock in any gains
+                paper_sell(sym, pos["qty"], prices, mstate, f"EOD PROFIT ({mtc:.0f}m to close)")
+                apex_log.info(f"EOD profit harvest: {sym}  P&L={pnl:+.0f}  {mtc:.0f}m left")
+
+            elif mtc <= exit_min:
+                # Force-exit window: close everything regardless
+                tag = "EOD EXIT" if pnl >= 0 else "EOD CUT LOSS"
+                paper_sell(sym, pos["qty"], prices, mstate, f"{tag} ({mtc:.0f}m to close)")
+                apex_log.info(f"EOD force exit: {sym}  P&L={pnl:+.0f}  {mtc:.0f}m left")
+
+    # ── Normal SL / target checks ─────────────────────────────────────────────
+    for sym in list(mstate["positions"].keys()):
+        pos   = mstate["positions"][sym]
+        if prices.get(sym) is None:
+            continue
+        price = prices[sym]
+        if price <= pos["stop_loss"]:
+            paper_sell(sym, pos["qty"], prices, mstate, "STOP LOSS")
+            _dc["sell"] += 1
+        elif price >= pos["target"]:
+            paper_sell(sym, pos["qty"], prices, mstate, "TARGET HIT")
+            _dc["sell"] += 1
+        else:
+            pnl_pct = (price - pos["entry"]) / pos["entry"] * 100
+            apex_log.debug(
+                f"[{market_key.upper()}] SL-CHECK HOLD  {sym}  "
+                f"price={price:.2f}  P&L={pnl_pct:+.1f}%  "
+                f"SL={pos['stop_loss']:.2f}  T={pos['target']:.2f}"
+            )
+
+    # ── Block new buys when EOD exit mode is active ───────────────────────────
+    if mtc is not None and mtc <= harvest_min:
+        apex_log.info(
+            f"[{market_key.upper()}] think loop ■  EOD mode  "
+            f"SELL:{_dc['sell']}  remaining pos={len(mstate['positions'])}"
+        )
+        return
+
+    open_pos = len(mstate["positions"])
+    for a in sorted(analyses, key=lambda x: x["confidence"], reverse=True):
+        sym    = a["symbol"]
+        in_pos = sym in mstate["positions"]
+        if (not in_pos
+                and a["confidence"] >= cfg["confidence_threshold"]
+                and a["score"] > 0
+                and open_pos < max_pos
+                and mstate["cash"] > a["price"] * 2):
+            if paper_buy(sym, 0, prices, mstate):
+                open_pos += 1
+                _dc["buy"] += 1
+        elif in_pos and a["score"] < -30:
+            paper_sell(sym, 0, prices, mstate, "SIGNAL EXIT")
+            _dc["sell"] += 1
+        else:
+            label = "HOLD" if in_pos else "WATCH"
+            apex_log.debug(
+                f"[{market_key.upper()}] {label}  {sym}  "
+                f"score={a['score']:+d}  conf={a['confidence']:.0f}%"
+            )
+            _dc["hold" if in_pos else "watch"] += 1
+
+    apex_log.info(
+        f"[{market_key.upper()}] think loop ■  "
+        f"BUY:{_dc['buy']}  SELL:{_dc['sell']}  "
+        f"HOLD:{_dc['hold']}  WATCH:{_dc['watch']}  "
+        f"cash={mstate['cash']:.0f}  pos={len(mstate['positions'])}"
+    )
+
+def portfolio_value(mstate: dict, prices: dict) -> float:
+    return mstate["cash"] + sum(
+        (prices.get(s) or p["entry"]) * p["qty"]
+        for s, p in mstate["positions"].items()
+    )
+
+def unrealised_pnl(mstate: dict, prices: dict) -> float:
+    return sum(
+        (prices.get(s, p["entry"]) - p["entry"]) * p["qty"]
+        for s, p in mstate["positions"].items()
+    )
+
+# ─── PAPER TRADING LAYER ──────────────────────────────────────────────────────
+
+def paper_buy(symbol: str, qty: int, latest_prices: dict, mstate: dict):
+    """Paper-trade a buy using the price from the snapshot.
+    qty is advisory; actual qty is computed from risk settings inside execute_buy."""
+    price = latest_prices.get(symbol)
+    if price is None:
+        apex_log.warning(f"paper_buy: no price for {symbol} in snapshot — skipping")
+        return None
+    return execute_buy(symbol, price, mstate)
+
+def paper_sell(symbol: str, qty: int, latest_prices: dict, mstate: dict, reason: str = "SIGNAL"):
+    """Paper-trade a sell using the price from the snapshot (falls back to live fetch)."""
+    price = latest_prices.get(symbol) or get_price(symbol)
+    if price is None:
+        apex_log.warning(f"paper_sell: no price for {symbol} — skipping")
+        return
+    execute_sell(symbol, price, reason, mstate)
+
+def get_summary(latest_prices: dict) -> dict:
+    """Return a snapshot summary of both paper portfolios at current prices."""
+    with _lock:
+        india_pv   = portfolio_value(_state["india"], latest_prices)
+        us_pv      = portfolio_value(_state["us"],    latest_prices)
+        india_upnl = unrealised_pnl(_state["india"],  latest_prices)
+        us_upnl    = unrealised_pnl(_state["us"],     latest_prices)
+        return {
+            "india": {
+                "cash":            round(_state["india"]["cash"], 2),
+                "portfolio_value": round(india_pv, 2),
+                "unrealised_pnl":  round(india_upnl, 2),
+                "realised_pnl":    round(_state["india"]["realised_pnl"], 2),
+                "open_positions":  len(_state["india"]["positions"]),
+                "wins":            _state["india"]["wins"],
+                "losses":          _state["india"]["losses"],
+            },
+            "us": {
+                "cash":            round(_state["us"]["cash"], 2),
+                "portfolio_value": round(us_pv, 2),
+                "unrealised_pnl":  round(us_upnl, 2),
+                "realised_pnl":    round(_state["us"]["realised_pnl"], 2),
+                "open_positions":  len(_state["us"]["positions"]),
+                "wins":            _state["us"]["wins"],
+                "losses":          _state["us"]["losses"],
+            },
+        }
+
+# ─── THREAD MANAGEMENT ────────────────────────────────────────────────────────
+
+_price_thread: threading.Thread = None
+
+def start_price_updater():
+    global _price_thread
+    if _price_thread and _price_thread.is_alive():
+        return
+    _price_thread = threading.Thread(target=_price_updater, daemon=True, name="apex-prices")
+    _price_thread.start()
+    apex_log.info("Price updater thread started (10 s interval)")
+
+# ─── AGENT THREAD ─────────────────────────────────────────────────────────────
+
+def agent_loop():
+    global _state
+    with _lock:
+        _state = load_state()
+    _agent["status"] = "running"
+    apex_log.info("Agent started — dual-market cycle active")
+
+    while _agent["running"]:
+        if _agent["paused"]:
+            _agent["status"] = "paused"
+            time.sleep(5)
+            continue
+
+        india_open = is_india_open()
+        us_open    = is_us_open()
+        _agent["india_open"] = india_open
+        _agent["us_open"]    = us_open
+
+        apex_log.info(
+            f"Cycle  India={'OPEN' if india_open else 'closed'}  "
+            f"US={'OPEN' if us_open else 'closed'}"
+        )
+
+        india_analyses, india_prices = [], {}
+        us_analyses,    us_prices    = [], {}
+
+        # Snapshot latest prices ONCE before any strategy logic runs (Thread 2 rule)
+        with _price_lock:
+            prices_snapshot = dict(_latest_prices)
+
+        # Rotate session if the calendar date has changed
+        with _lock:
+            _check_session_rotation(prices_snapshot)
+            save_state(_state)
+
+        if india_open:
+            _agent["status"] = "Scanning India"
+            apex_log.info("Scanning India watchlist…")
+            india_analyses, india_prices = fetch_cycle_data(INDIA_WATCHLIST, prices_snapshot)
+            apex_log.info(
+                f"India scan done: {len(india_analyses)}/{len(INDIA_WATCHLIST)} symbols  "
+                f"prices={len(india_prices)}"
+            )
+            with _lock:
+                apply_cycle("india", india_analyses, india_prices, cfg["india_max_positions"])
+                _signals["india"]        = india_analyses
+                _signals["india_prices"] = india_prices
+        else:
+            apex_log.debug("India market closed — skipping")
+
+        if us_open:
+            _agent["status"] = "Scanning US"
+            apex_log.info("Scanning US watchlist…")
+            us_analyses, us_prices = fetch_cycle_data(US_WATCHLIST, prices_snapshot)
+            apex_log.info(
+                f"US scan done: {len(us_analyses)}/{len(US_WATCHLIST)} symbols  "
+                f"prices={len(us_prices)}"
+            )
+            with _lock:
+                apply_cycle("us", us_analyses, us_prices, cfg["us_max_positions"])
+                _signals["us"]        = us_analyses
+                _signals["us_prices"] = us_prices
+        else:
+            apex_log.debug("US market closed — skipping")
+
+        with _lock:
+            save_state(_state)
+        apex_log.info("State saved to disk")
+
+        _agent["last_update"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        sleep_min = cfg["check_interval_min"] if (india_open or us_open) else cfg["idle_interval_min"]
+        _agent["status"] = "waiting"
+        next_t = (datetime.now(timezone.utc) + timedelta(minutes=sleep_min)).isoformat(timespec="seconds")
+        _agent["next_check"] = next_t
+        apex_log.info(f"Waiting {sleep_min} min — next check at {next_t}")
+
+        # Sleep in 5-second ticks so stop/pause respond quickly
+        for _ in range(sleep_min * 12):
+            if not _agent["running"]:
+                break
+            time.sleep(5)
+
+    _agent["status"]  = "stopped"
+    _agent["running"] = False
+    apex_log.info("Agent stopped")
+
+# ─── FLASK APP ────────────────────────────────────────────────────────────────
+
+app = Flask(__name__)
+
+# ─── AUTH ────────────────────────────────────────────────────────────────────
+import secrets as _secrets
+app.secret_key        = os.environ.get("APEX_SECRET", _secrets.token_hex(32))
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+_AUTH_USER = os.environ.get("APEX_USER", "apex")
+_AUTH_PASS = os.environ.get("APEX_PASS", "admin")
+
+@app.before_request
+def _require_login():
+    if request.path in ("/login", "/logout"):
+        return None
+    if not session.get("logged_in"):
+        if request.path.startswith("/api/"):
+            return jsonify({"ok": False, "msg": "Not authenticated"}), 401
+        return redirect("/login")
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    err = ""
+    if request.method == "POST":
+        if (request.form.get("u", "") == _AUTH_USER and
+                request.form.get("p", "") == _AUTH_PASS):
+            session["logged_in"] = True
+            apex_log.info("Dashboard login from " + (request.remote_addr or "?"))
+            return redirect("/")
+        err = "Invalid credentials — try again"
+        apex_log.warning("Failed login attempt from " + (request.remote_addr or "?"))
+    return render_template_string(LOGIN_HTML, err=err)
+
+@app.route("/logout")
+def logout():
+    apex_log.info("Dashboard logout")
+    session.clear()
+    return redirect("/login")
+
+@app.route("/")
+def index():
+    return render_template_string(HTML)
+
+@app.route("/api/state")
+def api_state():
+    with _price_lock:
+        live_prices = dict(_latest_prices)
+    with _lock:
+        st   = json.loads(json.dumps(_state,   default=str))
+        sigs = json.loads(json.dumps(_signals, default=str))
+    # Prefer live prices from the 10-s updater; fall back to last decision-cycle prices
+    merged_india = {**sigs["india_prices"], **{k: live_prices[k] for k in INDIA_WATCHLIST if k in live_prices}}
+    merged_us    = {**sigs["us_prices"],    **{k: live_prices[k] for k in US_WATCHLIST    if k in live_prices}}
+    india_pv   = portfolio_value(st["india"], merged_india)
+    us_pv      = portfolio_value(st["us"],    merged_us)
+    india_upnl = unrealised_pnl(st["india"], merged_india)
+    us_upnl    = unrealised_pnl(st["us"],    merged_us)
+
+    def dd_calc(mstate, pv):
+        peak = mstate.get("peak_portfolio", pv)
+        return round((peak - pv) / peak * 100, 2) if peak > 0 else 0.0
+
+    return jsonify({
+        "agent":  _agent,
+        "config": cfg,
+        "server_time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "agent_log":  list(_log_buffer)[-100:],
+        "india_mtc":  minutes_to_close("india"),
+        "us_mtc":     minutes_to_close("us"),
+        "india": {
+            **st["india"],
+            "portfolio_value": round(india_pv, 2),
+            "unrealised_pnl":  round(india_upnl, 2),
+            "total_pnl":       round(st["india"]["realised_pnl"] + india_upnl, 2),
+            "drawdown":        dd_calc(st["india"], india_pv),
+            "market_open":     is_india_open(),
+        },
+        "us": {
+            **st["us"],
+            "portfolio_value": round(us_pv, 2),
+            "unrealised_pnl":  round(us_upnl, 2),
+            "total_pnl":       round(st["us"]["realised_pnl"] + us_upnl, 2),
+            "drawdown":        dd_calc(st["us"], us_pv),
+            "market_open":     is_us_open(),
+        },
+        "signals":        sigs,
+        "live_prices":    live_prices,
+        "paper_summary":  get_summary(live_prices),
+        "sessions_count": len(st.get("sessions", [])),
+    })
+
+@app.route("/api/agent/start", methods=["POST"])
+def agent_start():
+    global _agent_thread
+    if _agent["running"]:
+        apex_log.warning("Start requested but agent already running")
+        return jsonify({"ok": True, "msg": "Agent already running"})
+    _agent["running"] = True
+    _agent["paused"]  = False
+    apex_log.info("Agent start requested via dashboard")
+    start_price_updater()
+    t = threading.Thread(target=agent_loop, daemon=True, name="apex-agent")
+    t.start()
+    return jsonify({"ok": True, "msg": "Agent started"})
+
+@app.route("/api/agent/stop", methods=["POST"])
+def agent_stop():
+    apex_log.info("Agent stop requested via dashboard")
+    _agent["running"] = False
+    return jsonify({"ok": True, "msg": "Stopping agent after current cycle"})
+
+@app.route("/api/agent/pause", methods=["POST"])
+def agent_pause():
+    if not _agent["running"]:
+        return jsonify({"ok": False, "msg": "Agent not running"})
+    _agent["paused"] = not _agent["paused"]
+    state = "paused" if _agent["paused"] else "resumed"
+    apex_log.info(f"Agent {state} via dashboard")
+    return jsonify({"ok": True, "paused": _agent["paused"]})
+
+@app.route("/api/sell/<market>/<path:symbol>", methods=["POST"])
+def force_sell(market, symbol):
+    if market not in ("india", "us"):
+        return jsonify({"ok": False, "msg": "Invalid market"})
+    with _price_lock:
+        snap = dict(_latest_prices)
+    with _lock:
+        mstate = _state.get(market, {})
+        if symbol not in mstate.get("positions", {}):
+            return jsonify({"ok": False, "msg": "Position not found"})
+        price = snap.get(symbol) or get_price(symbol)
+        if price is None:
+            return jsonify({"ok": False, "msg": "Could not fetch live price"})
+        paper_sell(symbol, 0, snap, mstate, "MANUAL SELL")
+        save_state(_state)
+        apex_log.info(f"Manual sell: {symbol} @ {price:.2f}  market={market}")
+    return jsonify({"ok": True, "msg": f"Sold {symbol.replace('.NS', '')}"})
+
+@app.route("/api/config", methods=["POST"])
+def update_config():
+    data = request.json or {}
+    int_keys = {"india_max_positions", "us_max_positions",
+                "check_interval_min",  "idle_interval_min",
+                "confidence_threshold", "eod_harvest_min", "eod_exit_min"}
+    changed = []
+    for k in ("risk_per_trade", "confidence_threshold", "stop_loss_pct", "target_pct",
+              "check_interval_min", "idle_interval_min",
+              "india_max_positions", "us_max_positions",
+              "eod_harvest_min", "eod_exit_min"):
+        if k in data:
+            cfg[k] = int(data[k]) if k in int_keys else float(data[k])
+            changed.append(k)
+    apex_log.info(f"Config updated: {', '.join(changed)}")
+    return jsonify({"ok": True, "config": cfg})
+
+@app.route("/api/logs")
+def api_logs():
+    return jsonify(list(_log_buffer))
+
+@app.route("/api/reset/<market>", methods=["POST"])
+def reset_market(market):
+    if market not in ("india", "us", "all"):
+        return jsonify({"ok": False, "msg": "Invalid market"})
+    with _lock:
+        if market in ("india", "all"):
+            _state["india"] = _empty_mstate(cfg["india_capital"], datetime.now(IST).strftime("%Y-%m-%d"))
+        if market in ("us", "all"):
+            _state["us"]    = _empty_mstate(cfg["us_capital"],    datetime.now(EDT).strftime("%Y-%m-%d"))
+        save_state(_state)
+    apex_log.warning(f"State reset: market={market}")
+    return jsonify({"ok": True, "msg": f"Reset {market}"})
+
+@app.route("/api/edit/state", methods=["POST"])
+def edit_state():
+    data = request.json or {}
+    changed = []
+    with _lock:
+        for mkt in ("india", "us"):
+            if mkt not in data:
+                continue
+            mstate = _state[mkt]
+            md = data[mkt]
+            for field, cast in [("cash", float), ("realised_pnl", float),
+                                 ("wins", int), ("losses", int),
+                                 ("peak_portfolio", float), ("max_drawdown", float)]:
+                if field in md:
+                    mstate[field] = cast(md[field])
+                    changed.append(f"{mkt}.{field}")
+        save_state(_state)
+    apex_log.info(f"Manual state edit: {', '.join(changed)}")
+    return jsonify({"ok": True, "changed": changed})
+
+@app.route("/api/edit/position/<market>/<path:symbol>", methods=["POST"])
+def edit_position(market, symbol):
+    if market not in ("india", "us"):
+        return jsonify({"ok": False, "msg": "Invalid market"})
+    data = request.json or {}
+    with _lock:
+        pos = _state.get(market, {}).get("positions", {}).get(symbol)
+        if pos is None:
+            return jsonify({"ok": False, "msg": "Position not found"})
+        for field, cast in [("qty", int), ("entry", float),
+                             ("stop_loss", float), ("target", float)]:
+            if field in data:
+                pos[field] = cast(data[field])
+        save_state(_state)
+    apex_log.info(f"Manual position edit: {symbol} ({market})")
+    return jsonify({"ok": True})
+
+@app.route("/api/sessions")
+def api_sessions():
+    with _lock:
+        sessions = list(reversed(_state.get("sessions", [])))  # newest first
+    return jsonify(sessions)
+
+@app.route("/api/sessions/close/<market>", methods=["POST"])
+def close_session_api(market):
+    """Manually archive the current session and reset. Useful for testing or early EOD."""
+    if market not in ("india", "us"):
+        return jsonify({"ok": False, "msg": "Invalid market"})
+    with _price_lock:
+        snap = dict(_latest_prices)
+    with _lock:
+        _close_session(market, snap)
+        save_state(_state)
+    apex_log.info(f"Manual session close: {market}")
+    return jsonify({"ok": True, "msg": f"{market} session archived and reset"})
+
+# ─── HTML / CSS / JS TEMPLATE ─────────────────────────────────────────────────
+
+LOGIN_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Apex — Sign In</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+     background:#0d1117;color:#e6edf3;display:flex;align-items:center;
+     justify-content:center;min-height:100vh}
+.box{background:#161b22;border:1px solid #30363d;border-radius:10px;
+     padding:36px 40px;width:340px}
+.logo{font-size:20px;font-weight:700;letter-spacing:2px;color:#58a6ff;
+      text-align:center;margin-bottom:28px}
+.logo b{color:#f0883e}
+label{font-size:10px;color:#8b949e;text-transform:uppercase;
+      letter-spacing:.5px;display:block;margin-bottom:5px}
+input[type=text],input[type=password]{background:#1c2128;border:1px solid #30363d;
+      border-radius:6px;color:#e6edf3;padding:9px 12px;font-size:14px;width:100%;
+      margin-bottom:16px;transition:border-color .2s}
+input:focus{outline:none;border-color:#58a6ff}
+.err{color:#f85149;font-size:11px;text-align:center;margin-bottom:14px;
+     background:#200a0a;border:1px solid #5a1a1a;border-radius:5px;padding:7px 10px}
+.btn{width:100%;padding:10px;border-radius:6px;cursor:pointer;font-size:13px;
+     font-weight:700;letter-spacing:.4px;background:#0d1e3a;color:#58a6ff;
+     border:1px solid #1a3a6a;transition:filter .15s}
+.btn:hover{filter:brightness(1.2)}
+.sub{font-size:10px;color:#444c56;text-align:center;margin-top:18px}
+</style>
+</head>
+<body>
+<div class="box">
+  <div class="logo">APEX <b>▲</b></div>
+  {% if err %}<div class="err">{{ err }}</div>{% endif %}
+  <form method="POST" autocomplete="off">
+    <label>Username</label>
+    <input type="text" name="u" autofocus autocomplete="username">
+    <label>Password</label>
+    <input type="password" name="p" autocomplete="current-password">
+    <button class="btn" type="submit">Sign In</button>
+  </form>
+  <div class="sub">Apex Paper Trading — restricted access</div>
+</div>
+</body>
+</html>"""
+
+HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Apex Trading Dashboard</title>
+<style>
+:root{
+  --bg:#0d1117;--card:#161b22;--card2:#1c2128;--border:#30363d;
+  --text:#e6edf3;--muted:#8b949e;
+  --green:#3fb950;--red:#f85149;--yellow:#d29922;
+  --blue:#58a6ff;--orange:#f0883e;--purple:#bc8cff;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+     background:var(--bg);color:var(--text);font-size:13px;line-height:1.5}
+
+/* ── Header ── */
+.hdr{background:var(--card);border-bottom:1px solid var(--border);
+     padding:10px 20px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;position:sticky;top:0;z-index:100}
+.logo{font-size:15px;font-weight:700;letter-spacing:2px;color:var(--blue)}
+.logo b{color:var(--orange)}
+.hdr-right{margin-left:auto;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+#clock{font-family:monospace;color:var(--muted);font-size:12px}
+
+/* ── Badges ── */
+.badge{padding:2px 10px;border-radius:20px;font-size:10px;font-weight:700;
+       letter-spacing:.6px;white-space:nowrap}
+.b-open  {background:#0d2318;color:var(--green);border:1px solid #1a4a2a}
+.b-closed{background:#1e1a0a;color:var(--yellow);border:1px solid #3a2f10}
+.b-run   {background:#0d1e3a;color:var(--blue);border:1px solid #1a3a6a;animation:pulse 2s infinite}
+.b-pause {background:#2a1800;color:var(--orange);border:1px solid #5a3500}
+.b-idle  {background:var(--card2);color:var(--muted);border:1px solid var(--border)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.55}}
+
+/* ── Buttons ── */
+.btn{padding:5px 14px;border-radius:6px;border:1px solid;cursor:pointer;
+     font-size:11px;font-weight:700;letter-spacing:.4px;transition:filter .15s}
+.btn:hover{filter:brightness(1.2)}
+.btn-green{background:#0d2318;color:var(--green);border-color:#1a4a2a}
+.btn-red  {background:#2a0d0d;color:var(--red);border-color:#5a1a1a}
+.btn-blue {background:#0d1e3a;color:var(--blue);border-color:#1a3a6a}
+.btn-muted{background:var(--card2);color:var(--muted);border-color:var(--border)}
+.btn-sm{padding:3px 9px;font-size:10px}
+
+/* ── Layout ── */
+.main{padding:14px 18px;max-width:1700px;margin:0 auto}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px}
+.g5{display:grid;grid-template-columns:repeat(6,1fr);gap:8px}
+
+/* ── Cards ── */
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:12px}
+.c-title{font-size:10px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);margin-bottom:4px}
+.c-val{font-size:20px;font-weight:700;font-family:monospace}
+.c-sub{font-size:11px;margin-top:1px}
+
+/* ── Market section header ── */
+.mkt-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+.mkt-name{font-size:13px;font-weight:700}
+
+/* ── Section divider ── */
+.sec{display:flex;align-items:center;gap:8px;margin:14px 0 8px;
+     padding-bottom:5px;border-bottom:1px solid var(--border)}
+.sec-title{font-size:12px;font-weight:600;letter-spacing:.4px}
+.sec-badge{font-size:10px;padding:1px 7px;border-radius:10px;
+           background:var(--card2);color:var(--muted);border:1px solid var(--border)}
+
+/* ── Tabs ── */
+.tabs{display:flex;border-bottom:1px solid var(--border);margin-bottom:14px}
+.tab{padding:7px 16px;cursor:pointer;font-size:12px;font-weight:500;
+     border-bottom:2px solid transparent;color:var(--muted);transition:all .15s}
+.tab:hover{color:var(--text)}
+.tab.on{color:var(--blue);border-bottom-color:var(--blue)}
+.pane{display:none}.pane.on{display:block}
+
+/* ── Tables ── */
+.tbl-wrap{overflow-x:auto;border-radius:6px;border:1px solid var(--border)}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{padding:6px 10px;text-align:left;color:var(--muted);font-weight:500;
+   font-size:10px;text-transform:uppercase;letter-spacing:.5px;
+   border-bottom:1px solid var(--border);background:var(--card2);white-space:nowrap}
+td{padding:6px 10px;border-bottom:1px solid #21262d;white-space:nowrap}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:#1c2330}
+
+/* ── Badges inside table ── */
+.act-buy {display:inline-block;padding:1px 8px;border-radius:4px;font-size:10px;font-weight:700;
+          background:#0d2318;color:var(--green);border:1px solid #1a4a2a}
+.act-sell{display:inline-block;padding:1px 8px;border-radius:4px;font-size:10px;font-weight:700;
+          background:#2a0d0d;color:var(--red);border:1px solid #5a1a1a}
+.act-hold{display:inline-block;padding:1px 8px;border-radius:4px;font-size:10px;font-weight:700;
+          background:var(--card2);color:var(--muted);border:1px solid var(--border)}
+
+/* ── Confidence bar ── */
+.cbar{display:inline-flex;align-items:center;gap:5px}
+.cbar-bg{width:48px;height:4px;border-radius:2px;background:var(--card2);overflow:hidden}
+.cbar-fg{height:100%;border-radius:2px}
+
+/* ── Trade log ── */
+.log-box{background:var(--card);border:1px solid var(--border);border-radius:6px;
+         max-height:200px;overflow-y:auto}
+.log-row{padding:5px 10px;border-bottom:1px solid #21262d;
+         font-family:monospace;font-size:11px;display:flex;gap:10px}
+.log-row:last-child{border-bottom:none}
+.lt{color:var(--muted);min-width:62px}
+.lb{color:var(--green)}.ls{color:var(--blue)}.ll{color:var(--red)}
+
+/* ── Agent system log ── */
+.alog-box{background:#0a0e14;border:1px solid var(--border);border-radius:6px;
+          max-height:400px;overflow-y:auto}
+.alog-row{padding:4px 10px;border-bottom:1px solid #161b22;
+          font-family:monospace;font-size:11px;display:flex;gap:8px;align-items:baseline}
+.alog-row:last-child{border-bottom:none}
+.al-ts{color:#444c56;min-width:68px;font-size:10px}
+.al-lvl{min-width:52px;font-size:9px;font-weight:700;letter-spacing:.5px;text-transform:uppercase}
+.al-info{color:var(--blue)}.al-debug{color:#444c56}.al-warning{color:var(--yellow)}.al-error{color:var(--red)}
+
+/* ── Settings form ── */
+.fg{display:flex;flex-direction:column;gap:4px}
+label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
+input[type=number]{background:var(--card2);border:1px solid var(--border);
+  border-radius:5px;color:var(--text);padding:5px 9px;font-size:13px;
+  font-family:monospace;width:100%;transition:border-color .2s}
+input:focus{outline:none;border-color:var(--blue)}
+.fgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+
+/* ── Footer / refresh bar ── */
+.foot{display:flex;align-items:center;gap:10px;padding:8px 0;
+      font-size:10px;color:var(--muted);border-top:1px solid var(--border);margin-top:14px}
+#prog{flex:1;height:3px;background:var(--card2);border-radius:2px;overflow:hidden}
+#prog-f{height:100%;background:var(--blue);width:0;transition:width linear}
+
+/* ── Toast ── */
+.toasts{position:fixed;bottom:18px;right:18px;display:flex;flex-direction:column;gap:7px;z-index:9999}
+.toast{background:var(--card2);border:1px solid var(--border);border-radius:7px;
+       padding:9px 14px;font-size:12px;animation:tin .25s ease;
+       display:flex;align-items:center;gap:8px;max-width:300px}
+.tok{border-left:3px solid var(--green)}.terr{border-left:3px solid var(--red)}
+@keyframes tin{from{transform:translateX(110%);opacity:0}to{transform:translateX(0);opacity:1}}
+
+.green{color:var(--green)}.red{color:var(--red)}.yellow{color:var(--yellow)}
+.blue{color:var(--blue)}.muted{color:var(--muted)}.mono{font-family:monospace}
+
+/* ── EOD ── */
+.b-eod-warn{background:#1a1000;color:var(--orange);border:1px solid #5a3500}
+.b-eod-exit{background:#2a0d0d;color:var(--red);border:1px solid #5a1a1a}
+.eod-banner{border-radius:6px;padding:8px 14px;margin-bottom:8px;font-size:11px;
+            display:flex;align-items:center;gap:10px;border:1px solid}
+.eod-warn{background:#1a1000;border-color:#5a3500}
+.eod-exit{background:#200a0a;border-color:#6a1a1a}
+
+/* ── Log filter ── */
+.log-filter-btn.on{background:#0d1e3a;color:var(--blue);border-color:#1a3a6a}
+
+/* ── Position / state edit modal ── */
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);
+               z-index:600;align-items:center;justify-content:center}
+.modal-overlay.open{display:flex}
+.modal-box{background:var(--card);border:1px solid var(--border);border-radius:10px;
+           padding:24px;min-width:340px;max-width:600px;width:100%;max-height:90vh;overflow-y:auto}
+.modal-title{font-size:13px;font-weight:700;margin-bottom:18px;color:var(--text)}
+.modal-title span{color:var(--blue)}
+.es-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+.es-col-title{font-size:11px;font-weight:700;color:var(--muted);margin-bottom:10px;
+              text-transform:uppercase;letter-spacing:.5px;padding-bottom:5px;
+              border-bottom:1px solid var(--border)}
+
+/* ── Session cards ── */
+.sess-card{background:var(--card);border:1px solid var(--border);border-radius:8px;
+           margin-bottom:8px;overflow:hidden}
+.sess-hdr{display:flex;align-items:center;gap:12px;padding:10px 14px;
+          cursor:pointer;user-select:none;transition:background .1s}
+.sess-hdr:hover{background:var(--card2)}
+.sess-date{font-size:13px;font-weight:700;font-family:monospace;min-width:90px;color:var(--text)}
+.sess-mkt{font-size:10px;font-weight:700;padding:2px 8px;border-radius:12px;
+          min-width:48px;text-align:center;white-space:nowrap}
+.sess-mkt-india{background:#0d1e3a;color:var(--blue);border:1px solid #1a3a6a}
+.sess-mkt-us{background:#1a0d2a;color:var(--purple);border:1px solid #3a1a5a}
+.sess-body{display:none;border-top:1px solid var(--border);background:#0a0e14}
+.sess-body.open{display:block}
+.sess-metrics{display:flex;gap:24px;padding:10px 14px;flex-wrap:wrap;
+              border-bottom:1px solid var(--border)}
+.sess-m{display:flex;flex-direction:column;gap:2px}
+.sess-m-l{font-size:9px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted)}
+.sess-m-v{font-size:13px;font-weight:600;font-family:monospace}
+.sess-filter.on{background:#0d1e3a;color:var(--blue);border-color:#1a3a6a}
+.sess-label{font-size:10px;color:var(--muted);margin-top:2px}
+</style>
+</head>
+<body>
+
+<div class="hdr">
+  <div class="logo">APEX <b>▲</b></div>
+  <span id="nse-badge"    class="badge b-closed">NSE CLOSED</span>
+  <span id="nyse-badge"   class="badge b-closed">NYSE CLOSED</span>
+  <span id="india-eod"   class="badge" style="display:none">NSE EOD</span>
+  <span id="us-eod"      class="badge" style="display:none">NYSE EOD</span>
+  <span id="agent-badge" class="badge b-idle">IDLE</span>
+  <div class="hdr-right">
+    <span id="clock">—</span>
+    <button class="btn btn-muted btn-sm" onclick="doRefresh()">↻ Refresh</button>
+    <button id="btn-pause"  class="btn btn-muted btn-sm" onclick="pauseAgent()">⏸ Pause</button>
+    <button id="btn-toggle" class="btn btn-green"         onclick="toggleAgent()">▶ Start Agent</button>
+    <button class="btn btn-muted btn-sm" onclick="location.href='/logout'" title="Sign out">⎋ Logout</button>
+  </div>
+</div>
+
+<div class="main">
+
+  <!-- ── Market summary cards ── -->
+  <div class="g2">
+    <!-- India -->
+    <div class="card">
+      <div class="mkt-hdr">
+        <div>
+          <span class="mkt-name">India — NSE / NIFTY 50</span>
+          <div class="sess-label" id="india-sess-lbl">Session —</div>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <button class="btn btn-muted btn-sm" title="Archive current session and reset"
+            onclick="closeSessionNow('india')">End Session</button>
+          <span id="india-mkt" class="badge b-closed">CLOSED</span>
+        </div>
+      </div>
+      <div class="g5">
+        <div><div class="c-title">Portfolio</div>
+          <div class="c-val mono" id="india-pv">₹0</div>
+          <div class="c-sub" id="india-diff">—</div></div>
+        <div><div class="c-title">Cash</div>
+          <div class="c-val mono" id="india-cash">₹0</div>
+          <div class="c-sub muted" id="india-npos">0 positions</div></div>
+        <div><div class="c-title">Realised P&amp;L</div>
+          <div class="c-val mono" id="india-pnl">₹0</div>
+          <div class="c-sub muted" id="india-ntrades">0 trades</div></div>
+        <div><div class="c-title">Win Rate</div>
+          <div class="c-val mono" id="india-wr">0%</div>
+          <div class="c-sub muted" id="india-wl">0W 0L</div></div>
+        <div><div class="c-title">Drawdown</div>
+          <div class="c-val mono" id="india-dd">0.0%</div>
+          <div class="c-sub muted">from peak</div></div>
+        <div style="background:var(--card2);border:1px solid var(--border);border-radius:6px;padding:10px">
+          <div class="c-title">Total Profit</div>
+          <div class="c-val mono" id="india-tpnl">₹0</div>
+          <div class="c-sub" id="india-upnl" style="font-size:10px">Float: ₹0</div></div>
+      </div>
+    </div>
+    <!-- US -->
+    <div class="card">
+      <div class="mkt-hdr">
+        <div>
+          <span class="mkt-name">US — NYSE / NASDAQ</span>
+          <div class="sess-label" id="us-sess-lbl">Session —</div>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <button class="btn btn-muted btn-sm" title="Archive current session and reset"
+            onclick="closeSessionNow('us')">End Session</button>
+          <span id="us-mkt" class="badge b-closed">CLOSED</span>
+        </div>
+      </div>
+      <div class="g5">
+        <div><div class="c-title">Portfolio</div>
+          <div class="c-val mono" id="us-pv">$0</div>
+          <div class="c-sub" id="us-diff">—</div></div>
+        <div><div class="c-title">Cash</div>
+          <div class="c-val mono" id="us-cash">$0</div>
+          <div class="c-sub muted" id="us-npos">0 positions</div></div>
+        <div><div class="c-title">Realised P&amp;L</div>
+          <div class="c-val mono" id="us-pnl">$0</div>
+          <div class="c-sub muted" id="us-ntrades">0 trades</div></div>
+        <div><div class="c-title">Win Rate</div>
+          <div class="c-val mono" id="us-wr">0%</div>
+          <div class="c-sub muted" id="us-wl">0W 0L</div></div>
+        <div><div class="c-title">Drawdown</div>
+          <div class="c-val mono" id="us-dd">0.0%</div>
+          <div class="c-sub muted">from peak</div></div>
+        <div style="background:var(--card2);border:1px solid var(--border);border-radius:6px;padding:10px">
+          <div class="c-title">Total Profit</div>
+          <div class="c-val mono" id="us-tpnl">$0</div>
+          <div class="c-sub" id="us-upnl" style="font-size:10px">Float: $0</div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Tabs ── -->
+  <div class="tabs">
+    <div class="tab on"  onclick="tab('india',this)">India (NSE)</div>
+    <div class="tab"     onclick="tab('us',this)">US (NYSE)</div>
+    <div class="tab"     onclick="tab('sessions',this)">Sessions <span id="sess-tab-cnt" style="font-size:9px;color:var(--muted)"></span></div>
+    <div class="tab"     onclick="tab('settings',this)">Settings</div>
+    <div class="tab"     onclick="tab('logs',this)">All Logs</div>
+  </div>
+
+  <!-- India pane -->
+  <div class="pane on" id="pane-india">
+    <div class="sec"><span class="sec-title">Open Positions</span><span class="sec-badge" id="india-pc">0</span></div>
+    <div id="india-eod-banner" style="display:none" class="eod-banner eod-warn">
+      <span id="india-eod-phase" style="font-weight:700;color:var(--orange)">EOD</span>
+      <span id="india-eod-detail" style="color:var(--muted)"></span>
+    </div>
+    <div class="tbl-wrap"><table>
+      <thead><tr>
+        <th>Symbol</th><th>Qty</th><th>Entry ₹</th><th>Current ₹</th>
+        <th>P&amp;L</th><th>Stop ₹</th><th>Target ₹</th><th>Since</th><th>EOD</th><th></th>
+      </tr></thead>
+      <tbody id="india-pos"><tr><td colspan="10" style="text-align:center;padding:18px;color:var(--muted)">No open positions</td></tr></tbody>
+    </table></div>
+
+    <div class="sec" style="margin-top:18px"><span class="sec-title">Signal Board</span><span class="sec-badge">NIFTY 50 Top 16</span></div>
+    <div class="tbl-wrap"><table>
+      <thead><tr>
+        <th>Symbol</th><th>Price ₹</th><th>RSI</th><th>MACD</th>
+        <th>Bollinger</th><th>EMA</th><th>Volume</th><th>Confidence</th><th>Action</th>
+      </tr></thead>
+      <tbody id="india-sig"><tr><td colspan="9" style="text-align:center;padding:18px;color:var(--muted)">No scan data yet — start the agent</td></tr></tbody>
+    </table></div>
+
+    <div class="sec" style="margin-top:18px"><span class="sec-title">Recent Trades</span></div>
+    <div class="log-box" id="india-log">
+      <div class="log-row"><span class="lt">—</span><span class="muted">No trades yet</span></div>
+    </div>
+  </div>
+
+  <!-- US pane -->
+  <div class="pane" id="pane-us">
+    <div class="sec"><span class="sec-title">Open Positions</span><span class="sec-badge" id="us-pc">0</span></div>
+    <div id="us-eod-banner" style="display:none" class="eod-banner eod-warn">
+      <span id="us-eod-phase" style="font-weight:700;color:var(--orange)">EOD</span>
+      <span id="us-eod-detail" style="color:var(--muted)"></span>
+    </div>
+    <div class="tbl-wrap"><table>
+      <thead><tr>
+        <th>Symbol</th><th>Qty</th><th>Entry $</th><th>Current $</th>
+        <th>P&amp;L</th><th>Stop $</th><th>Target $</th><th>Since</th><th>EOD</th><th></th>
+      </tr></thead>
+      <tbody id="us-pos"><tr><td colspan="10" style="text-align:center;padding:18px;color:var(--muted)">No open positions</td></tr></tbody>
+    </table></div>
+
+    <div class="sec" style="margin-top:18px"><span class="sec-title">Signal Board</span><span class="sec-badge">Top 16 Tech</span></div>
+    <div class="tbl-wrap"><table>
+      <thead><tr>
+        <th>Symbol</th><th>Price $</th><th>RSI</th><th>MACD</th>
+        <th>Bollinger</th><th>EMA</th><th>Volume</th><th>Confidence</th><th>Action</th>
+      </tr></thead>
+      <tbody id="us-sig"><tr><td colspan="9" style="text-align:center;padding:18px;color:var(--muted)">No scan data yet — start the agent</td></tr></tbody>
+    </table></div>
+
+    <div class="sec" style="margin-top:18px"><span class="sec-title">Recent Trades</span></div>
+    <div class="log-box" id="us-log">
+      <div class="log-row"><span class="lt">—</span><span class="muted">No trades yet</span></div>
+    </div>
+  </div>
+
+  <!-- Sessions pane -->
+  <div class="pane" id="pane-sessions">
+    <div class="sec" style="flex-wrap:wrap;gap:8px">
+      <span class="sec-title">Past Sessions</span>
+      <span class="sec-badge" id="sess-count">0 sessions</span>
+      <div style="margin-left:auto;display:flex;gap:5px;flex-wrap:wrap">
+        <button class="btn btn-muted btn-sm sess-filter on" onclick="setSessFilter('all',this)">All</button>
+        <button class="btn btn-muted btn-sm sess-filter" onclick="setSessFilter('india',this)">India (NSE)</button>
+        <button class="btn btn-muted btn-sm sess-filter" onclick="setSessFilter('us',this)">US (NYSE)</button>
+      </div>
+    </div>
+    <div id="sess-list">
+      <div style="text-align:center;padding:36px;color:var(--muted)">No past sessions yet — sessions are archived automatically when the calendar date changes</div>
+    </div>
+  </div>
+
+  <!-- Settings pane -->
+  <div class="pane" id="pane-settings">
+    <div style="max-width:580px">
+      <div class="sec"><span class="sec-title">Risk Parameters</span></div>
+      <div class="fgrid">
+        <div class="fg"><label>Risk per Trade (0.01–1.0)</label><input type="number" id="s-risk" step="0.01" min="0.01" max="1"></div>
+        <div class="fg"><label>Confidence Threshold (%)</label><input type="number" id="s-conf" step="1"    min="50"   max="95"></div>
+        <div class="fg"><label>Stop Loss (0.005–0.2)</label>   <input type="number" id="s-sl"   step="0.005" min="0.005" max="0.2"></div>
+        <div class="fg"><label>Target (0.01–0.5)</label>       <input type="number" id="s-tgt"  step="0.005" min="0.01"  max="0.5"></div>
+        <div class="fg"><label>Check Interval (min)</label>    <input type="number" id="s-chk"  step="1"    min="1"    max="60"></div>
+        <div class="fg"><label>Idle Interval (min)</label>     <input type="number" id="s-idle" step="1"    min="5"    max="120"></div>
+        <div class="fg"><label>India Max Positions</label>     <input type="number" id="s-ip"   step="1"    min="1"    max="16"></div>
+        <div class="fg"><label>US Max Positions</label>        <input type="number" id="s-up"   step="1"    min="1"    max="16"></div>
+        <div class="fg"><label>EOD Profit Harvest (min before close)</label><input type="number" id="s-eod-h" step="1" min="10" max="60"></div>
+        <div class="fg"><label>EOD Force Exit (min before close)</label>    <input type="number" id="s-eod-e" step="1" min="3"  max="30"></div>
+      </div>
+      <div style="margin-top:14px;display:flex;gap:10px">
+        <button class="btn btn-blue" onclick="saveConfig()">Save Settings</button>
+      </div>
+
+      <div class="sec" style="margin-top:24px"><span class="sec-title">Edit Portfolio State</span>
+        <span class="sec-badge">raw values</span></div>
+      <div class="es-grid">
+        <div>
+          <div class="es-col-title">India (₹)</div>
+          <div class="fg"><label>Cash</label><input type="number" id="es-india-cash" step="0.01"></div>
+          <div class="fg" style="margin-top:8px"><label>Realised P&amp;L</label><input type="number" id="es-india-rpnl" step="0.01"></div>
+          <div class="fg" style="margin-top:8px"><label>Wins</label><input type="number" id="es-india-wins" step="1" min="0"></div>
+          <div class="fg" style="margin-top:8px"><label>Losses</label><input type="number" id="es-india-losses" step="1" min="0"></div>
+          <div class="fg" style="margin-top:8px"><label>Peak Portfolio</label><input type="number" id="es-india-peak" step="0.01"></div>
+        </div>
+        <div>
+          <div class="es-col-title">US ($)</div>
+          <div class="fg"><label>Cash</label><input type="number" id="es-us-cash" step="0.01"></div>
+          <div class="fg" style="margin-top:8px"><label>Realised P&amp;L</label><input type="number" id="es-us-rpnl" step="0.01"></div>
+          <div class="fg" style="margin-top:8px"><label>Wins</label><input type="number" id="es-us-wins" step="1" min="0"></div>
+          <div class="fg" style="margin-top:8px"><label>Losses</label><input type="number" id="es-us-losses" step="1" min="0"></div>
+          <div class="fg" style="margin-top:8px"><label>Peak Portfolio</label><input type="number" id="es-us-peak" step="0.01"></div>
+        </div>
+      </div>
+      <div style="margin-top:14px;display:flex;gap:10px">
+        <button class="btn btn-blue" onclick="saveEditState()">Apply State Changes</button>
+      </div>
+      <p style="font-size:10px;color:var(--muted);margin-top:8px">
+        Position fields (qty, entry, stop-loss, target) are editable via the Edit button in each position row.
+      </p>
+
+      <div class="sec" style="margin-top:24px"><span class="sec-title" style="color:var(--red)">Danger Zone</span></div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <button class="btn btn-red btn-sm" onclick="resetMkt('india')">Reset India State</button>
+        <button class="btn btn-red btn-sm" onclick="resetMkt('us')">Reset US State</button>
+        <button class="btn btn-red btn-sm" onclick="resetMkt('all')">Reset Everything</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Logs pane -->
+  <div class="pane" id="pane-logs">
+    <div class="sec">
+      <span class="sec-title">Agent System Log</span>
+      <span class="sec-badge" id="alog-count">0 entries</span>
+      <span style="margin-left:auto;font-size:10px;color:var(--muted)">→ <span class="mono" style="color:var(--blue)">apex.log</span></span>
+    </div>
+    <div style="display:flex;align-items:center;gap:6px;margin-bottom:8px;flex-wrap:wrap">
+      <button class="btn btn-muted btn-sm log-filter-btn on"  onclick="setLogFilter('ALL',this)">ALL</button>
+      <button class="btn btn-muted btn-sm log-filter-btn"     onclick="setLogFilter('INFO',this)">INFO</button>
+      <button class="btn btn-muted btn-sm log-filter-btn"     onclick="setLogFilter('WARNING',this)">WARN</button>
+      <button class="btn btn-muted btn-sm log-filter-btn"     onclick="setLogFilter('ERROR',this)">ERROR</button>
+      <button class="btn btn-muted btn-sm log-filter-btn"     onclick="setLogFilter('DEBUG',this)">DEBUG</button>
+      <label style="display:flex;align-items:center;gap:5px;font-size:10px;color:var(--muted);
+                    margin-left:8px;text-transform:none;letter-spacing:0;cursor:pointer">
+        <input type="checkbox" id="auto-scroll" checked onchange="_autoScroll=this.checked"> Auto-scroll
+      </label>
+      <span id="log-live-dot" style="margin-left:4px;font-size:9px;color:var(--muted)">● live</span>
+    </div>
+    <div class="alog-box" id="agent-log" style="max-height:500px">
+      <div class="alog-row"><span class="al-ts">—</span><span class="al-lvl al-debug">—</span><span class="muted">No agent activity yet — start the agent</span></div>
+    </div>
+
+    <div class="sec" style="margin-top:18px"><span class="sec-title">All Trade Activity</span></div>
+    <div class="log-box" style="max-height:320px" id="all-log">
+      <div class="log-row"><span class="lt">—</span><span class="muted">No trades yet</span></div>
+    </div>
+  </div>
+
+  <!-- Footer -->
+  <div class="foot">
+    <span id="last-upd">Last update: —</span>
+    <div id="prog"><div id="prog-f"></div></div>
+    <span id="nxt-ref">Refreshing in 30s</span>
+  </div>
+</div>
+
+<div class="toasts" id="toasts"></div>
+
+<!-- Position edit modal -->
+<div class="modal-overlay" id="pos-edit-modal" onclick="if(event.target===this)closeEditPos()">
+  <div class="modal-box">
+    <div class="modal-title">Edit Position: <span id="epm-sym">—</span></div>
+    <input type="hidden" id="epm-mkt">
+    <input type="hidden" id="epm-sym-h">
+    <div class="fgrid">
+      <div class="fg"><label>Qty (shares)</label>
+        <input type="number" id="epm-qty" step="1" min="1"></div>
+      <div class="fg"><label>Entry Price</label>
+        <input type="number" id="epm-entry" step="0.01" min="0"></div>
+      <div class="fg"><label>Stop Loss</label>
+        <input type="number" id="epm-sl" step="0.01" min="0"></div>
+      <div class="fg"><label>Target</label>
+        <input type="number" id="epm-tgt" step="0.01" min="0"></div>
+    </div>
+    <div style="display:flex;gap:10px;margin-top:18px">
+      <button class="btn btn-blue" onclick="saveEditPos()">Save Changes</button>
+      <button class="btn btn-muted" onclick="closeEditPos()">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const INTERVAL = 30;
+let _progStart = null, _progTimer = null, _refreshTimer = null;
+let _cfg = {};   // latest config snapshot — set in doRefresh
+let _activeTab = "india";
+let _logPollTimer = null;
+let _sessPollTimer = null;
+let _logFilter = "ALL";
+let _autoScroll = true;
+let _lastLogEntries = null;
+let _sessFilter = "all";
+let _sessData   = [];
+
+// ── Utilities ──────────────────────────────────────────────────────────────
+
+// Format a UTC ISO timestamp string into local date + time.
+// Today's entries: show time only. Older entries: show "15 Apr 14:30:22".
+function fmtTs(ts) {
+  if (!ts || ts === "—") return ts;
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return ts;          // graceful fallback for legacy strings
+  const sameDay = d.toDateString() === new Date().toDateString();
+  const timePart = d.toLocaleTimeString(undefined, {hour:"2-digit", minute:"2-digit", second:"2-digit", hour12:false});
+  if (sameDay) return timePart;
+  const datePart = d.toLocaleDateString(undefined, {day:"2-digit", month:"short"});
+  return datePart + "  " + timePart;
+}
+
+// Full date + time for the clock / last-update label.
+function fmtDt(ts) {
+  const d = ts ? new Date(ts) : new Date();
+  if (isNaN(d.getTime())) return ts;
+  return d.toLocaleDateString(undefined, {day:"2-digit", month:"short", year:"numeric"}) + "  " +
+         d.toLocaleTimeString(undefined, {hour:"2-digit", minute:"2-digit", second:"2-digit", hour12:false});
+}
+
+function fc(v, sym) {
+  if (v == null) return "—";
+  const a = Math.abs(v);
+  if (sym === "₹") {
+    if (a >= 1e7) return sym + (v/1e7).toFixed(2) + "Cr";
+    if (a >= 1e5) return sym + (v/1e5).toFixed(2) + "L";
+  }
+  if (a >= 1e6) return sym + (v/1e6).toFixed(2) + "M";
+  if (a >= 1e3) return sym + Math.abs(v).toLocaleString("en-IN",{maximumFractionDigits:0});
+  return sym + v.toFixed(2);
+}
+const sc  = v => v > 0 ? "green" : v < 0 ? "red" : "muted";
+const sgn = v => v >= 0 ? "+" : "";
+const disp = s => s.replace(".NS","");
+
+function toast(msg, ok=true) {
+  const d = document.createElement("div");
+  d.className = "toast " + (ok ? "tok" : "terr");
+  d.innerHTML = `<span>${ok?"✓":"✗"}</span>${msg}`;
+  document.getElementById("toasts").appendChild(d);
+  setTimeout(() => d.remove(), 3200);
+}
+
+function tab(name, el) {
+  _activeTab = name;
+  document.querySelectorAll(".tab").forEach(t => t.classList.remove("on"));
+  document.querySelectorAll(".pane").forEach(p => p.classList.remove("on"));
+  el.classList.add("on");
+  document.getElementById("pane-"+name).classList.add("on");
+  clearInterval(_logPollTimer);
+  clearInterval(_sessPollTimer);
+  if (name === "logs") {
+    _logPollTimer = setInterval(pollLogs, 5000);
+    pollLogs();
+  } else if (name === "sessions") {
+    _sessPollTimer = setInterval(pollSessions, 15000);
+    pollSessions();
+  }
+}
+
+async function pollLogs() {
+  try {
+    const r = await fetch("/api/logs");
+    if (!r.ok) return;
+    const entries = await r.json();
+    _lastLogEntries = entries;
+    renderAgentLog(entries);
+    const dot = document.getElementById("log-live-dot");
+    if (dot) { dot.style.color = "var(--green)"; setTimeout(()=>{ dot.style.color="var(--muted)"; }, 800); }
+  } catch(e) {}
+}
+
+function setLogFilter(lvl, el) {
+  _logFilter = lvl;
+  document.querySelectorAll(".log-filter-btn").forEach(b => b.classList.remove("on"));
+  el.classList.add("on");
+  if (_lastLogEntries) renderAgentLog(_lastLogEntries);
+}
+
+// ── Clock (browser local time) ────────────────────────────────────────────
+function tick() {
+  document.getElementById("clock").textContent = fmtDt();
+}
+setInterval(tick, 1000); tick();
+
+// ── Progress bar ──────────────────────────────────────────────────────────
+function startProg() {
+  _progStart = Date.now();
+  clearInterval(_progTimer);
+  _progTimer = setInterval(() => {
+    const e = (Date.now()-_progStart)/1000;
+    document.getElementById("prog-f").style.width = Math.min(100, e/INTERVAL*100)+"%";
+    const r = Math.max(0, INTERVAL - Math.floor(e));
+    document.getElementById("nxt-ref").textContent = "Refresh in "+r+"s";
+  }, 500);
+}
+
+// ── Render stats cards ────────────────────────────────────────────────────
+function renderStats(d) {
+  const ic = d.config.india_capital, uc = d.config.us_capital;
+  [["india","₹",ic],["us","$",uc]].forEach(([mkt,sym,cap]) => {
+    const m  = d[mkt];
+    const pv = m.portfolio_value || 0;
+    const df = pv - cap, pct = df/cap*100;
+    const pnl = m.realised_pnl || 0;
+    const tot = (m.wins||0)+(m.losses||0);
+    const wr  = tot > 0 ? m.wins/tot*100 : 0;
+    const dd   = m.drawdown || 0;
+    const tpnl = m.total_pnl || 0;
+    const upnl = m.unrealised_pnl || 0;
+    document.getElementById(mkt+"-pv").textContent   = fc(pv,sym);
+    document.getElementById(mkt+"-pv").className     = "c-val mono "+sc(df);
+    document.getElementById(mkt+"-diff").innerHTML   = `<span class="${sc(df)}">${sgn(df)}${fc(df,sym)} (${sgn(pct)}${pct.toFixed(1)}%)</span>`;
+    document.getElementById(mkt+"-cash").textContent = fc(m.cash,sym);
+    document.getElementById(mkt+"-npos").textContent = Object.keys(m.positions||{}).length+" positions";
+    document.getElementById(mkt+"-pnl").textContent  = fc(pnl,sym);
+    document.getElementById(mkt+"-pnl").className    = "c-val mono "+sc(pnl);
+    document.getElementById(mkt+"-ntrades").textContent = tot+" trades";
+    document.getElementById(mkt+"-wr").textContent   = wr.toFixed(0)+"%";
+    document.getElementById(mkt+"-wr").className     = "c-val mono "+(wr>=50?"green":"red");
+    document.getElementById(mkt+"-wl").textContent   = (m.wins||0)+"W "+(m.losses||0)+"L";
+    document.getElementById(mkt+"-dd").textContent   = dd.toFixed(1)+"%";
+    document.getElementById(mkt+"-dd").className     = "c-val mono "+(dd>5?"red":"green");
+    document.getElementById(mkt+"-tpnl").textContent = (tpnl>=0?"+":"")+fc(tpnl,sym);
+    document.getElementById(mkt+"-tpnl").className   = "c-val mono "+sc(tpnl);
+    document.getElementById(mkt+"-upnl").innerHTML   =
+      `Float: <span class="${sc(upnl)}">${sgn(upnl)}${fc(upnl,sym)}</span>`;
+    // market open badge
+    const mb = document.getElementById(mkt+"-mkt");
+    mb.className = "badge "+(m.market_open?"b-open":"b-closed");
+    mb.textContent = m.market_open ? "OPEN" : "CLOSED";
+    // session info
+    const sl = document.getElementById(mkt+"-sess-lbl");
+    if (sl) {
+      const sessDate = m.session_date || "—";
+      const nTrades  = (m.trade_log||[]).length;
+      const pnlStr   = (m.realised_pnl||0) >= 0
+        ? "+" + fc(m.realised_pnl||0, sym) : fc(m.realised_pnl||0, sym);
+      sl.innerHTML = `Session <span class="mono" style="color:var(--muted)">${sessDate}</span>`
+        + `  ·  ${nTrades} trade${nTrades!==1?"s":""}  ·  `
+        + `<span class="${sc(m.realised_pnl||0)}">${pnlStr}</span>`;
+    }
+  });
+  // header badges
+  const nb = document.getElementById("nse-badge"), ub = document.getElementById("nyse-badge");
+  nb.className = "badge "+(d.india.market_open?"b-open":"b-closed");
+  nb.textContent = "NSE "+(d.india.market_open?"OPEN":"CLOSED");
+  ub.className = "badge "+(d.us.market_open?"b-open":"b-closed");
+  ub.textContent = "NYSE "+(d.us.market_open?"OPEN":"CLOSED");
+}
+
+// ── EOD per-position cell ─────────────────────────────────────────────────
+function eodCell(p, cur, sym, mtc) {
+  if (mtc == null || mtc <= 0) return `<td class="muted" style="font-size:10px">—</td>`;
+  const harvestMin = _cfg.eod_harvest_min || 30;
+  const exitMin    = _cfg.eod_exit_min    || 15;
+  const pnl        = (cur - p.entry) * p.qty;
+  const needPct    = ((p.entry / cur) - 1) * 100; // % rise needed to break even
+  let badge = "", note = "";
+
+  if (mtc <= exitMin) {
+    badge = `<span style="color:var(--red);font-size:10px;font-weight:700">⚡ FORCE EXIT</span>`;
+  } else if (mtc <= harvestMin) {
+    if (pnl > 0) {
+      badge = `<span style="color:var(--green);font-size:10px;font-weight:700">✓ HARVESTING</span>`;
+    } else {
+      badge = `<span style="color:var(--orange);font-size:10px;font-weight:700">⏳ HOLDING</span>`;
+      if (needPct > 0.05)
+        note = `<div style="color:var(--yellow);font-size:9px">need +${needPct.toFixed(1)}% → ${sym}${p.entry.toFixed(2)} BE</div>`;
+    }
+  } else {
+    const m = Math.floor(mtc);
+    badge = `<span style="color:var(--muted);font-size:10px">${m}m left</span>`;
+    if (pnl < 0 && mtc < 60 && needPct > 0.05)
+      note = `<div style="color:var(--yellow);font-size:9px">+${needPct.toFixed(1)}% to BE</div>`;
+  }
+  return `<td>${badge}${note}</td>`;
+}
+
+// ── Render positions table ────────────────────────────────────────────────
+function renderPos(positions, prices, sym, bodyId, countId, mkt, mtc) {
+  const cnt = Object.keys(positions||{}).length;
+  document.getElementById(countId).textContent = cnt;
+  const tb = document.getElementById(bodyId);
+  if (!cnt) {
+    tb.innerHTML = `<tr><td colspan="10" style="text-align:center;padding:18px;color:var(--muted)">No open positions</td></tr>`;
+    return;
+  }
+  tb.innerHTML = Object.entries(positions).map(([s,p]) => {
+    const cur = prices[s] || p.entry;
+    const pnl = (cur-p.entry)*p.qty;
+    const pct = pnl/(p.entry*p.qty)*100;
+    const c   = pnl>=0?"green":"red";
+    return `<tr>
+      <td class="mono" style="font-weight:700;color:var(--blue)">${disp(s)}</td>
+      <td class="mono">${p.qty}</td>
+      <td class="mono">${sym}${p.entry.toFixed(2)}</td>
+      <td class="mono">${sym}${cur.toFixed(2)}</td>
+      <td class="mono ${c}">${pnl>=0?"+":""}${sym}${Math.abs(pnl).toFixed(0)} (${pct>=0?"+":""}${pct.toFixed(1)}%)</td>
+      <td class="mono">${sym}${p.stop_loss.toFixed(2)}</td>
+      <td class="mono">${sym}${p.target.toFixed(2)}</td>
+      <td class="muted" style="font-size:11px">${fmtTs(p.entered_at||"")}</td>
+      ${eodCell(p, cur, sym, mtc)}
+      <td style="white-space:nowrap">
+        <button class="btn btn-muted btn-sm" style="margin-right:4px"
+          onclick="editPos('${mkt}','${s}',${p.qty},${p.entry},${p.stop_loss},${p.target})">Edit</button>
+        <button class="btn btn-red btn-sm" onclick="sellPos('${mkt}','${s}')">Sell</button>
+      </td>
+    </tr>`;
+  }).join("");
+}
+
+// ── EOD header badges + per-market banners ────────────────────────────────
+function renderEodHeader(d) {
+  [["india","NSE"],["us","NYSE"]].forEach(([mkt, label]) => {
+    const mtc        = d[mkt+"_mtc"];
+    const nPos       = Object.keys(d[mkt].positions||{}).length;
+    const harvestMin = d.config.eod_harvest_min || 30;
+    const exitMin    = d.config.eod_exit_min    || 15;
+    const badge      = document.getElementById(mkt+"-eod");
+    const banner     = document.getElementById(mkt+"-eod-banner");
+    const phase      = document.getElementById(mkt+"-eod-phase");
+    const detail     = document.getElementById(mkt+"-eod-detail");
+
+    if (mtc == null || mtc <= 0) {
+      badge.style.display  = "none";
+      banner.style.display = "none";
+      return;
+    }
+
+    // Header badge (visible whenever market is open and within 60 min of close)
+    if (mtc <= 60) {
+      badge.style.display = "";
+      badge.textContent   = `${label} EOD ${Math.floor(mtc)}m`;
+      badge.className     = "badge " + (mtc <= exitMin ? "b-eod-exit" : "b-eod-warn");
+    } else {
+      badge.style.display = "none";
+    }
+
+    // Banner above positions table
+    if (nPos > 0 && mtc <= harvestMin) {
+      banner.style.display = "flex";
+      if (mtc <= exitMin) {
+        banner.className   = "eod-banner eod-exit";
+        phase.textContent  = "⚡ FORCE EXIT";
+        phase.style.color  = "var(--red)";
+        detail.textContent = `Closing all ${nPos} position${nPos>1?"s":""} — ${Math.floor(mtc)} min until ${label} close`;
+      } else {
+        banner.className   = "eod-banner eod-warn";
+        phase.textContent  = "⏳ EOD HARVEST";
+        phase.style.color  = "var(--orange)";
+        detail.textContent =
+          `Selling profitable positions now. Force exit in ${Math.floor(mtc-exitMin)} min. No new buys.`;
+      }
+    } else if (nPos > 0 && mtc <= 60) {
+      banner.style.display = "flex";
+      banner.className     = "eod-banner eod-warn";
+      phase.textContent    = "EOD approaching";
+      phase.style.color    = "var(--muted)";
+      detail.textContent   =
+        `${Math.floor(mtc)} min until ${label} close — profit harvest starts in ${Math.floor(mtc-harvestMin)} min`;
+    } else {
+      banner.style.display = "none";
+    }
+  });
+}
+
+// ── Render signal board ───────────────────────────────────────────────────
+function renderSig(analyses, positions, sym, bodyId) {
+  const tb = document.getElementById(bodyId);
+  if (!analyses||!analyses.length) {
+    tb.innerHTML = `<tr><td colspan="9" style="text-align:center;padding:18px;color:var(--muted)">No scan data — start the agent</td></tr>`;
+    return;
+  }
+  tb.innerHTML = analyses.map(a => {
+    const inP  = positions&&positions[a.symbol];
+    const conf = a.confidence;
+    const cc   = conf>65?"var(--green)":conf>40?"var(--yellow)":"var(--muted)";
+    const actC = a.score>25?"act-buy":a.score<-25?"act-sell":"act-hold";
+    const actT = a.score>25?"BUY":a.score<-25?"SELL":"HOLD";
+    const rsiC = a.rsi<35?"var(--green)":a.rsi>65?"var(--red)":"inherit";
+    const macd = (a.signals?.MACD?.signal||"").split(" ")[0];
+    const bb   = (a.signals?.BB?.signal||"").split(" ")[0];
+    const ema  = (a.signals?.EMA?.signal||"").split(" ")[0];
+    const vol  = (a.signals?.Vol?.signal||"").split(" ")[0];
+    return `<tr>
+      <td class="mono" style="font-weight:600${inP?";color:var(--blue)":""}">${disp(a.symbol)}${inP?" *":""}</td>
+      <td class="mono">${sym}${(a.price||0).toFixed(2)}</td>
+      <td class="mono" style="color:${rsiC}">${(a.rsi||0).toFixed(0)}</td>
+      <td class="muted">${macd}</td>
+      <td class="muted">${bb}</td>
+      <td class="muted">${ema}</td>
+      <td class="muted">${vol}</td>
+      <td><div class="cbar"><div class="cbar-bg"><div class="cbar-fg" style="width:${conf}%;background:${cc}"></div></div>
+          <span class="mono" style="color:${cc};font-size:11px">${conf.toFixed(0)}%</span></div></td>
+      <td><span class="${actC}">${actT}</span></td>
+    </tr>`;
+  }).join("");
+}
+
+// ── Render trade log ──────────────────────────────────────────────────────
+function renderLog(trades, id, n=20) {
+  const el = document.getElementById(id);
+  if (!trades||!trades.length) {
+    el.innerHTML = `<div class="log-row"><span class="lt">—</span><span class="muted">No trades yet</span></div>`;
+    return;
+  }
+  el.innerHTML = [...trades].reverse().slice(0,n).map(t => {
+    const c = t.kind==="BUY"?"lb":t.kind==="SELL"?"ls":"ll";
+    return `<div class="log-row"><span class="lt">${fmtTs(t.time)}</span><span class="${c}">${t.message}</span></div>`;
+  }).join("");
+}
+
+function renderAllLogs(il, ul) {
+  const all = [...(il||[]).map(t=>({...t,mkt:"NSE"})),
+               ...(ul||[]).map(t=>({...t,mkt:"NYSE"}))]
+    .sort((a,b)=>b.time.localeCompare(a.time)).slice(0,150);
+  const el = document.getElementById("all-log");
+  if (!all.length) { el.innerHTML=`<div class="log-row"><span class="lt">—</span><span class="muted">No trades yet</span></div>`; return; }
+  el.innerHTML = all.map(t=>{
+    const c = t.kind==="BUY"?"lb":t.kind==="SELL"?"ls":"ll";
+    return `<div class="log-row"><span class="lt">${fmtTs(t.time)}</span>
+      <span class="muted" style="min-width:44px;font-size:10px">${t.mkt}</span>
+      <span class="${c}">${t.message}</span></div>`;
+  }).join("");
+}
+
+function renderAgentLog(entries) {
+  if (entries) _lastLogEntries = entries;
+  const all = _lastLogEntries || [];
+  const el  = document.getElementById("agent-log");
+  const cnt = document.getElementById("alog-count");
+  if (!all.length) {
+    el.innerHTML = `<div class="alog-row"><span class="al-ts">—</span><span class="al-lvl al-debug">—</span><span class="muted">No agent activity yet — start the agent</span></div>`;
+    if (cnt) cnt.textContent = "0 entries";
+    return;
+  }
+  const filtered = _logFilter === "ALL" ? all
+    : all.filter(e => (e.level||"").toUpperCase() === _logFilter);
+  if (!filtered.length) {
+    el.innerHTML = `<div class="alog-row"><span class="al-ts">—</span><span class="al-lvl al-debug">—</span><span class="muted">No ${_logFilter} entries</span></div>`;
+    if (cnt) cnt.textContent = "0 / " + all.length + " entries";
+    return;
+  }
+  el.innerHTML = [...filtered].reverse().map(e => {
+    const lc = "al-"+(e.level||"info").toLowerCase();
+    return `<div class="alog-row">
+      <span class="al-ts">${fmtTs(e.ts||"")}</span>
+      <span class="al-lvl ${lc}">${e.level||""}</span>
+      <span style="color:var(--text);flex:1">${e.msg||""}</span>
+    </div>`;
+  }).join("");
+  if (cnt) cnt.textContent = filtered.length + (filtered.length < all.length ? " / "+all.length : "") + " entries";
+  if (_autoScroll) el.scrollTop = 0;
+}
+
+// ── Render agent badge + controls ─────────────────────────────────────────
+function renderAgent(a) {
+  const ab  = document.getElementById("agent-badge");
+  const bt  = document.getElementById("btn-toggle");
+  const bp  = document.getElementById("btn-pause");
+  if (a.running && !a.paused) {
+    ab.className  = "badge b-run"; ab.textContent = "● "+(a.status||"RUNNING").toUpperCase();
+    bt.className  = "btn btn-red"; bt.textContent = "■ Stop Agent";
+    bp.textContent = "⏸ Pause";
+  } else if (a.paused) {
+    ab.className  = "badge b-pause"; ab.textContent = "⏸ PAUSED";
+    bt.className  = "btn btn-red";   bt.textContent = "■ Stop Agent";
+    bp.textContent = "▶ Resume";
+  } else {
+    ab.className  = "badge b-idle"; ab.textContent = "IDLE";
+    bt.className  = "btn btn-green"; bt.textContent = "▶ Start Agent";
+    bp.textContent = "⏸ Pause";
+  }
+  if (a.last_update) document.getElementById("last-upd").textContent = "Last update: "+fmtDt(a.last_update);
+}
+
+// ── Load config into form ─────────────────────────────────────────────────
+function loadCfg(c) {
+  document.getElementById("s-risk").value  = c.risk_per_trade;
+  document.getElementById("s-conf").value  = c.confidence_threshold;
+  document.getElementById("s-sl").value    = c.stop_loss_pct;
+  document.getElementById("s-tgt").value   = c.target_pct;
+  document.getElementById("s-chk").value   = c.check_interval_min;
+  document.getElementById("s-idle").value  = c.idle_interval_min;
+  document.getElementById("s-ip").value    = c.india_max_positions;
+  document.getElementById("s-up").value    = c.us_max_positions;
+  document.getElementById("s-eod-h").value = c.eod_harvest_min;
+  document.getElementById("s-eod-e").value = c.eod_exit_min;
+}
+
+// ── Load editable state into form ─────────────────────────────────────────
+function loadEditState(d) {
+  const fill = (id, val, decimals=2) =>
+    { const el = document.getElementById(id); if(el) el.value = (val||0).toFixed ? (val||0).toFixed(decimals) : (val||0); };
+  fill("es-india-cash",   d.india.cash);
+  fill("es-india-rpnl",   d.india.realised_pnl);
+  fill("es-india-wins",   d.india.wins,    0);
+  fill("es-india-losses", d.india.losses,  0);
+  fill("es-india-peak",   d.india.peak_portfolio || d.india.portfolio_value);
+  fill("es-us-cash",      d.us.cash);
+  fill("es-us-rpnl",      d.us.realised_pnl);
+  fill("es-us-wins",      d.us.wins,    0);
+  fill("es-us-losses",    d.us.losses,  0);
+  fill("es-us-peak",      d.us.peak_portfolio || d.us.portfolio_value);
+}
+
+async function saveEditState() {
+  const gf = id => parseFloat(document.getElementById(id).value);
+  const gi = id => parseInt(document.getElementById(id).value);
+  const body = {
+    india: { cash: gf("es-india-cash"), realised_pnl: gf("es-india-rpnl"),
+             wins: gi("es-india-wins"), losses: gi("es-india-losses"),
+             peak_portfolio: gf("es-india-peak") },
+    us:    { cash: gf("es-us-cash"),    realised_pnl: gf("es-us-rpnl"),
+             wins: gi("es-us-wins"),    losses: gi("es-us-losses"),
+             peak_portfolio: gf("es-us-peak") },
+  };
+  const r = await fetch("/api/edit/state", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(body),
+  });
+  const d = await r.json();
+  toast(d.ok ? "Portfolio state updated" : "Update failed", d.ok);
+  if (d.ok) setTimeout(doRefresh, 300);
+}
+
+// ── Position editing ──────────────────────────────────────────────────────
+function editPos(mkt, sym, qty, entry, sl, tgt) {
+  document.getElementById("epm-sym").textContent = disp(sym);
+  document.getElementById("epm-mkt").value = mkt;
+  document.getElementById("epm-sym-h").value = sym;
+  document.getElementById("epm-qty").value   = qty;
+  document.getElementById("epm-entry").value = entry.toFixed(2);
+  document.getElementById("epm-sl").value    = sl.toFixed(2);
+  document.getElementById("epm-tgt").value   = tgt.toFixed(2);
+  document.getElementById("pos-edit-modal").classList.add("open");
+}
+
+function closeEditPos() {
+  document.getElementById("pos-edit-modal").classList.remove("open");
+}
+
+async function saveEditPos() {
+  const mkt = document.getElementById("epm-mkt").value;
+  const sym = document.getElementById("epm-sym-h").value;
+  const body = {
+    qty:       parseInt(document.getElementById("epm-qty").value),
+    entry:     parseFloat(document.getElementById("epm-entry").value),
+    stop_loss: parseFloat(document.getElementById("epm-sl").value),
+    target:    parseFloat(document.getElementById("epm-tgt").value),
+  };
+  const r = await fetch(`/api/edit/position/${mkt}/${sym}`, {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(body),
+  });
+  const d = await r.json();
+  toast(d.ok ? "Position updated" : d.msg, d.ok);
+  closeEditPos();
+  if (d.ok) setTimeout(doRefresh, 300);
+}
+
+// ── Sessions ──────────────────────────────────────────────────────────────
+async function pollSessions() {
+  try {
+    const r = await fetch("/api/sessions");
+    if (!r.ok) return;
+    _sessData = await r.json();
+    renderSessions(_sessData);
+  } catch(e) {}
+}
+
+function setSessFilter(f, el) {
+  _sessFilter = f;
+  document.querySelectorAll(".sess-filter").forEach(b => b.classList.remove("on"));
+  el.classList.add("on");
+  renderSessions(_sessData);
+}
+
+function toggleSessBody(safeId) {
+  const el = document.getElementById("sb-"+safeId);
+  if (el) el.classList.toggle("open");
+}
+
+function renderSessions(sessions) {
+  const filtered = _sessFilter === "all" ? sessions
+    : sessions.filter(s => s.market === _sessFilter);
+  const cnt = document.getElementById("sess-count");
+  if (cnt) cnt.textContent = filtered.length + " session" + (filtered.length !== 1 ? "s" : "");
+  const tc = document.getElementById("sess-tab-cnt");
+  if (tc) tc.textContent = sessions.length > 0 ? "("+sessions.length+")" : "";
+  const el = document.getElementById("sess-list");
+  if (!filtered.length) {
+    el.innerHTML = `<div style="text-align:center;padding:36px;color:var(--muted)">No past sessions yet — sessions are archived automatically when the calendar date changes</div>`;
+    return;
+  }
+  el.innerHTML = filtered.map(s => {
+    const sm      = s.market === "india" ? "₹" : "$";
+    const safe    = (s.id||"").replace(/[^a-zA-Z0-9]/g,"_");
+    const pnlCls  = (s.net_pnl||0) >= 0 ? "green" : "red";
+    const tot     = (s.wins||0) + (s.losses||0);
+    const wr      = tot > 0 ? (s.wins/tot*100).toFixed(0)+"%" : "—";
+    const mktCls  = s.market === "india" ? "sess-mkt-india" : "sess-mkt-us";
+    const mktLbl  = s.market === "india" ? "NSE" : "NYSE";
+    const sign    = (s.net_pnl||0) >= 0 ? "+" : "";
+    const trades  = s.trades || [];
+    const trHtml  = trades.length
+      ? [...trades].reverse().map(t => {
+          const c = t.kind==="BUY"?"lb":t.kind==="SELL"?"ls":"ll";
+          return `<div class="log-row"><span class="lt">${fmtTs(t.time)}</span><span class="${c}">${t.message}</span></div>`;
+        }).join("")
+      : `<div class="log-row"><span class="muted" style="padding:4px 10px">No trades this session</span></div>`;
+    return `<div class="sess-card">
+      <div class="sess-hdr" onclick="toggleSessBody('${safe}')">
+        <span class="sess-date">${s.date||"—"}</span>
+        <span class="sess-mkt ${mktCls}">${mktLbl}</span>
+        <div style="flex:1;display:flex;flex-wrap:wrap;gap:16px;align-items:center;padding:0 6px">
+          <span class="mono" style="font-size:12px;color:var(--muted)">
+            ${sm}${(s.start_cash||0).toLocaleString(undefined,{maximumFractionDigits:0})}
+            → ${sm}${(s.end_cash||0).toLocaleString(undefined,{maximumFractionDigits:0})}
+          </span>
+          <span class="mono ${pnlCls}" style="font-size:14px;font-weight:700">
+            ${sign}${sm}${Math.abs(s.net_pnl||0).toLocaleString(undefined,{maximumFractionDigits:0})}
+            <span style="font-size:11px;font-weight:400;color:inherit;opacity:.8">
+              (${sign}${(s.pnl_pct||0).toFixed(1)}%)
+            </span>
+          </span>
+          <span class="muted" style="font-size:11px">
+            ${s.wins||0}W ${s.losses||0}L · ${wr} WR · ${s.n_trades||trades.length} trade${(s.n_trades||trades.length)!==1?"s":""}
+          </span>
+        </div>
+        <span style="color:var(--muted);font-size:14px;padding-left:4px">›</span>
+      </div>
+      <div class="sess-body" id="sb-${safe}">
+        <div class="sess-metrics">
+          <div class="sess-m">
+            <span class="sess-m-l">Start Capital</span>
+            <span class="sess-m-v">${sm}${(s.start_cash||0).toLocaleString(undefined,{maximumFractionDigits:0})}</span>
+          </div>
+          <div class="sess-m">
+            <span class="sess-m-l">End Cash</span>
+            <span class="sess-m-v">${sm}${(s.end_cash||0).toLocaleString(undefined,{maximumFractionDigits:0})}</span>
+          </div>
+          <div class="sess-m">
+            <span class="sess-m-l">End Portfolio</span>
+            <span class="sess-m-v">${sm}${(s.end_portfolio||s.end_cash||0).toLocaleString(undefined,{maximumFractionDigits:0})}</span>
+          </div>
+          <div class="sess-m">
+            <span class="sess-m-l">Net P&amp;L</span>
+            <span class="sess-m-v ${pnlCls}">${sign}${sm}${Math.abs(s.net_pnl||0).toLocaleString(undefined,{maximumFractionDigits:0})}</span>
+          </div>
+          <div class="sess-m">
+            <span class="sess-m-l">Wins / Losses</span>
+            <span class="sess-m-v">${s.wins||0}W / ${s.losses||0}L</span>
+          </div>
+          <div class="sess-m">
+            <span class="sess-m-l">Win Rate</span>
+            <span class="sess-m-v">${wr}</span>
+          </div>
+          <div class="sess-m">
+            <span class="sess-m-l">Archived at</span>
+            <span class="sess-m-v muted" style="font-size:11px">${fmtTs(s.archived_at||"")}</span>
+          </div>
+        </div>
+        <div class="log-box" style="max-height:200px;border-radius:0;border:none;background:#0a0e14">
+          ${trHtml}
+        </div>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+async function closeSessionNow(market) {
+  if (!confirm(`Archive current ${market.toUpperCase()} session and reset to starting capital?\n\nAll open positions will be force-closed at current prices.`)) return;
+  const r = await fetch("/api/sessions/close/"+market, {method:"POST"});
+  const d = await r.json();
+  toast(d.msg, d.ok);
+  if (d.ok) { setTimeout(doRefresh, 400); setTimeout(pollSessions, 600); }
+}
+
+// ── Main refresh ──────────────────────────────────────────────────────────
+async function doRefresh() {
+  try {
+    const r = await fetch("/api/state");
+    const d = await r.json();
+    _cfg = d.config;
+    renderStats(d);
+    renderAgent(d.agent);
+    loadCfg(d.config);
+    loadEditState(d);
+    renderEodHeader(d);
+    renderPos(d.india.positions, d.signals.india_prices, "₹", "india-pos", "india-pc", "india", d.india_mtc);
+    renderPos(d.us.positions,    d.signals.us_prices,    "$",  "us-pos",    "us-pc",    "us",    d.us_mtc);
+    renderSig(d.signals.india, d.india.positions, "₹", "india-sig");
+    renderSig(d.signals.us,    d.us.positions,    "$",  "us-sig");
+    renderLog(d.india.trade_log, "india-log");
+    renderLog(d.us.trade_log,    "us-log");
+    renderAllLogs(d.india.trade_log, d.us.trade_log);
+    renderAgentLog(d.agent_log || []);
+    // update sessions tab badge + refresh sessions data in background
+    const tc = document.getElementById("sess-tab-cnt");
+    if (tc) tc.textContent = d.sessions_count > 0 ? "("+d.sessions_count+")" : "";
+    if (_activeTab === "sessions") pollSessions();
+    startProg();
+  } catch(e) { toast("Refresh failed: "+e.message, false); }
+}
+
+function scheduleRefresh() {
+  clearTimeout(_refreshTimer);
+  _refreshTimer = setTimeout(()=>{ doRefresh(); scheduleRefresh(); }, INTERVAL*1000);
+}
+
+// ── Controls ──────────────────────────────────────────────────────────────
+async function toggleAgent() {
+  const running = document.getElementById("btn-toggle").textContent.includes("Stop");
+  const url = running ? "/api/agent/stop" : "/api/agent/start";
+  const r = await fetch(url,{method:"POST"});
+  const d = await r.json();
+  toast(d.msg, d.ok);
+  setTimeout(doRefresh, 400);
+}
+
+async function pauseAgent() {
+  const r = await fetch("/api/agent/pause",{method:"POST"});
+  const d = await r.json();
+  if (d.ok) toast(d.paused ? "Agent paused" : "Agent resumed");
+  else toast(d.msg, false);
+  setTimeout(doRefresh, 300);
+}
+
+async function sellPos(market, symbol) {
+  if (!confirm("Force sell "+disp(symbol)+"?")) return;
+  const r = await fetch("/api/sell/"+market+"/"+symbol,{method:"POST"});
+  const d = await r.json();
+  toast(d.msg, d.ok);
+  setTimeout(doRefresh, 400);
+}
+
+async function saveConfig() {
+  const p = {
+    risk_per_trade:       parseFloat(document.getElementById("s-risk").value),
+    confidence_threshold: parseInt(document.getElementById("s-conf").value),
+    stop_loss_pct:        parseFloat(document.getElementById("s-sl").value),
+    target_pct:           parseFloat(document.getElementById("s-tgt").value),
+    check_interval_min:   parseInt(document.getElementById("s-chk").value),
+    idle_interval_min:    parseInt(document.getElementById("s-idle").value),
+    india_max_positions:  parseInt(document.getElementById("s-ip").value),
+    us_max_positions:     parseInt(document.getElementById("s-up").value),
+    eod_harvest_min:      parseInt(document.getElementById("s-eod-h").value),
+    eod_exit_min:         parseInt(document.getElementById("s-eod-e").value),
+  };
+  const r = await fetch("/api/config",{method:"POST",
+    headers:{"Content-Type":"application/json"},body:JSON.stringify(p)});
+  const d = await r.json();
+  toast(d.ok ? "Settings saved — applies next cycle" : "Save failed", d.ok);
+}
+
+async function resetMkt(market) {
+  if (!confirm("Reset "+market+" paper state? This erases all positions, trades and P&L.")) return;
+  const r = await fetch("/api/reset/"+market,{method:"POST"});
+  const d = await r.json();
+  toast(d.msg, d.ok);
+  setTimeout(doRefresh, 300);
+}
+
+// ── Boot ──────────────────────────────────────────────────────────────────
+doRefresh();
+scheduleRefresh();
+startProg();
+</script>
+</body>
+</html>"""
+
+# ─── GUNICORN / WSGI STARTUP ──────────────────────────────────────────────────
+# Runs when gunicorn (or any WSGI server) imports this module.
+# __main__ block below is kept for local `python apex_dashboard.py` usage.
+
+def _on_startup():
+    global _state
+    with _lock:
+        _state = load_state()
+    start_price_updater()
+    apex_log.info("Apex started — Supabase storage, dual-loop active")
+
+_on_startup()
+
+# ─── ENTRY POINT ──────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import webbrowser
+    # _on_startup() already ran at import time; no need to reload state here.
+    url = "http://localhost:7000"
+    print(f"\n  Apex Dashboard  →  {url}")
+    print("  Press Ctrl+C to stop\n")
+    threading.Timer(1.2, lambda: webbrowser.open(url)).start()
+    app.run(host="0.0.0.0", port=7000, debug=False,
+            use_reloader=False, threaded=True)
