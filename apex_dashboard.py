@@ -1157,7 +1157,7 @@ tr:hover td{background:#1c2330}
 .alog-row{padding:4px 10px;border-bottom:1px solid #161b22;
           font-family:monospace;font-size:11px;display:flex;gap:8px;align-items:baseline}
 .alog-row:last-child{border-bottom:none}
-.al-ts{color:#444c56;min-width:68px;font-size:10px}
+.al-ts{color:#444c56;min-width:120px;font-size:10px}
 .al-lvl{min-width:52px;font-size:9px;font-weight:700;letter-spacing:.5px;text-transform:uppercase}
 .al-info{color:var(--blue)}.al-debug{color:#444c56}.al-warning{color:var(--yellow)}.al-error{color:var(--red)}
 
@@ -1197,6 +1197,53 @@ input:focus{outline:none;border-color:var(--blue)}
 
 /* ── Log filter ── */
 .log-filter-btn.on{background:#0d1e3a;color:var(--blue);border-color:#1a3a6a}
+
+/* ── Mobile responsive ── */
+@media (max-width:640px){
+  /* Main padding */
+  .main{padding:10px 10px}
+
+  /* Header: hide clock to save room, tighten gaps */
+  .hdr{padding:8px 10px;gap:6px}
+  #clock{display:none}
+  .hdr-right{gap:5px}
+  .logo{font-size:13px}
+
+  /* Market summary: stack India / US vertically */
+  .g2{grid-template-columns:1fr}
+
+  /* Stats row: 3 columns instead of 6 */
+  .g5{grid-template-columns:repeat(3,1fr)}
+
+  /* Smaller stat values so they fit in 3-col */
+  .c-val{font-size:16px}
+
+  /* Tabs: horizontal scroll, no wrapping */
+  .tabs{overflow-x:auto;flex-wrap:nowrap;-webkit-overflow-scrolling:touch;
+        scrollbar-width:none}
+  .tabs::-webkit-scrollbar{display:none}
+  .tab{white-space:nowrap;flex-shrink:0;padding:7px 12px}
+
+  /* Settings: single-column forms */
+  .fgrid{grid-template-columns:1fr}
+  .es-grid{grid-template-columns:1fr}
+
+  /* Modal: full-width on small screens */
+  .modal-box{min-width:unset;width:calc(100vw - 24px);padding:16px}
+
+  /* Agent log timestamp: slightly narrower */
+  .al-ts{min-width:90px}
+
+  /* Toasts: keep inside viewport */
+  .toasts{right:10px;bottom:10px;max-width:calc(100vw - 20px)}
+  .toast{max-width:100%}
+}
+
+/* Extra-narrow phones (< 400px): 2-col stats */
+@media (max-width:400px){
+  .g5{grid-template-columns:repeat(2,1fr)}
+  .btn{padding:4px 8px;font-size:10px}
+}
 
 /* ── Position / state edit modal ── */
 .modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);
@@ -1546,14 +1593,12 @@ let _sessData   = [];
 // ── Utilities ──────────────────────────────────────────────────────────────
 
 // Format a UTC ISO timestamp string into local date + time.
-// Today's entries: show time only. Older entries: show "15 Apr 14:30:22".
+// Always shows "15 Apr 14:30:22" so the date is visible in the log.
 function fmtTs(ts) {
   if (!ts || ts === "—") return ts;
   const d = new Date(ts);
   if (isNaN(d.getTime())) return ts;          // graceful fallback for legacy strings
-  const sameDay = d.toDateString() === new Date().toDateString();
   const timePart = d.toLocaleTimeString(undefined, {hour:"2-digit", minute:"2-digit", second:"2-digit", hour12:false});
-  if (sameDay) return timePart;
   const datePart = d.toLocaleDateString(undefined, {day:"2-digit", month:"short"});
   return datePart + "  " + timePart;
 }
