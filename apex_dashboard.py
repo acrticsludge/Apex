@@ -111,6 +111,21 @@ if not apex_log.handlers:
     apex_log.addHandler(_fh)
     apex_log.addHandler(_BufHandler())
 
+# ─── DECISION / THINKING LOG ──────────────────────────────────────────────────
+# Separate from apex_log — plain-language narration of every bot decision.
+# Categories: CYCLE · SCAN · FILTER · ENTRY · EXIT · RISK · INDEX
+
+_think_buffer: deque = deque(maxlen=400)
+
+def think_log(cat: str, msg: str, sym: str = "") -> None:
+    """Append a reasoning entry. Thread-safe: deque.append is atomic in CPython."""
+    _think_buffer.append({
+        "ts":  datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "cat": cat,
+        "sym": sym,
+        "msg": msg,
+    })
+
 # ─── SHARED STATE ─────────────────────────────────────────────────────────────
 
 _lock    = threading.Lock()
@@ -249,6 +264,9 @@ def _refresh_index_trend():
                     _index_trend[key] = round((last - first) / first * 100, 3)
         except Exception as e:
             apex_log.debug(f"[INDEX] {key} refresh failed: {e}")
+    think_log("INDEX",
+              f"India (^NSEI) {_index_trend['india']:+.2f}%   "
+              f"US (^GSPC) {_index_trend['us']:+.2f}%")
 
 # ─── INDICATORS ───────────────────────────────────────────────────────────────
 
@@ -699,6 +717,11 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int):
         f"{len(mstate['positions'])} positions open  "
         f"cash={mstate['cash']:.0f}"
     )
+    think_log("CYCLE",
+              f"{market_key.upper()} scan started — "
+              f"{len(analyses)} symbols  "
+              f"{len(mstate['positions'])} positions open  "
+              f"cash={mstate['cash']:.0f}")
 
     # ── 1. Update peak portfolio (prerequisite for drawdown kill-switch) ──────
     pv = portfolio_value(mstate, prices)
@@ -717,11 +740,13 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int):
             pnl = (price - pos["entry"]) * pos["qty"]
 
             if exit_min < mtc <= harvest_min and pnl > 0:
+                think_log("EXIT", f"{sym} EOD HARVEST: {mtc:.0f}m to close  P&L={pnl:+.0f}", sym)
                 paper_sell(sym, pos["qty"], prices, mstate, f"EOD PROFIT ({mtc:.0f}m to close)")
                 apex_log.info(f"EOD profit harvest: {sym}  P&L={pnl:+.0f}  {mtc:.0f}m left")
 
             elif mtc <= exit_min:
                 tag = "EOD EXIT" if pnl >= 0 else "EOD CUT LOSS"
+                think_log("EXIT", f"{sym} EOD FORCE EXIT ({tag}): {mtc:.0f}m to close  P&L={pnl:+.0f}", sym)
                 paper_sell(sym, pos["qty"], prices, mstate, f"{tag} ({mtc:.0f}m to close)")
                 apex_log.info(f"EOD force exit: {sym}  P&L={pnl:+.0f}  {mtc:.0f}m left")
 
@@ -741,15 +766,20 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int):
                 if new_sl > pos["stop_loss"]:
                     old_sl = pos["stop_loss"]
                     pos["stop_loss"] = round(new_sl, 2)
+                    think_log("EXIT",
+                              f"{sym} TRAIL ↑ SL {old_sl:.2f}→{pos['stop_loss']:.2f}  "
+                              f"running_high={pos['running_high']:.2f}", sym)
                     apex_log.debug(
                         f"[TRAIL] {sym}  SL {old_sl:.2f}→{pos['stop_loss']:.2f}  "
                         f"high={pos['running_high']:.2f}"
                     )
 
         if price <= pos["stop_loss"]:
+            think_log("EXIT", f"{sym} STOP LOSS hit @ {price:.2f}  SL was {pos['stop_loss']:.2f}", sym)
             paper_sell(sym, pos["qty"], prices, mstate, "STOP LOSS")
             _dc["sell"] += 1
         elif price >= pos["target"]:
+            think_log("EXIT", f"{sym} TARGET HIT @ {price:.2f}  T was {pos['target']:.2f}", sym)
             paper_sell(sym, pos["qty"], prices, mstate, "TARGET HIT")
             _dc["sell"] += 1
         else:
@@ -776,6 +806,9 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int):
     if (daily_loss_pct < -cfg.get("daily_loss_limit_pct", 0.05)
             or drawdown_pct > cfg.get("max_drawdown_pct", 0.08)):
         mstate["trading_halted"] = True
+        think_log("RISK",
+                  f"TRADING HALTED — daily_loss={daily_loss_pct:.1%}  "
+                  f"drawdown={drawdown_pct:.1%}  No new entries this session")
         apex_log.warning(
             f"[{market_key.upper()}] ⛔ TRADING HALTED — "
             f"daily_loss={daily_loss_pct:.1%}  drawdown={drawdown_pct:.1%}"
@@ -807,9 +840,22 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int):
     for a in sorted(analyses, key=lambda x: x["confidence"], reverse=True):
         sym    = a["symbol"]
         in_pos = sym in mstate["positions"]
+        conf   = a["confidence"]
+        adx_val = a.get("adx", 25.0)
+
+        # ── SCAN log for every symbol not already held ────────────────────────
+        if not in_pos:
+            think_log("SCAN",
+                      f"RSI={a.get('rsi', 0):.1f}  "
+                      f"Score={a['score']:+d}  Conf={conf:.0f}%  "
+                      f"ADX={adx_val:.1f}  ATR={a.get('atr', 0):.3f}",
+                      sym)
 
         # Signal exit for held positions (no window restriction)
         if in_pos and a["score"] < -30:
+            think_log("EXIT",
+                      f"{sym} SIGNAL EXIT: score={a['score']}  conf={conf:.0f}%  "
+                      f"(bearish reversal)", sym)
             paper_sell(sym, 0, prices, mstate, "SIGNAL EXIT")
             _dc["sell"] += 1
             continue
@@ -817,31 +863,42 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int):
         if in_pos:
             apex_log.debug(
                 f"[{market_key.upper()}] HOLD  {sym}  "
-                f"score={a['score']:+d}  conf={a['confidence']:.0f}%"
+                f"score={a['score']:+d}  conf={conf:.0f}%"
             )
             _dc["hold"] += 1
             continue
 
         # ── New entry checks ─────────────────────────────────────────────────
-        conf = a["confidence"]
 
         # Open window: only allow trades if confidence >= 85%
         if in_open_window and conf < open_conf_gate:
+            think_log("FILTER",
+                      f"{sym} SKIP open-window: {mins_since_open:.0f}m since open  "
+                      f"conf={conf:.0f}% < {open_conf_gate}%", sym)
             apex_log.debug(
                 f"[{market_key.upper()}] OBSERVE  {sym}  "
                 f"conf={conf:.0f}% < {open_conf_gate}% (open window)"
             )
             _dc["watch"] += 1
             continue
+        elif in_open_window and conf >= open_conf_gate:
+            think_log("FILTER",
+                      f"{sym} ALLOW open-window: conf={conf:.0f}% >= {open_conf_gate}%  "
+                      f"(high conviction override)", sym)
 
         # Index trend gate
         if not index_ok:
+            think_log("FILTER",
+                      f"{sym} SKIP index: {market_key} {index_pct:+.2f}% < "
+                      f"{cfg.get('index_min_pct', -0.5):.1f}% gate", sym)
             _dc["watch"] += 1
             continue
 
         # ADX trend gate
-        adx_val = a.get("adx", 25.0)
         if adx_val < cfg.get("adx_min", 20):
+            think_log("FILTER",
+                      f"{sym} SKIP ADX: {adx_val:.1f} < {cfg.get('adx_min', 20)}  "
+                      f"(market not trending, signals unreliable)", sym)
             apex_log.debug(
                 f"[{market_key.upper()}] NO-TREND  {sym}  ADX={adx_val:.1f}"
             )
@@ -851,6 +908,9 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int):
         # Re-entry cooldown
         cooldown_until = mstate.get("cooldown_until", {}).get(sym, "")
         if cooldown_until and now_utc < cooldown_until:
+            think_log("FILTER",
+                      f"{sym} SKIP cooldown: re-entry blocked until {cooldown_until}  "
+                      f"(60m pause after stop-loss)", sym)
             apex_log.debug(f"[COOLDOWN] {sym}  blocked until {cooldown_until}")
             _dc["watch"] += 1
             continue
@@ -862,10 +922,27 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int):
                 and a["score"] > 0
                 and open_pos < max_pos
                 and mstate["cash"] > a["price"] * 2):
+            think_log("ENTRY",
+                      f"{sym} ENTRY: conf={conf:.0f}%  score={a['score']:+d}  "
+                      f"@ {a['price']:.2f}  ADX={adx_val:.1f}  ATR={a.get('atr', 0):.3f}", sym)
             if paper_buy(sym, 0, prices, mstate, atr=a.get("atr")):
                 open_pos += 1
                 _dc["buy"] += 1
         else:
+            # Diagnose which condition failed
+            if open_pos >= max_pos:
+                think_log("FILTER",
+                          f"{sym} SKIP: max positions ({max_pos}) already open", sym)
+            elif mstate["cash"] <= a["price"] * 2:
+                think_log("FILTER",
+                          f"{sym} SKIP: insufficient cash  "
+                          f"cash={mstate['cash']:.0f}  need≈{a['price']*2:.0f}", sym)
+            elif conf < cfg["confidence_threshold"]:
+                think_log("FILTER",
+                          f"{sym} SKIP: conf={conf:.0f}% < threshold {cfg['confidence_threshold']}%", sym)
+            else:
+                think_log("FILTER",
+                          f"{sym} SKIP: score={a['score']} not bullish enough", sym)
             apex_log.debug(
                 f"[{market_key.upper()}] WATCH  {sym}  "
                 f"score={a['score']:+d}  conf={conf:.0f}%  ADX={adx_val:.1f}"
@@ -1127,7 +1204,8 @@ def api_state():
         "agent":  _agent,
         "config": cfg,
         "server_time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "agent_log":  list(_log_buffer)[-100:],
+        "agent_log":    list(_log_buffer)[-100:],
+        "decision_log": list(_think_buffer)[-150:],
         "india_mtc":  minutes_to_close("india"),
         "us_mtc":     minutes_to_close("us"),
         "india": {
@@ -1219,6 +1297,10 @@ def update_config():
 @app.route("/api/logs")
 def api_logs():
     return jsonify(list(_log_buffer))
+
+@app.route("/api/think")
+def api_think():
+    return jsonify(list(_think_buffer))
 
 @app.route("/api/reset/<market>", methods=["POST"])
 def reset_market(market):
@@ -1454,6 +1536,25 @@ tr:hover td{background:#1c2330}
 .al-ts{color:#444c56;min-width:120px;font-size:10px}
 .al-lvl{min-width:52px;font-size:9px;font-weight:700;letter-spacing:.5px;text-transform:uppercase}
 .al-info{color:var(--blue)}.al-debug{color:#444c56}.al-warning{color:var(--yellow)}.al-error{color:var(--red)}
+
+/* ── Decision / thinking log ── */
+.dlog-box{background:#0a0e14;border:1px solid var(--border);border-radius:6px;
+          max-height:420px;overflow-y:auto}
+.drow{padding:3px 10px;border-bottom:1px solid #161b22;
+      font-family:monospace;font-size:11px;display:flex;gap:8px;align-items:baseline;flex-wrap:nowrap}
+.drow:last-child{border-bottom:none}
+.drow:hover{background:#12161f}
+.dcat{min-width:48px;font-size:9px;font-weight:700;letter-spacing:.4px;
+      text-transform:uppercase;padding:1px 5px;border-radius:3px;white-space:nowrap}
+.dcat-CYCLE {background:#1e1e1e;color:#666}
+.dcat-SCAN  {background:#0d2040;color:#4a9eff}
+.dcat-FILTER{background:#2e1800;color:#f0900a}
+.dcat-ENTRY {background:#0a2016;color:#27c46b}
+.dcat-EXIT  {background:#2a0a0a;color:#e05454}
+.dcat-RISK  {background:#3a0000;color:#ff4444;font-weight:900}
+.dcat-INDEX {background:#1a0a30;color:#b47fff}
+.dsym{color:#bbb;min-width:88px;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dmsg{color:#ddd;flex:1;white-space:pre-wrap;word-break:break-word}
 
 /* ── Settings form ── */
 .fg{display:flex;flex-direction:column;gap:4px}
@@ -1811,7 +1912,33 @@ input:focus{outline:none;border-color:var(--blue)}
 
   <!-- Logs pane -->
   <div class="pane" id="pane-logs">
+
+    <!-- Decision Log -->
     <div class="sec">
+      <span class="sec-title">Decision Log</span>
+      <span class="sec-badge" id="dlog-count">0 entries</span>
+      <span style="margin-left:auto;font-size:10px;color:var(--muted)">why the bot does what it does</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:6px;margin-bottom:8px;flex-wrap:wrap">
+      <button class="btn btn-muted btn-sm log-filter-btn on" id="df-ALL"    onclick="setDlogFilter('ALL',this)">ALL</button>
+      <button class="btn btn-muted btn-sm log-filter-btn"   id="df-SCAN"   onclick="setDlogFilter('SCAN',this)">SCAN</button>
+      <button class="btn btn-muted btn-sm log-filter-btn"   id="df-ENTRY"  onclick="setDlogFilter('ENTRY',this)">ENTRY</button>
+      <button class="btn btn-muted btn-sm log-filter-btn"   id="df-EXIT"   onclick="setDlogFilter('EXIT',this)">EXIT</button>
+      <button class="btn btn-muted btn-sm log-filter-btn"   id="df-FILTER" onclick="setDlogFilter('FILTER',this)">FILTER</button>
+      <button class="btn btn-muted btn-sm log-filter-btn"   id="df-RISK"   onclick="setDlogFilter('RISK',this)">RISK</button>
+      <button class="btn btn-muted btn-sm log-filter-btn"   id="df-INDEX"  onclick="setDlogFilter('INDEX',this)">INDEX</button>
+      <button class="btn btn-muted btn-sm log-filter-btn"   id="df-CYCLE"  onclick="setDlogFilter('CYCLE',this)">CYCLE</button>
+      <label style="display:flex;align-items:center;gap:5px;font-size:10px;color:var(--muted);
+                    margin-left:8px;text-transform:none;letter-spacing:0;cursor:pointer">
+        <input type="checkbox" id="dlog-autoscroll" checked> Auto-scroll
+      </label>
+      <span id="dlog-live-dot" style="margin-left:4px;font-size:9px;color:var(--muted)">● live</span>
+    </div>
+    <div class="dlog-box" id="dlog-box">
+      <div class="drow"><span class="al-ts">—</span><span class="dcat dcat-CYCLE">CYCLE</span><span class="dsym"></span><span class="dmsg muted">No decisions yet — start the agent</span></div>
+    </div>
+
+    <div class="sec" style="margin-top:18px">
       <span class="sec-title">Agent System Log</span>
       <span class="sec-badge" id="alog-count">0 entries</span>
       <span style="margin-left:auto;font-size:10px;color:var(--muted)">→ <span class="mono" style="color:var(--blue)">apex.log</span></span>
@@ -1881,6 +2008,8 @@ let _sessPollTimer = null;
 let _logFilter = "ALL";
 let _autoScroll = true;
 let _lastLogEntries = null;
+let _lastDlogEntries = [];
+let _dlogFilter = "ALL";
 let _sessFilter = "all";
 let _sessData   = [];
 
@@ -1938,7 +2067,9 @@ function tab(name, el) {
   clearInterval(_sessPollTimer);
   if (name === "logs") {
     _logPollTimer = setInterval(pollLogs, 5000);
+    setInterval(pollDecisions, 4000);
     pollLogs();
+    pollDecisions();
   } else if (name === "sessions") {
     _sessPollTimer = setInterval(pollSessions, 15000);
     pollSessions();
@@ -1962,6 +2093,52 @@ function setLogFilter(lvl, el) {
   document.querySelectorAll(".log-filter-btn").forEach(b => b.classList.remove("on"));
   el.classList.add("on");
   if (_lastLogEntries) renderAgentLog(_lastLogEntries);
+}
+
+// ── Decision log ──────────────────────────────────────────────────────────
+async function pollDecisions() {
+  try {
+    const r = await fetch("/api/think");
+    if (!r.ok) return;
+    const entries = await r.json();
+    _lastDlogEntries = entries;
+    renderDlog(entries);
+    const dot = document.getElementById("dlog-live-dot");
+    if (dot) { dot.style.color = "var(--green)"; setTimeout(()=>{ dot.style.color="var(--muted)"; }, 800); }
+  } catch(e) {}
+}
+
+function setDlogFilter(cat, el) {
+  _dlogFilter = cat;
+  document.querySelectorAll('[id^="df-"]').forEach(b => b.classList.remove("on"));
+  if (el) el.classList.add("on");
+  renderDlog(_lastDlogEntries);
+}
+
+function renderDlog(entries) {
+  const box = document.getElementById("dlog-box");
+  const cnt = document.getElementById("dlog-count");
+  if (!box) return;
+  const all = entries || [];
+  const filtered = _dlogFilter === "ALL" ? all : all.filter(e => e.cat === _dlogFilter);
+  if (cnt) cnt.textContent = filtered.length + (filtered.length < all.length ? " / "+all.length : "") + " entries";
+  if (!filtered.length) {
+    box.innerHTML = `<div class="drow"><span class="al-ts">—</span><span class="dcat dcat-CYCLE">CYCLE</span><span class="dsym"></span><span class="dmsg muted">No ${_dlogFilter === "ALL" ? "" : _dlogFilter+" "}decisions yet</span></div>`;
+    return;
+  }
+  box.innerHTML = [...filtered].reverse().map(e => {
+    const cat = e.cat || "CYCLE";
+    const ts  = fmtTs(e.ts || "");
+    const sym = e.sym ? `<span class="dsym">${e.sym}</span>` : `<span class="dsym"></span>`;
+    return `<div class="drow">
+      <span class="al-ts">${ts}</span>
+      <span class="dcat dcat-${cat}">${cat}</span>
+      ${sym}
+      <span class="dmsg">${e.msg || ""}</span>
+    </div>`;
+  }).join("");
+  const auto = document.getElementById("dlog-autoscroll");
+  if (auto?.checked) box.scrollTop = 0;
 }
 
 // ── Clock (browser local time) ────────────────────────────────────────────
@@ -2484,6 +2661,7 @@ async function doRefresh() {
     renderLog(d.us.trade_log,    "us-log");
     renderAllLogs(d.india.trade_log, d.us.trade_log);
     renderAgentLog(d.agent_log || []);
+    if (d.decision_log) { _lastDlogEntries = d.decision_log; renderDlog(d.decision_log); }
     // update sessions tab badge + refresh sessions data in background
     const tc = document.getElementById("sess-tab-cnt");
     if (tc) tc.textContent = d.sessions_count > 0 ? "("+d.sessions_count+")" : "";
