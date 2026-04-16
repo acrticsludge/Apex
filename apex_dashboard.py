@@ -72,7 +72,11 @@ cfg = {
     "open_filter_confidence":   85,   # allow trades during window only if confidence >= 85%
     # ── Trade hygiene ────────────────────────────────────────────────────────
     "cooldown_after_sl_min":    60,   # re-entry blocked for 60 min after a stop-loss
-    "commission_pct":        0.0006,  # 0.05% per side (buy + sell)
+    "commission_pct":        0.0006,  # 0.06% per side (buy + sell)
+    # ── Short selling ─────────────────────────────────────────────────────────
+    "short_selling_enabled":       True,
+    "short_confidence_threshold":    75,  # bearish confidence needed to short (0–100)
+    "index_max_pct_for_short":      0.5,  # block shorts if index UP more than +0.5%
 }
 
 INDIA_WATCHLIST = [
@@ -424,6 +428,12 @@ def _normalize_state(st: dict) -> dict:
             st[mkt]["session_start_cash"] = float(cap)
         st[mkt].setdefault("trading_halted", False)
         st[mkt].setdefault("cooldown_until", {})
+        # ── Migrate positions to short-selling schema ─────────────────────────
+        for pos in st[mkt].get("positions", {}).values():
+            pos.setdefault("side", "long")           # all pre-existing positions are longs
+            pos.setdefault("running_high", pos.get("entry", 0))  # safety (already present)
+            if pos.get("side") == "short":
+                pos.setdefault("running_low", pos.get("entry", 0))
 
     # ── Carry-over migration ──────────────────────────────────────────────────
     # If a session was archived by the old code (which always reset to the config
@@ -509,7 +519,10 @@ def _close_session(market_key: str, prices: dict):
     # Force-close any remaining open positions (safety net — EOD should have cleared them)
     for s in list(mstate["positions"].keys()):
         price = prices.get(s) or mstate["positions"][s]["entry"]
-        execute_sell(s, price, "SESSION END", mstate)
+        if mstate["positions"][s].get("side", "long") == "long":
+            execute_sell(s, price, "SESSION END", mstate)
+        else:
+            execute_cover(s, price, "SESSION END", mstate)
 
     start_c = mstate.get("session_start_cash", float(capital))
     net_pnl = mstate["realised_pnl"]
@@ -638,6 +651,7 @@ def execute_buy(symbol: str, price: float, mstate: dict, atr: float = None):
     tgt = round(price + tp_dist, 2)
 
     mstate["positions"][symbol] = {
+        "side":         "long",
         "qty":          qty,
         "entry":        price,
         "stop_loss":    sl,
@@ -654,6 +668,60 @@ def execute_buy(symbol: str, price: float, mstate: dict, atr: float = None):
     apex_log.info(
         f"BUY  {qty}x {symbol} @ {price:.2f}  cost={cost:.0f}  "
         f"SL={sl:.2f}  T={tgt:.2f}  ATR={f'{atr:.3f}' if atr else 'n/a'}"
+    )
+    return qty
+
+def execute_short(symbol: str, price: float, mstate: dict, atr: float = None):
+    """Open a short position: sell-to-open, profit when price falls."""
+    start_cash   = mstate.get("session_start_cash", price * 10)
+    risk_dollars = start_cash * cfg["risk_per_trade"]
+    atr_sl_mult  = cfg["atr_sl_mult"]
+
+    if atr and atr > 0 and cfg.get("use_atr_exits", True):
+        sl_dist = atr * atr_sl_mult
+        tp_dist = atr * cfg["atr_tp_mult"]
+        sl_floor = price * cfg["stop_loss_pct"] * 0.5
+        sl_cap   = price * cfg["stop_loss_pct"] * 2.0
+        tp_floor = price * cfg["target_pct"]    * 0.5
+        tp_cap   = price * cfg["target_pct"]    * 2.0
+        sl_dist  = max(sl_floor, min(sl_cap, sl_dist))
+        tp_dist  = max(tp_floor, min(tp_cap, tp_dist))
+        qty = max(1, int(risk_dollars / sl_dist)) if sl_dist > 0 else 1
+    else:
+        sl_dist = price * cfg["stop_loss_pct"]
+        tp_dist = price * cfg["target_pct"]
+        qty     = max(1, int((start_cash * cfg["risk_per_trade"]) / price))
+
+    max_qty = max(1, int(mstate["cash"] * cfg["max_position_pct"] / price))
+    qty     = min(qty, max_qty)
+
+    # Only commission deducted on short open; PnL settled on cover
+    commission = qty * price * cfg.get("commission_pct", 0.0)
+    if mstate["cash"] < commission + price:   # keep at least 1-share worth as buffer
+        return None
+
+    mstate["cash"] -= commission
+
+    sl  = round(price + sl_dist, 2)                       # SL ABOVE entry
+    tgt = round(max(price - tp_dist, 0.01), 2)            # TP BELOW entry
+
+    mstate["positions"][symbol] = {
+        "side":        "short",
+        "qty":         qty,
+        "entry":       price,
+        "stop_loss":   sl,
+        "target":      tgt,
+        "atr":         atr or 0.0,
+        "running_low": price,
+        "entered_at":  datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    log_trade(mstate,
+              f"SHORT {qty} {symbol} @ {price:.2f}  SL:{sl:.2f}  T:{tgt:.2f}  "
+              + (f"ATR:{atr:.3f}" if atr else ""),
+              "SHORT")
+    apex_log.info(
+        f"SHORT {qty}x {symbol} @ {price:.2f}  SL={sl:.2f}  T={tgt:.2f}  "
+        f"ATR={f'{atr:.3f}' if atr else 'n/a'}"
     )
     return qty
 
@@ -686,6 +754,35 @@ def execute_sell(symbol: str, price: float, reason: str, mstate: dict):
         ).isoformat(timespec="seconds")
         mstate.setdefault("cooldown_until", {})[symbol] = until
         apex_log.info(f"[COOLDOWN] {symbol} blocked for {cooldown_min}m (stop-loss triggered)")
+
+def execute_cover(symbol: str, price: float, reason: str, mstate: dict):
+    """Close a short position (buy-to-cover). Profit when price fell below entry."""
+    pos = mstate["positions"].get(symbol)
+    if not pos or pos.get("side") != "short":
+        return
+    gross_pnl  = (pos["entry"] - price) * pos["qty"]    # positive when price fell
+    commission = price * pos["qty"] * cfg.get("commission_pct", 0.0)
+    net_pnl    = gross_pnl - commission
+    mstate["cash"]         += net_pnl
+    mstate["realised_pnl"] += net_pnl
+    if net_pnl >= 0:
+        mstate["wins"]   += 1
+    else:
+        mstate["losses"] += 1
+    sign = "+" if net_pnl >= 0 else ""
+    log_trade(mstate,
+              f"COVER {pos['qty']} {symbol} @ {price:.2f}  P&L:{sign}{net_pnl:.0f}  ({reason})",
+              "SELL" if net_pnl >= 0 else "LOSS")
+    apex_log.info(f"COVER {pos['qty']}x {symbol} @ {price:.2f}  P&L={sign}{net_pnl:.0f}  reason={reason}")
+    del mstate["positions"][symbol]
+
+    if reason == "STOP LOSS":
+        cooldown_min = cfg.get("cooldown_after_sl_min", 60)
+        until = (
+            datetime.now(timezone.utc) + timedelta(minutes=cooldown_min)
+        ).isoformat(timespec="seconds")
+        mstate.setdefault("cooldown_until", {})[symbol] = until
+        apex_log.info(f"[COOLDOWN] {symbol} blocked for {cooldown_min}m (short stop-loss triggered)")
 
 # ─── MARKET CYCLE ─────────────────────────────────────────────────────────────
 
@@ -737,17 +834,25 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int):
             price = prices.get(sym) or get_price(sym)
             if price is None:
                 continue
-            pnl = (price - pos["entry"]) * pos["qty"]
+            is_short = pos.get("side", "long") == "short"
+            pnl = ((pos["entry"] - price) * pos["qty"] if is_short
+                   else (price - pos["entry"]) * pos["qty"])
 
             if exit_min < mtc <= harvest_min and pnl > 0:
                 think_log("EXIT", f"{sym} EOD HARVEST: {mtc:.0f}m to close  P&L={pnl:+.0f}", sym)
-                paper_sell(sym, pos["qty"], prices, mstate, f"EOD PROFIT ({mtc:.0f}m to close)")
+                if is_short:
+                    paper_cover(sym, pos["qty"], prices, mstate, f"EOD PROFIT ({mtc:.0f}m to close)")
+                else:
+                    paper_sell(sym, pos["qty"], prices, mstate, f"EOD PROFIT ({mtc:.0f}m to close)")
                 apex_log.info(f"EOD profit harvest: {sym}  P&L={pnl:+.0f}  {mtc:.0f}m left")
 
             elif mtc <= exit_min:
                 tag = "EOD EXIT" if pnl >= 0 else "EOD CUT LOSS"
                 think_log("EXIT", f"{sym} EOD FORCE EXIT ({tag}): {mtc:.0f}m to close  P&L={pnl:+.0f}", sym)
-                paper_sell(sym, pos["qty"], prices, mstate, f"{tag} ({mtc:.0f}m to close)")
+                if is_short:
+                    paper_cover(sym, pos["qty"], prices, mstate, f"{tag} ({mtc:.0f}m to close)")
+                else:
+                    paper_sell(sym, pos["qty"], prices, mstate, f"{tag} ({mtc:.0f}m to close)")
                 apex_log.info(f"EOD force exit: {sym}  P&L={pnl:+.0f}  {mtc:.0f}m left")
 
     # ── 3. Trailing stop update + normal SL / target checks ──────────────────
@@ -757,33 +862,70 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int):
             continue
         price = prices[sym]
 
-        # Trailing stop: activate once price rises by activation_mult × ATR from entry
-        if cfg.get("trailing_stop_enabled", True) and pos.get("atr", 0) > 0:
-            activation = pos["entry"] + pos["atr"] * cfg.get("trailing_activation_mult", 1.0)
-            if price >= activation:
-                pos["running_high"] = max(pos.get("running_high", price), price)
-                new_sl = pos["running_high"] - pos["atr"] * cfg.get("trailing_dist_mult", 1.5)
-                if new_sl > pos["stop_loss"]:
-                    old_sl = pos["stop_loss"]
-                    pos["stop_loss"] = round(new_sl, 2)
-                    think_log("EXIT",
-                              f"{sym} TRAIL ↑ SL {old_sl:.2f}→{pos['stop_loss']:.2f}  "
-                              f"running_high={pos['running_high']:.2f}", sym)
-                    apex_log.debug(
-                        f"[TRAIL] {sym}  SL {old_sl:.2f}→{pos['stop_loss']:.2f}  "
-                        f"high={pos['running_high']:.2f}"
-                    )
+        is_short = pos.get("side", "long") == "short"
 
-        if price <= pos["stop_loss"]:
+        # Trailing stop — mirror logic for longs vs shorts
+        if cfg.get("trailing_stop_enabled", True) and pos.get("atr", 0) > 0:
+            act_mult = cfg.get("trailing_activation_mult", 1.0)
+            dist_mult = cfg.get("trailing_dist_mult", 1.5)
+            if not is_short:
+                # LONG: activate when price rises 1×ATR above entry, SL trails up
+                activation = pos["entry"] + pos["atr"] * act_mult
+                if price >= activation:
+                    pos["running_high"] = max(pos.get("running_high", price), price)
+                    new_sl = pos["running_high"] - pos["atr"] * dist_mult
+                    if new_sl > pos["stop_loss"]:
+                        old_sl = pos["stop_loss"]
+                        pos["stop_loss"] = round(new_sl, 2)
+                        think_log("EXIT",
+                                  f"{sym} TRAIL ↑ SL {old_sl:.2f}→{pos['stop_loss']:.2f}  "
+                                  f"running_high={pos['running_high']:.2f}", sym)
+                        apex_log.debug(
+                            f"[TRAIL] {sym}  SL {old_sl:.2f}→{pos['stop_loss']:.2f}  "
+                            f"high={pos['running_high']:.2f}"
+                        )
+            else:
+                # SHORT: activate when price falls 1×ATR below entry, SL trails down
+                activation = pos["entry"] - pos["atr"] * act_mult
+                if price <= activation:
+                    pos["running_low"] = min(pos.get("running_low", price), price)
+                    new_sl = pos["running_low"] + pos["atr"] * dist_mult
+                    if new_sl < pos["stop_loss"]:   # tighten SL downward
+                        old_sl = pos["stop_loss"]
+                        pos["stop_loss"] = round(new_sl, 2)
+                        think_log("EXIT",
+                                  f"{sym} TRAIL ↓ SL {old_sl:.2f}→{pos['stop_loss']:.2f}  "
+                                  f"running_low={pos['running_low']:.2f}", sym)
+                        apex_log.debug(
+                            f"[TRAIL-SHORT] {sym}  SL {old_sl:.2f}→{pos['stop_loss']:.2f}  "
+                            f"low={pos['running_low']:.2f}"
+                        )
+
+        # SL / target checks — inverted for shorts
+        if not is_short:
+            sl_hit = price <= pos["stop_loss"]
+            tp_hit = price >= pos["target"]
+        else:
+            sl_hit = price >= pos["stop_loss"]   # short: price rising = loss
+            tp_hit = price <= pos["target"]       # short: price falling = profit
+
+        if sl_hit:
             think_log("EXIT", f"{sym} STOP LOSS hit @ {price:.2f}  SL was {pos['stop_loss']:.2f}", sym)
-            paper_sell(sym, pos["qty"], prices, mstate, "STOP LOSS")
+            if is_short:
+                paper_cover(sym, pos["qty"], prices, mstate, "STOP LOSS")
+            else:
+                paper_sell(sym, pos["qty"], prices, mstate, "STOP LOSS")
             _dc["sell"] += 1
-        elif price >= pos["target"]:
+        elif tp_hit:
             think_log("EXIT", f"{sym} TARGET HIT @ {price:.2f}  T was {pos['target']:.2f}", sym)
-            paper_sell(sym, pos["qty"], prices, mstate, "TARGET HIT")
+            if is_short:
+                paper_cover(sym, pos["qty"], prices, mstate, "TARGET HIT")
+            else:
+                paper_sell(sym, pos["qty"], prices, mstate, "TARGET HIT")
             _dc["sell"] += 1
         else:
-            pnl_pct = (price - pos["entry"]) / pos["entry"] * 100
+            pnl_pct = ((pos["entry"] - price) / pos["entry"] * 100 if is_short
+                       else (price - pos["entry"]) / pos["entry"] * 100)
             apex_log.debug(
                 f"[{market_key.upper()}] SL-CHECK HOLD  {sym}  "
                 f"price={price:.2f}  P&L={pnl_pct:+.1f}%  "
@@ -845,24 +987,35 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int):
 
         # ── SCAN log for every symbol not already held ────────────────────────
         if not in_pos:
+            direction = (f"▲long({conf:.0f}%)" if a["score"] > 0
+                         else f"▼short({100-conf:.0f}%)" if a["score"] < 0
+                         else "neutral")
             think_log("SCAN",
                       f"RSI={a.get('rsi', 0):.1f}  "
-                      f"Score={a['score']:+d}  Conf={conf:.0f}%  "
+                      f"Score={a['score']:+d}  {direction}  "
                       f"ADX={adx_val:.1f}  ATR={a.get('atr', 0):.3f}",
                       sym)
 
         # Signal exit for held positions (no window restriction)
-        if in_pos and a["score"] < -30:
-            think_log("EXIT",
-                      f"{sym} SIGNAL EXIT: score={a['score']}  conf={conf:.0f}%  "
-                      f"(bearish reversal)", sym)
-            paper_sell(sym, 0, prices, mstate, "SIGNAL EXIT")
-            _dc["sell"] += 1
-            continue
-
         if in_pos:
+            pos = mstate["positions"][sym]
+            pos_side = pos.get("side", "long")
+            if pos_side == "long" and a["score"] < -30:
+                think_log("EXIT",
+                          f"{sym} SIGNAL EXIT: score={a['score']}  conf={conf:.0f}%  "
+                          f"(bearish reversal)", sym)
+                paper_sell(sym, 0, prices, mstate, "SIGNAL EXIT")
+                _dc["sell"] += 1
+                continue
+            elif pos_side == "short" and a["score"] > 30:
+                think_log("EXIT",
+                          f"{sym} SHORT COVER: score={a['score']}  conf={conf:.0f}%  "
+                          f"(bullish reversal)", sym)
+                paper_cover(sym, 0, prices, mstate, "SIGNAL COVER")
+                _dc["sell"] += 1
+                continue
             apex_log.debug(
-                f"[{market_key.upper()}] HOLD  {sym}  "
+                f"[{market_key.upper()}] HOLD {pos_side.upper()}  {sym}  "
                 f"score={a['score']:+d}  conf={conf:.0f}%"
             )
             _dc["hold"] += 1
@@ -886,15 +1039,11 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int):
                       f"{sym} ALLOW open-window: conf={conf:.0f}% >= {open_conf_gate}%  "
                       f"(high conviction override)", sym)
 
-        # Index trend gate
-        if not index_ok:
-            think_log("FILTER",
-                      f"{sym} SKIP index: {market_key} {index_pct:+.2f}% < "
-                      f"{cfg.get('index_min_pct', -0.5):.1f}% gate", sym)
-            _dc["watch"] += 1
-            continue
+        # Index trend gate — longs blocked when index is down; shorts evaluated separately
+        # (no hard `continue` here — the check is embedded in the entry conditions below
+        #  so a bearish signal can still go to the short entry branch on a down-index day)
 
-        # ADX trend gate
+        # ADX trend gate — applies to both longs and shorts
         if adx_val < cfg.get("adx_min", 20):
             think_log("FILTER",
                       f"{sym} SKIP ADX: {adx_val:.1f} < {cfg.get('adx_min', 20)}  "
@@ -917,9 +1066,15 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int):
         elif cooldown_until and now_utc >= cooldown_until:
             mstate["cooldown_until"].pop(sym, None)
 
-        # Core entry conditions
+        # ── LONG entry ───────────────────────────────────────────────────────
+        short_enabled    = cfg.get("short_selling_enabled", False)
+        bearish_conf     = 100 - conf
+        short_threshold  = cfg.get("short_confidence_threshold", 75)
+        index_max_short  = cfg.get("index_max_pct_for_short", 0.5)
+
         if (conf >= cfg["confidence_threshold"]
                 and a["score"] > 0
+                and index_ok                           # longs require healthy index
                 and open_pos < max_pos
                 and mstate["cash"] > a["price"] * 2):
             think_log("ENTRY",
@@ -928,6 +1083,22 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int):
             if paper_buy(sym, 0, prices, mstate, atr=a.get("atr")):
                 open_pos += 1
                 _dc["buy"] += 1
+
+        # ── SHORT entry ──────────────────────────────────────────────────────
+        elif (short_enabled
+                and not in_open_window              # too volatile at open; skip shorts
+                and bearish_conf >= short_threshold
+                and a["score"] < 0
+                and index_pct <= index_max_short    # block shorts on strongly bullish days
+                and open_pos < max_pos
+                and mstate["cash"] > a["price"] * 2):
+            think_log("ENTRY",
+                      f"{sym} SHORT ENTRY: bearish_conf={bearish_conf:.0f}%  score={a['score']:+d}  "
+                      f"@ {a['price']:.2f}  ADX={adx_val:.1f}  ATR={a.get('atr', 0):.3f}", sym)
+            if paper_short(sym, 0, prices, mstate, atr=a.get("atr")):
+                open_pos += 1
+                _dc["buy"] += 1
+
         else:
             # Diagnose which condition failed
             if open_pos >= max_pos:
@@ -937,12 +1108,21 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int):
                 think_log("FILTER",
                           f"{sym} SKIP: insufficient cash  "
                           f"cash={mstate['cash']:.0f}  need≈{a['price']*2:.0f}", sym)
-            elif conf < cfg["confidence_threshold"]:
+            elif not index_ok and a["score"] > 0:
                 think_log("FILTER",
-                          f"{sym} SKIP: conf={conf:.0f}% < threshold {cfg['confidence_threshold']}%", sym)
+                          f"{sym} SKIP index: {market_key} {index_pct:+.2f}% < "
+                          f"{cfg.get('index_min_pct', -0.5):.1f}% gate (long blocked)", sym)
+            elif short_enabled and bearish_conf >= short_threshold and index_pct > index_max_short:
+                think_log("FILTER",
+                          f"{sym} SKIP short: index {index_pct:+.2f}% > {index_max_short:.1f}% "
+                          f"(bull day, shorting blocked)", sym)
+            elif conf < cfg["confidence_threshold"] and bearish_conf < short_threshold:
+                think_log("FILTER",
+                          f"{sym} SKIP: conf={conf:.0f}% (long<{cfg['confidence_threshold']}%)  "
+                          f"bearish_conf={bearish_conf:.0f}% (short<{short_threshold}%)", sym)
             else:
                 think_log("FILTER",
-                          f"{sym} SKIP: score={a['score']} not bullish enough", sym)
+                          f"{sym} SKIP: score={a['score']} — not strong enough for long or short", sym)
             apex_log.debug(
                 f"[{market_key.upper()}] WATCH  {sym}  "
                 f"score={a['score']:+d}  conf={conf:.0f}%  ADX={adx_val:.1f}"
@@ -960,16 +1140,24 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int):
     )
 
 def portfolio_value(mstate: dict, prices: dict) -> float:
-    return mstate["cash"] + sum(
-        (prices.get(s) or p["entry"]) * p["qty"]
-        for s, p in mstate["positions"].items()
-    )
+    v = mstate["cash"]
+    for s, p in mstate["positions"].items():
+        cur = prices.get(s) or p["entry"]
+        if p.get("side", "long") == "long":
+            v += cur * p["qty"]
+        else:  # short: contribution = (entry − current) × qty
+            v += (p["entry"] - cur) * p["qty"]
+    return v
 
 def unrealised_pnl(mstate: dict, prices: dict) -> float:
-    return sum(
-        (prices.get(s, p["entry"]) - p["entry"]) * p["qty"]
-        for s, p in mstate["positions"].items()
-    )
+    total = 0.0
+    for s, p in mstate["positions"].items():
+        cur = prices.get(s, p["entry"])
+        if p.get("side", "long") == "long":
+            total += (cur - p["entry"]) * p["qty"]
+        else:
+            total += (p["entry"] - cur) * p["qty"]
+    return total
 
 # ─── PAPER TRADING LAYER ──────────────────────────────────────────────────────
 
@@ -989,6 +1177,22 @@ def paper_sell(symbol: str, qty: int, latest_prices: dict, mstate: dict, reason:
         apex_log.warning(f"paper_sell: no price for {symbol} — skipping")
         return
     execute_sell(symbol, price, reason, mstate)
+
+def paper_short(symbol: str, qty: int, latest_prices: dict, mstate: dict, atr: float = None):
+    """Paper-trade a short: sell-to-open at snapshot price."""
+    price = latest_prices.get(symbol)
+    if price is None:
+        apex_log.warning(f"paper_short: no price for {symbol} — skipping")
+        return None
+    return execute_short(symbol, price, mstate, atr=atr)
+
+def paper_cover(symbol: str, qty: int, latest_prices: dict, mstate: dict, reason: str = "SIGNAL"):
+    """Paper-trade a short cover: buy-to-close at snapshot price (falls back to live)."""
+    price = latest_prices.get(symbol) or get_price(symbol)
+    if price is None:
+        apex_log.warning(f"paper_cover: no price for {symbol} — skipping")
+        return
+    execute_cover(symbol, price, reason, mstate)
 
 def get_summary(latest_prices: dict) -> dict:
     """Return a snapshot summary of both paper portfolios at current prices."""
@@ -1272,9 +1476,13 @@ def force_sell(market, symbol):
         price = snap.get(symbol) or get_price(symbol)
         if price is None:
             return jsonify({"ok": False, "msg": "Could not fetch live price"})
-        paper_sell(symbol, 0, snap, mstate, "MANUAL SELL")
+        pos = mstate["positions"].get(symbol, {})
+        if pos.get("side", "long") == "long":
+            paper_sell(symbol, 0, snap, mstate, "MANUAL SELL")
+        else:
+            paper_cover(symbol, 0, snap, mstate, "MANUAL COVER")
         save_state(_state)
-        apex_log.info(f"Manual sell: {symbol} @ {price:.2f}  market={market}")
+        apex_log.info(f"Manual close: {symbol} @ {price:.2f}  market={market}  side={pos.get('side','long')}")
     return jsonify({"ok": True, "msg": f"Sold {symbol.replace('.NS', '')}"})
 
 @app.route("/api/config", methods=["POST"])
@@ -1555,6 +1763,10 @@ tr:hover td{background:#1c2330}
 .dcat-INDEX {background:#1a0a30;color:#b47fff}
 .dsym{color:#bbb;min-width:88px;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .dmsg{color:#ddd;flex:1;white-space:pre-wrap;word-break:break-word}
+/* Position side badges */
+.side-badge{font-size:9px;font-weight:700;padding:1px 5px;border-radius:3px;vertical-align:middle;letter-spacing:.5px}
+.side-long {background:#0a2016;color:#27c46b;border:1px solid #1a4a2a}
+.side-short{background:#2a0a0a;color:#e05454;border:1px solid #4a1a1a}
 
 /* ── Settings form ── */
 .fg{display:flex;flex-direction:column;gap:4px}
@@ -2218,8 +2430,11 @@ function eodCell(p, cur, sym, mtc) {
   if (mtc == null || mtc <= 0) return `<td class="muted" style="font-size:10px">—</td>`;
   const harvestMin = _cfg.eod_harvest_min || 30;
   const exitMin    = _cfg.eod_exit_min    || 15;
-  const pnl        = (cur - p.entry) * p.qty;
-  const needPct    = ((p.entry / cur) - 1) * 100; // % rise needed to break even
+  const isShort    = p.side === "short";
+  const pnl        = isShort ? (p.entry - cur) * p.qty : (cur - p.entry) * p.qty;
+  const needPct    = isShort
+    ? ((cur / p.entry) - 1) * 100   // % drop needed to break even for shorts
+    : ((p.entry / cur) - 1) * 100;  // % rise needed to break even for longs
   let badge = "", note = "";
 
   if (mtc <= exitMin) {
@@ -2251,12 +2466,15 @@ function renderPos(positions, prices, sym, bodyId, countId, mkt, mtc) {
     return;
   }
   tb.innerHTML = Object.entries(positions).map(([s,p]) => {
-    const cur = prices[s] || p.entry;
-    const pnl = (cur-p.entry)*p.qty;
-    const pct = pnl/(p.entry*p.qty)*100;
-    const c   = pnl>=0?"green":"red";
+    const cur      = prices[s] || p.entry;
+    const isShort  = p.side === "short";
+    const pnl      = isShort ? (p.entry - cur) * p.qty : (cur - p.entry) * p.qty;
+    const pct      = pnl / (p.entry * p.qty) * 100;
+    const c        = pnl >= 0 ? "green" : "red";
+    const sideBadge = `<span class="side-badge ${isShort ? 'side-short' : 'side-long'}">${isShort ? 'SHORT' : 'LONG'}</span>`;
+    const btnLabel  = isShort ? "Cover" : "Sell";
     return `<tr>
-      <td class="mono" style="font-weight:700;color:var(--blue)">${disp(s)}</td>
+      <td class="mono" style="font-weight:700;color:var(--blue)">${disp(s)} ${sideBadge}</td>
       <td class="mono">${p.qty}</td>
       <td class="mono">${sym}${p.entry.toFixed(2)}</td>
       <td class="mono">${sym}${cur.toFixed(2)}</td>
@@ -2268,7 +2486,7 @@ function renderPos(positions, prices, sym, bodyId, countId, mkt, mtc) {
       <td style="white-space:nowrap">
         <button class="btn btn-muted btn-sm" style="margin-right:4px"
           onclick="editPos('${mkt}','${s}',${p.qty},${p.entry},${p.stop_loss},${p.target})">Edit</button>
-        <button class="btn btn-red btn-sm" onclick="sellPos('${mkt}','${s}')">Sell</button>
+        <button class="btn btn-red btn-sm" onclick="sellPos('${mkt}','${s}')">${btnLabel}</button>
       </td>
     </tr>`;
   }).join("");
