@@ -42,8 +42,8 @@ except ImportError:
 cfg = {
     "india_capital":        50_000,
     "us_capital":            1_800,
-    "india_max_positions":       4,
-    "us_max_positions":          4,
+    "india_max_positions":       16,
+    "us_max_positions":          16,
     "risk_per_trade":         0.02,   # % of session_start_cash risked per trade (ATR-normalised)
     "max_position_pct":       0.20,   # hard cap: no single position > 20% of cash
     "confidence_threshold":     62,
@@ -341,6 +341,34 @@ def calc_adx(df, p=14) -> float:
     val      = adx.iloc[-1]
     return float(val) if not np.isnan(val) else 0.0
 
+def compute_hist_bias(df) -> tuple:
+    """
+    Count how many of the last 4 completed trading days closed above their open.
+    Returns (bull_days: int, total_days: int, bias_score: float [-1.0, +1.0]).
+    Returns (0, 0, 0.0) when fewer than 2 completed days are available.
+    """
+    try:
+        idx   = df.index
+        dates = idx.normalize() if hasattr(idx, "normalize") else pd.DatetimeIndex(idx).normalize()
+        unique_days = sorted(dates.unique())
+        if len(unique_days) >= 1:
+            unique_days = unique_days[:-1]          # drop today (may be incomplete)
+        completed_days = unique_days[-4:]           # last 4 completed days
+        total_days     = len(completed_days)
+        if total_days < 2:
+            return (0, 0, 0.0)
+        bull_days = 0
+        for day in completed_days:
+            day_bars = df[dates == day]
+            if len(day_bars) < 2:
+                continue
+            if float(day_bars["close"].iloc[-1]) > float(day_bars["open"].iloc[0]):
+                bull_days += 1
+        bias_score = round((bull_days / total_days) * 2 - 1, 4)
+        return (bull_days, total_days, bias_score)
+    except Exception:
+        return (0, 0, 0.0)
+
 # ─── SIGNAL ENGINE ────────────────────────────────────────────────────────────
 
 def analyse(symbol: str, df, live_price: float) -> dict:
@@ -383,17 +411,25 @@ def analyse(symbol: str, df, live_price: float) -> dict:
     atr = calc_atr(df)
     adx = calc_adx(df)
 
+    hist_win, hist_total, hist_bias = compute_hist_bias(df)
+    if hist_total >= 2:
+        score += round(hist_bias * 10)
+    score = max(-100, min(100, score))
+
     return {
-        "symbol":     symbol,
-        "price":      price,
-        "score":      score,
-        "confidence": round(min(100, max(0, (score + 100) / 2)), 1),
-        "signals":    sigs,
-        "rsi":        r,
-        "bb_upper":   bu,
-        "bb_lower":   bl,
-        "atr":        round(atr, 4),
-        "adx":        round(adx, 1),
+        "symbol":          symbol,
+        "price":           price,
+        "score":           score,
+        "confidence":      round(min(100, max(0, (score + 100) / 2)), 1),
+        "signals":         sigs,
+        "rsi":             r,
+        "bb_upper":        bu,
+        "bb_lower":        bl,
+        "atr":             round(atr, 4),
+        "adx":             round(adx, 1),
+        "hist_win_days":   hist_win,
+        "hist_total_days": hist_total,
+        "hist_bias":       hist_bias,
     }
 
 # ─── STATE MANAGEMENT ─────────────────────────────────────────────────────────
@@ -990,10 +1026,14 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int):
             direction = (f"▲long({conf:.0f}%)" if a["score"] > 0
                          else f"▼short({100-conf:.0f}%)" if a["score"] < 0
                          else "neutral")
+            hw   = a.get("hist_win_days", 0)
+            ht   = a.get("hist_total_days", 0)
+            harr = "↑" if hw > ht / 2 else "↓" if hw < ht / 2 else "→"
+            hstr = f"Hist={hw}/{ht}{harr}" if ht > 0 else "Hist=n/a"
             think_log("SCAN",
                       f"RSI={a.get('rsi', 0):.1f}  "
                       f"Score={a['score']:+d}  {direction}  "
-                      f"ADX={adx_val:.1f}  ATR={a.get('atr', 0):.3f}",
+                      f"ADX={adx_val:.1f}  ATR={a.get('atr', 0):.3f}  {hstr}",
                       sym)
 
         # Signal exit for held positions (no window restriction)
@@ -2009,9 +2049,9 @@ input:focus{outline:none;border-color:var(--blue)}
     <div class="tbl-wrap"><table>
       <thead><tr>
         <th>Symbol</th><th>Price ₹</th><th>RSI</th><th>MACD</th>
-        <th>Bollinger</th><th>EMA</th><th>Volume</th><th>Confidence</th><th>Action</th>
+        <th>Bollinger</th><th>EMA</th><th>Volume</th><th>4d Trend</th><th>Confidence</th><th>Action</th>
       </tr></thead>
-      <tbody id="india-sig"><tr><td colspan="9" style="text-align:center;padding:18px;color:var(--muted)">No scan data yet — start the agent</td></tr></tbody>
+      <tbody id="india-sig"><tr><td colspan="10" style="text-align:center;padding:18px;color:var(--muted)">No scan data yet — start the agent</td></tr></tbody>
     </table></div>
 
     <div class="sec" style="margin-top:18px"><span class="sec-title">Recent Trades</span></div>
@@ -2039,9 +2079,9 @@ input:focus{outline:none;border-color:var(--blue)}
     <div class="tbl-wrap"><table>
       <thead><tr>
         <th>Symbol</th><th>Price $</th><th>RSI</th><th>MACD</th>
-        <th>Bollinger</th><th>EMA</th><th>Volume</th><th>Confidence</th><th>Action</th>
+        <th>Bollinger</th><th>EMA</th><th>Volume</th><th>4d Trend</th><th>Confidence</th><th>Action</th>
       </tr></thead>
-      <tbody id="us-sig"><tr><td colspan="9" style="text-align:center;padding:18px;color:var(--muted)">No scan data yet — start the agent</td></tr></tbody>
+      <tbody id="us-sig"><tr><td colspan="10" style="text-align:center;padding:18px;color:var(--muted)">No scan data yet — start the agent</td></tr></tbody>
     </table></div>
 
     <div class="sec" style="margin-top:18px"><span class="sec-title">Recent Trades</span></div>
@@ -2551,7 +2591,7 @@ function renderEodHeader(d) {
 function renderSig(analyses, positions, sym, bodyId) {
   const tb = document.getElementById(bodyId);
   if (!analyses||!analyses.length) {
-    tb.innerHTML = `<tr><td colspan="9" style="text-align:center;padding:18px;color:var(--muted)">No scan data — start the agent</td></tr>`;
+    tb.innerHTML = `<tr><td colspan="10" style="text-align:center;padding:18px;color:var(--muted)">No scan data — start the agent</td></tr>`;
     return;
   }
   tb.innerHTML = analyses.map(a => {
@@ -2565,6 +2605,11 @@ function renderSig(analyses, positions, sym, bodyId) {
     const bb   = (a.signals?.BB?.signal||"").split(" ")[0];
     const ema  = (a.signals?.EMA?.signal||"").split(" ")[0];
     const vol  = (a.signals?.Vol?.signal||"").split(" ")[0];
+    const hw   = a.hist_win_days   ?? 0;
+    const ht   = a.hist_total_days ?? 0;
+    const hArr = hw > ht/2 ? "↑" : hw < ht/2 ? "↓" : "→";
+    const hTxt = ht > 0 ? `${hw}/${ht}${hArr}` : "–";
+    const hClr = hw > ht/2 ? "var(--green)" : hw < ht/2 ? "var(--red)" : "var(--muted)";
     return `<tr>
       <td class="mono" style="font-weight:600${inP?";color:var(--blue)":""}">${disp(a.symbol)}${inP?" *":""}</td>
       <td class="mono">${sym}${(a.price||0).toFixed(2)}</td>
@@ -2573,6 +2618,7 @@ function renderSig(analyses, positions, sym, bodyId) {
       <td class="muted">${bb}</td>
       <td class="muted">${ema}</td>
       <td class="muted">${vol}</td>
+      <td class="mono" style="color:${hClr};font-weight:600">${hTxt}</td>
       <td><div class="cbar"><div class="cbar-bg"><div class="cbar-fg" style="width:${conf}%;background:${cc}"></div></div>
           <span class="mono" style="color:${cc};font-size:11px">${conf.toFixed(0)}%</span></div></td>
       <td><span class="${actC}">${actT}</span></td>
