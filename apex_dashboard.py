@@ -406,6 +406,30 @@ def _normalize_state(st: dict) -> dict:
             st[mkt]["session_start_cash"] = float(cap)
         st[mkt].setdefault("trading_halted", False)
         st[mkt].setdefault("cooldown_until", {})
+
+    # ── Carry-over migration ──────────────────────────────────────────────────
+    # If a session was archived by the old code (which always reset to the config
+    # default capital), detect it and apply the correct end_cash from history.
+    for mkt, cap_key in [("india", "india_capital"), ("us", "us_capital")]:
+        if mkt not in st:
+            continue
+        default_cap = cfg[cap_key]
+        current_cash = st[mkt].get("cash", default_cap)
+        start_cash   = st[mkt].get("session_start_cash", default_cap)
+        if abs(current_cash - default_cap) < 0.01 and abs(start_cash - default_cap) < 0.01:
+            mkt_sessions = [s for s in st.get("sessions", []) if s.get("market") == mkt]
+            if mkt_sessions:
+                last = max(mkt_sessions, key=lambda s: s.get("archived_at", ""))
+                last_end = last.get("end_cash")
+                if last_end and abs(last_end - default_cap) > 0.01:
+                    st[mkt]["cash"]               = round(last_end, 2)
+                    st[mkt]["session_start_cash"] = round(last_end, 2)
+                    st[mkt]["peak_portfolio"]     = round(last_end, 2)
+                    apex_log.info(
+                        f"[MIGRATE] {mkt.upper()} carry-over applied: "
+                        f"{default_cap} → {last_end} (from session {last.get('id')})"
+                    )
+
     return st
 
 def load_state() -> dict:
