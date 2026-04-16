@@ -369,6 +369,59 @@ def compute_hist_bias(df) -> tuple:
     except Exception:
         return (0, 0, 0.0)
 
+# ─── NEWS SENTIMENT ───────────────────────────────────────────────────────────
+
+_NEWS_CACHE: dict = {}   # {symbol: (fetched_at, news_score, article_count)}
+_NEWS_TTL   = 900        # re-fetch every 15 minutes
+
+_BULL_KWORDS = {
+    "beat", "beats", "record", "growth", "profit", "surge", "soars", "rally",
+    "upgrade", "outperform", "strong", "positive", "revenue", "bullish",
+    "raises", "raised", "exceeds", "wins", "deal", "partnership", "approve",
+    "approved", "launches", "expands", "boost", "jump", "jumps", "rises",
+    "rise", "high", "buy", "acquisition", "dividend", "buyback",
+}
+
+_BEAR_KWORDS = {
+    "miss", "misses", "loss", "losses", "decline", "falls", "drops", "tumbles",
+    "downgrade", "underperform", "weak", "negative", "below", "disappoints",
+    "cuts", "cut", "warn", "warning", "bearish", "lawsuit", "investigation",
+    "recall", "fraud", "default", "halt", "suspend", "probe", "fine",
+    "penalty", "resign", "bankruptcy", "layoff", "layoffs", "selloff",
+}
+
+def compute_news_score(symbol: str) -> tuple:
+    """
+    Fetch recent yfinance headlines for symbol and score them via keyword matching.
+    Returns (news_score: float [-1.0, +1.0], article_count: int).
+    Scores are cached for 15 minutes per symbol to avoid repeated fetches.
+    Returns (0.0, 0) on any error or when no articles are found.
+    """
+    now = time.time()
+    cached = _NEWS_CACHE.get(symbol)
+    if cached and (now - cached[0]) < _NEWS_TTL:
+        return (cached[1], cached[2])
+    try:
+        news   = yf.Ticker(symbol).news or []
+        recent = [n for n in news
+                  if now - float(n.get("providerPublishTime", 0)) < 86400]
+        if not recent:
+            _NEWS_CACHE[symbol] = (now, 0.0, 0)
+            return (0.0, 0)
+        bull = bear = 0
+        for item in recent:
+            words = set((item.get("title") or "").lower().split())
+            bull += len(words & _BULL_KWORDS)
+            bear += len(words & _BEAR_KWORDS)
+        total = bull + bear
+        raw   = round((bull - bear) / total, 4) if total > 0 else 0.0
+        score = max(-1.0, min(1.0, raw))
+        _NEWS_CACHE[symbol] = (now, score, len(recent))
+        return (score, len(recent))
+    except Exception:
+        _NEWS_CACHE[symbol] = (now, 0.0, 0)
+        return (0.0, 0)
+
 # ─── SIGNAL ENGINE ────────────────────────────────────────────────────────────
 
 def analyse(symbol: str, df, live_price: float) -> dict:
@@ -414,6 +467,10 @@ def analyse(symbol: str, df, live_price: float) -> dict:
     hist_win, hist_total, hist_bias = compute_hist_bias(df)
     if hist_total >= 2:
         score += round(hist_bias * 10)
+
+    news_score, news_count = compute_news_score(symbol)
+    if news_count > 0:
+        score += round(news_score * 15)
     score = max(-100, min(100, score))
 
     return {
@@ -430,6 +487,8 @@ def analyse(symbol: str, df, live_price: float) -> dict:
         "hist_win_days":   hist_win,
         "hist_total_days": hist_total,
         "hist_bias":       hist_bias,
+        "news_score":      news_score,
+        "news_count":      news_count,
     }
 
 # ─── STATE MANAGEMENT ─────────────────────────────────────────────────────────
@@ -1066,10 +1125,14 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int):
             ht   = a.get("hist_total_days", 0)
             harr = "↑" if hw > ht / 2 else "↓" if hw < ht / 2 else "→"
             hstr = f"Hist={hw}/{ht}{harr}" if ht > 0 else "Hist=n/a"
+            nc   = a.get("news_count", 0)
+            ns   = a.get("news_score", 0.0)
+            narr = "↑" if ns > 0 else "↓" if ns < 0 else "→"
+            nstr = f"News={nc}{narr}" if nc > 0 else "News=n/a"
             think_log("SCAN",
                       f"RSI={a.get('rsi', 0):.1f}  "
                       f"Score={a['score']:+d}  {direction}  "
-                      f"ADX={adx_val:.1f}  ATR={a.get('atr', 0):.3f}  {hstr}",
+                      f"ADX={adx_val:.1f}  ATR={a.get('atr', 0):.3f}  {hstr}  {nstr}",
                       sym)
 
         # Signal exit for held positions (no window restriction)
@@ -2087,9 +2150,9 @@ input:focus{outline:none;border-color:var(--blue)}
     <div class="tbl-wrap"><table>
       <thead><tr>
         <th>Symbol</th><th>Price ₹</th><th>RSI</th><th>MACD</th>
-        <th>Bollinger</th><th>EMA</th><th>Volume</th><th>4d Trend</th><th>Confidence</th><th>Action</th>
+        <th>Bollinger</th><th>EMA</th><th>Volume</th><th>4d Trend</th><th>News</th><th>Confidence</th><th>Action</th>
       </tr></thead>
-      <tbody id="india-sig"><tr><td colspan="10" style="text-align:center;padding:18px;color:var(--muted)">No scan data yet — start the agent</td></tr></tbody>
+      <tbody id="india-sig"><tr><td colspan="11" style="text-align:center;padding:18px;color:var(--muted)">No scan data yet — start the agent</td></tr></tbody>
     </table></div>
 
     <div class="sec" style="margin-top:18px"><span class="sec-title">Recent Trades</span></div>
@@ -2117,9 +2180,9 @@ input:focus{outline:none;border-color:var(--blue)}
     <div class="tbl-wrap"><table>
       <thead><tr>
         <th>Symbol</th><th>Price $</th><th>RSI</th><th>MACD</th>
-        <th>Bollinger</th><th>EMA</th><th>Volume</th><th>4d Trend</th><th>Confidence</th><th>Action</th>
+        <th>Bollinger</th><th>EMA</th><th>Volume</th><th>4d Trend</th><th>News</th><th>Confidence</th><th>Action</th>
       </tr></thead>
-      <tbody id="us-sig"><tr><td colspan="10" style="text-align:center;padding:18px;color:var(--muted)">No scan data yet — start the agent</td></tr></tbody>
+      <tbody id="us-sig"><tr><td colspan="11" style="text-align:center;padding:18px;color:var(--muted)">No scan data yet — start the agent</td></tr></tbody>
     </table></div>
 
     <div class="sec" style="margin-top:18px"><span class="sec-title">Recent Trades</span></div>
@@ -2629,7 +2692,7 @@ function renderEodHeader(d) {
 function renderSig(analyses, positions, sym, bodyId) {
   const tb = document.getElementById(bodyId);
   if (!analyses||!analyses.length) {
-    tb.innerHTML = `<tr><td colspan="10" style="text-align:center;padding:18px;color:var(--muted)">No scan data — start the agent</td></tr>`;
+    tb.innerHTML = `<tr><td colspan="11" style="text-align:center;padding:18px;color:var(--muted)">No scan data — start the agent</td></tr>`;
     return;
   }
   tb.innerHTML = analyses.map(a => {
@@ -2648,6 +2711,11 @@ function renderSig(analyses, positions, sym, bodyId) {
     const hArr = hw > ht/2 ? "↑" : hw < ht/2 ? "↓" : "→";
     const hTxt = ht > 0 ? `${hw}/${ht}${hArr}` : "–";
     const hClr = hw > ht/2 ? "var(--green)" : hw < ht/2 ? "var(--red)" : "var(--muted)";
+    const nc   = a.news_count ?? 0;
+    const ns   = a.news_score ?? 0;
+    const nArr = ns > 0 ? "↑" : ns < 0 ? "↓" : "→";
+    const nTxt = nc > 0 ? `${nc}${nArr}` : "–";
+    const nClr = ns > 0 ? "var(--green)" : ns < 0 ? "var(--red)" : "var(--muted)";
     return `<tr>
       <td class="mono" style="font-weight:600${inP?";color:var(--blue)":""}">${disp(a.symbol)}${inP?" *":""}</td>
       <td class="mono">${sym}${(a.price||0).toFixed(2)}</td>
@@ -2657,6 +2725,7 @@ function renderSig(analyses, positions, sym, bodyId) {
       <td class="muted">${ema}</td>
       <td class="muted">${vol}</td>
       <td class="mono" style="color:${hClr};font-weight:600">${hTxt}</td>
+      <td class="mono" style="color:${nClr};font-weight:600">${nTxt}</td>
       <td><div class="cbar"><div class="cbar-bg"><div class="cbar-fg" style="width:${conf}%;background:${cc}"></div></div>
           <span class="mono" style="color:${cc};font-size:11px">${conf.toFixed(0)}%</span></div></td>
       <td><span class="${actC}">${actT}</span></td>
