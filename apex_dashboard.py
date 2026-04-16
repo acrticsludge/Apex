@@ -540,6 +540,42 @@ def save_state(st: dict):
     except Exception as e:
         apex_log.error(f"JSON save error: {e}")
 
+# ── Keys the user can change via the Settings panel ───────────────────────────
+_CFG_PERSIST_KEYS = (
+    "risk_per_trade", "confidence_threshold", "stop_loss_pct", "target_pct",
+    "check_interval_min", "idle_interval_min",
+    "india_max_positions", "us_max_positions",
+    "eod_harvest_min", "eod_exit_min",
+)
+
+def load_cfg():
+    """Restore user-adjusted settings from Supabase (id='config' row)."""
+    if not _sb:
+        return
+    try:
+        resp = _sb.table("apex_state").select("data").eq("id", "config").execute()
+        if resp.data:
+            saved = resp.data[0]["data"]
+            for k in _CFG_PERSIST_KEYS:
+                if k in saved:
+                    cfg[k] = saved[k]
+            apex_log.info(f"Config restored from Supabase: {[k for k in _CFG_PERSIST_KEYS if k in saved]}")
+    except Exception as e:
+        apex_log.warning(f"Config load error: {e}")
+
+def save_cfg():
+    """Persist user-adjustable settings to Supabase (id='config' row)."""
+    if not _sb:
+        return
+    try:
+        _sb.table("apex_state").upsert({
+            "id":         "config",
+            "data":       {k: cfg[k] for k in _CFG_PERSIST_KEYS},
+            "updated_at": datetime.now().isoformat(),
+        }).execute()
+    except Exception as e:
+        apex_log.error(f"Config save error: {e}")
+
 # ─── SESSION MANAGEMENT ───────────────────────────────────────────────────────
 
 def _close_session(market_key: str, prices: dict):
@@ -1279,6 +1315,7 @@ def start_price_updater():
 def agent_loop():
     global _state
     with _lock:
+        load_cfg()
         _state = load_state()
     _agent["status"] = "running"
     apex_log.info("Agent started — dual-market cycle active")
@@ -1539,6 +1576,7 @@ def update_config():
         if k in data:
             cfg[k] = int(data[k]) if k in int_keys else float(data[k])
             changed.append(k)
+    save_cfg()
     apex_log.info(f"Config updated: {', '.join(changed)}")
     return jsonify({"ok": True, "config": cfg})
 
