@@ -44,15 +44,35 @@ cfg = {
     "us_capital":            1_800,
     "india_max_positions":       4,
     "us_max_positions":          4,
-    "risk_per_trade":         0.12,
+    "risk_per_trade":         0.02,   # % of session_start_cash risked per trade (ATR-normalised)
+    "max_position_pct":       0.20,   # hard cap: no single position > 20% of cash
     "confidence_threshold":     62,
-    "stop_loss_pct":          0.03,
-    "target_pct":            0.045,
+    "stop_loss_pct":          0.03,   # fallback fixed SL (used when ATR unavailable)
+    "target_pct":            0.045,   # fallback fixed TP
     "check_interval_min":        3,
     "idle_interval_min":        15,
     "eod_harvest_min":          30,   # sell profitable positions this many min before close
     "eod_exit_min":             15,   # force-exit everything this many min before close
     "state_file":  "apex_dual_state.json",
+    # ── Risk controls ────────────────────────────────────────────────────────
+    "daily_loss_limit_pct":   0.05,   # halt new buys if day's realised loss > 5% of start cash
+    "max_drawdown_pct":       0.08,   # halt new buys if portfolio drops > 8% from peak
+    # ── ATR exits ────────────────────────────────────────────────────────────
+    "use_atr_exits":          True,
+    "atr_sl_mult":             2.0,   # SL = entry - ATR × 2.0
+    "atr_tp_mult":             3.0,   # TP = entry + ATR × 3.0
+    # ── Trailing stop ────────────────────────────────────────────────────────
+    "trailing_stop_enabled":  True,
+    "trailing_activation_mult": 1.0,  # activate once price rises by 1× ATR from entry
+    "trailing_dist_mult":      1.5,   # trail at 1.5× ATR below the running high
+    # ── Signal filters ───────────────────────────────────────────────────────
+    "adx_min":                  20,   # only trade when ADX confirms a trend
+    "index_min_pct":          -0.5,   # block new longs if index is down > 0.5% on the day
+    "open_filter_min":          15,   # observation window after market open (minutes)
+    "open_filter_confidence":   85,   # allow trades during window only if confidence >= 85%
+    # ── Trade hygiene ────────────────────────────────────────────────────────
+    "cooldown_after_sl_min":    60,   # re-entry blocked for 60 min after a stop-loss
+    "commission_pct":        0.0006,  # 0.05% per side (buy + sell)
 }
 
 INDIA_WATCHLIST = [
@@ -208,6 +228,28 @@ def _price_updater():
             apex_log.warning(f"Price updater error: {e}")
         time.sleep(10)
 
+# ─── INDEX TREND FILTER ───────────────────────────────────────────────────────
+
+_index_trend: dict = {"india": 0.0, "us": 0.0}   # intraday % change from day open
+
+def _refresh_index_trend():
+    """Fetch today's intraday % change for Nifty50 (^NSEI) and S&P500 (^GSPC).
+    Called once per agent cycle — no lock needed (floats are atomic in CPython)."""
+    for sym, key in [("^NSEI", "india"), ("^GSPC", "us")]:
+        try:
+            df = yf.download(sym, period="1d", interval="1m",
+                             progress=False, auto_adjust=True)
+            if df is not None and not df.empty:
+                close = df["Close"]
+                if isinstance(close, pd.DataFrame):
+                    close = close.iloc[:, 0]
+                first = float(close.dropna().iloc[0])
+                last  = float(close.dropna().iloc[-1])
+                if first > 0:
+                    _index_trend[key] = round((last - first) / first * 100, 3)
+        except Exception as e:
+            apex_log.debug(f"[INDEX] {key} refresh failed: {e}")
+
 # ─── INDICATORS ───────────────────────────────────────────────────────────────
 
 def calc_rsi(close, p=14) -> float:
@@ -234,6 +276,48 @@ def calc_ema(close, p) -> float:
 def calc_vol_ratio(volume, p=20) -> float:
     avg = volume.rolling(p).mean().iloc[-1]
     return float(volume.iloc[-1] / avg) if avg > 0 else 1.0
+
+def calc_atr(df, p=14) -> float:
+    """Average True Range on OHLCV dataframe. Uses high/low/close columns."""
+    high  = df["high"].astype(float)
+    low   = df["low"].astype(float)
+    close = df["close"].astype(float)
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low  - close.shift()).abs(),
+    ], axis=1).max(axis=1)
+    val = tr.rolling(p).mean().iloc[-1]
+    return float(val) if not np.isnan(val) else 0.0
+
+def calc_adx(df, p=14) -> float:
+    """Average Directional Index. 0–100; values > 20 indicate a tradeable trend."""
+    high  = df["high"].astype(float)
+    low   = df["low"].astype(float)
+    close = df["close"].astype(float)
+    up_move   = high.diff()
+    down_move = -low.diff()
+    plus_dm   = pd.Series(
+        np.where((up_move > down_move) & (up_move > 0), up_move, 0.0),
+        index=high.index
+    )
+    minus_dm  = pd.Series(
+        np.where((down_move > up_move) & (down_move > 0), down_move, 0.0),
+        index=high.index
+    )
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low  - close.shift()).abs(),
+    ], axis=1).max(axis=1)
+    atr14    = tr.rolling(p).mean()
+    plus_di  = 100 * plus_dm.rolling(p).mean()  / atr14
+    minus_di = 100 * minus_dm.rolling(p).mean() / atr14
+    denom    = (plus_di + minus_di).replace(0, np.nan)
+    dx       = (100 * (plus_di - minus_di).abs() / denom).fillna(0)
+    adx      = dx.rolling(p).mean()
+    val      = adx.iloc[-1]
+    return float(val) if not np.isnan(val) else 0.0
 
 # ─── SIGNAL ENGINE ────────────────────────────────────────────────────────────
 
@@ -274,6 +358,9 @@ def analyse(symbol: str, df, live_price: float) -> dict:
                                "Low volume"   if vr < 0.7 else "Normal")}
     score += 15 if vr > 1.5 else -5 if vr < 0.7 else 0
 
+    atr = calc_atr(df)
+    adx = calc_adx(df)
+
     return {
         "symbol":     symbol,
         "price":      price,
@@ -283,6 +370,8 @@ def analyse(symbol: str, df, live_price: float) -> dict:
         "rsi":        r,
         "bb_upper":   bu,
         "bb_lower":   bl,
+        "atr":        round(atr, 4),
+        "adx":        round(adx, 1),
     }
 
 # ─── STATE MANAGEMENT ─────────────────────────────────────────────────────────
@@ -299,6 +388,8 @@ def _empty_mstate(capital: float, session_date: str = None) -> dict:
         "trade_log":          [],
         "session_date":       session_date or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
         "session_start_cash": float(capital),
+        "trading_halted":     False,
+        "cooldown_until":     {},
     }
 
 def _normalize_state(st: dict) -> dict:
@@ -313,6 +404,8 @@ def _normalize_state(st: dict) -> dict:
         if "session_start_cash" not in st[mkt]:
             cap = cfg["india_capital"] if mkt == "india" else cfg["us_capital"]
             st[mkt]["session_start_cash"] = float(cap)
+        st[mkt].setdefault("trading_halted", False)
+        st[mkt].setdefault("cooldown_until", {})
     return st
 
 def load_state() -> dict:
@@ -414,9 +507,13 @@ def _close_session(market_key: str, prices: dict):
         f"{record['wins']}W/{record['losses']}L  WR={wr}  {n_trades} trades"
     )
 
-    # Reset for next session
-    _state[market_key] = _empty_mstate(capital, today)
-    apex_log.info(f"[SESSION] {market_key.upper()} reset — awaiting next session ({today})")
+    # Reset for next session — carry over the final cash balance so capital compounds
+    carry_cash = round(mstate["cash"], 2)
+    _state[market_key] = _empty_mstate(carry_cash, today)
+    apex_log.info(
+        f"[SESSION] {market_key.upper()} reset — "
+        f"carry-over capital={sym}{carry_cash:.2f}  ({today})"
+    )
 
 
 def _check_session_rotation(prices: dict):
@@ -457,34 +554,76 @@ def log_trade(mstate: dict, msg: str, kind: str):
     if len(mstate["trade_log"]) > 200:
         mstate["trade_log"] = mstate["trade_log"][-200:]
 
-def execute_buy(symbol: str, price: float, mstate: dict):
-    alloc = mstate["cash"] * cfg["risk_per_trade"]
-    qty   = max(1, int(alloc / price))
-    cost  = qty * price
+def execute_buy(symbol: str, price: float, mstate: dict, atr: float = None):
+    # ── Position sizing: ATR-normalised risk, capped at max_position_pct ─────
+    start_cash   = mstate.get("session_start_cash", price * 10)
+    risk_dollars = start_cash * cfg["risk_per_trade"]
+    atr_sl_mult  = cfg["atr_sl_mult"]
+
+    if atr and atr > 0 and cfg.get("use_atr_exits", True):
+        sl_dist  = atr * atr_sl_mult
+        tp_dist  = atr * cfg["atr_tp_mult"]
+        # Floor/cap: keep SL/TP within 0.5×–2× of the fixed-pct fallback
+        sl_floor = price * cfg["stop_loss_pct"] * 0.5
+        sl_cap   = price * cfg["stop_loss_pct"] * 2.0
+        tp_floor = price * cfg["target_pct"]    * 0.5
+        tp_cap   = price * cfg["target_pct"]    * 2.0
+        sl_dist  = max(sl_floor, min(sl_cap, sl_dist))
+        tp_dist  = max(tp_floor, min(tp_cap, tp_dist))
+        # Risk-adjusted qty: how many shares until 1 SL hit = risk_dollars
+        qty = max(1, int(risk_dollars / sl_dist)) if sl_dist > 0 else 1
+    else:
+        sl_dist = price * cfg["stop_loss_pct"]
+        tp_dist = price * cfg["target_pct"]
+        qty     = max(1, int((mstate["cash"] * cfg["risk_per_trade"]) / price))
+
+    # Hard cap: single position may not exceed max_position_pct of available cash
+    max_qty = max(1, int(mstate["cash"] * cfg["max_position_pct"] / price))
+    qty     = min(qty, max_qty)
+
+    cost = qty * price
     if cost > mstate["cash"]:
         return None
-    mstate["cash"] -= cost
+
+    # Commission on the buy side
+    commission = cost * cfg.get("commission_pct", 0.0)
+    if mstate["cash"] < cost + commission:
+        return None
+
+    mstate["cash"] -= cost + commission
+
+    sl  = round(price - sl_dist, 2)
+    tgt = round(price + tp_dist, 2)
+
     mstate["positions"][symbol] = {
-        "qty":        qty,
-        "entry":      price,
-        "stop_loss":  round(price * (1 - cfg["stop_loss_pct"]), 2),
-        "target":     round(price * (1 + cfg["target_pct"]),    2),
-        "entered_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "qty":          qty,
+        "entry":        price,
+        "stop_loss":    sl,
+        "target":       tgt,
+        "atr":          atr or 0.0,
+        "running_high": price,
+        "entered_at":   datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
-    sl  = price * (1 - cfg["stop_loss_pct"])
-    tgt = price * (1 + cfg["target_pct"])
     log_trade(mstate,
+              f"BUY {qty} {symbol} @ {price:.2f}  SL:{sl:.2f}  T:{tgt:.2f}  "
+              f"Cost:{cost:.0f}  ATR:{atr:.3f}" if atr else
               f"BUY {qty} {symbol} @ {price:.2f}  SL:{sl:.2f}  T:{tgt:.2f}  Cost:{cost:.0f}",
               "BUY")
-    apex_log.info(f"BUY  {qty}x {symbol} @ {price:.2f}  cost={cost:.0f}  SL={sl:.2f}  T={tgt:.2f}")
+    apex_log.info(
+        f"BUY  {qty}x {symbol} @ {price:.2f}  cost={cost:.0f}  "
+        f"SL={sl:.2f}  T={tgt:.2f}  ATR={f'{atr:.3f}' if atr else 'n/a'}"
+    )
     return qty
 
 def execute_sell(symbol: str, price: float, reason: str, mstate: dict):
     pos = mstate["positions"].get(symbol)
     if not pos:
         return
-    pnl = (price - pos["entry"]) * pos["qty"]
-    mstate["cash"]         += pos["qty"] * price
+    proceeds   = pos["qty"] * price
+    commission = proceeds * cfg.get("commission_pct", 0.0)
+    net_proceeds = proceeds - commission
+    pnl = net_proceeds - pos["entry"] * pos["qty"]
+    mstate["cash"]         += net_proceeds
     mstate["realised_pnl"] += pnl
     if pnl >= 0:
         mstate["wins"]   += 1
@@ -496,6 +635,15 @@ def execute_sell(symbol: str, price: float, reason: str, mstate: dict):
               "SELL" if pnl >= 0 else "LOSS")
     apex_log.info(f"SELL {pos['qty']}x {symbol} @ {price:.2f}  P&L={sign}{pnl:.0f}  reason={reason}")
     del mstate["positions"][symbol]
+
+    # Set re-entry cooldown after a stop-loss
+    if reason == "STOP LOSS":
+        cooldown_min = cfg.get("cooldown_after_sl_min", 60)
+        until = (
+            datetime.now(timezone.utc) + timedelta(minutes=cooldown_min)
+        ).isoformat(timespec="seconds")
+        mstate.setdefault("cooldown_until", {})[symbol] = until
+        apex_log.info(f"[COOLDOWN] {symbol} blocked for {cooldown_min}m (stop-loss triggered)")
 
 # ─── MARKET CYCLE ─────────────────────────────────────────────────────────────
 
@@ -528,7 +676,12 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int):
         f"cash={mstate['cash']:.0f}"
     )
 
-    # ── EOD exit: runs before normal SL/target checks ────────────────────────
+    # ── 1. Update peak portfolio (prerequisite for drawdown kill-switch) ──────
+    pv = portfolio_value(mstate, prices)
+    if pv > mstate.get("peak_portfolio", pv):
+        mstate["peak_portfolio"] = pv
+
+    # ── 2. EOD exit: runs before normal SL/target checks ─────────────────────
     if mtc is not None:
         for sym in list(mstate["positions"].keys()):
             pos   = mstate["positions"].get(sym)
@@ -540,22 +693,35 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int):
             pnl = (price - pos["entry"]) * pos["qty"]
 
             if exit_min < mtc <= harvest_min and pnl > 0:
-                # Profit-harvest window: lock in any gains
                 paper_sell(sym, pos["qty"], prices, mstate, f"EOD PROFIT ({mtc:.0f}m to close)")
                 apex_log.info(f"EOD profit harvest: {sym}  P&L={pnl:+.0f}  {mtc:.0f}m left")
 
             elif mtc <= exit_min:
-                # Force-exit window: close everything regardless
                 tag = "EOD EXIT" if pnl >= 0 else "EOD CUT LOSS"
                 paper_sell(sym, pos["qty"], prices, mstate, f"{tag} ({mtc:.0f}m to close)")
                 apex_log.info(f"EOD force exit: {sym}  P&L={pnl:+.0f}  {mtc:.0f}m left")
 
-    # ── Normal SL / target checks ─────────────────────────────────────────────
+    # ── 3. Trailing stop update + normal SL / target checks ──────────────────
     for sym in list(mstate["positions"].keys()):
-        pos   = mstate["positions"][sym]
-        if prices.get(sym) is None:
+        pos   = mstate["positions"].get(sym)
+        if pos is None or prices.get(sym) is None:
             continue
         price = prices[sym]
+
+        # Trailing stop: activate once price rises by activation_mult × ATR from entry
+        if cfg.get("trailing_stop_enabled", True) and pos.get("atr", 0) > 0:
+            activation = pos["entry"] + pos["atr"] * cfg.get("trailing_activation_mult", 1.0)
+            if price >= activation:
+                pos["running_high"] = max(pos.get("running_high", price), price)
+                new_sl = pos["running_high"] - pos["atr"] * cfg.get("trailing_dist_mult", 1.5)
+                if new_sl > pos["stop_loss"]:
+                    old_sl = pos["stop_loss"]
+                    pos["stop_loss"] = round(new_sl, 2)
+                    apex_log.debug(
+                        f"[TRAIL] {sym}  SL {old_sl:.2f}→{pos['stop_loss']:.2f}  "
+                        f"high={pos['running_high']:.2f}"
+                    )
+
         if price <= pos["stop_loss"]:
             paper_sell(sym, pos["qty"], prices, mstate, "STOP LOSS")
             _dc["sell"] += 1
@@ -570,7 +736,7 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int):
                 f"SL={pos['stop_loss']:.2f}  T={pos['target']:.2f}"
             )
 
-    # ── Block new buys when EOD exit mode is active ───────────────────────────
+    # ── 4. Block new buys when EOD exit mode is active ───────────────────────
     if mtc is not None and mtc <= harvest_min:
         apex_log.info(
             f"[{market_key.upper()}] think loop ■  EOD mode  "
@@ -578,34 +744,118 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int):
         )
         return
 
+    # ── 5. Daily loss limit / drawdown kill-switch ────────────────────────────
+    session_start = mstate.get("session_start_cash", 1.0)
+    daily_loss_pct = mstate["realised_pnl"] / session_start if session_start > 0 else 0
+    peak           = mstate.get("peak_portfolio", pv)
+    drawdown_pct   = (peak - pv) / peak if peak > 0 else 0
+    if (daily_loss_pct < -cfg.get("daily_loss_limit_pct", 0.05)
+            or drawdown_pct > cfg.get("max_drawdown_pct", 0.08)):
+        mstate["trading_halted"] = True
+        apex_log.warning(
+            f"[{market_key.upper()}] ⛔ TRADING HALTED — "
+            f"daily_loss={daily_loss_pct:.1%}  drawdown={drawdown_pct:.1%}"
+        )
+        return
+    mstate["trading_halted"] = False
+
+    # ── 6. Market open observation window filter ──────────────────────────────
+    tz_local  = IST if market_key == "india" else EDT
+    now_local = datetime.now(tz_local)
+    open_h, open_m = (9, 15) if market_key == "india" else (9, 30)
+    open_time = now_local.replace(hour=open_h, minute=open_m, second=0, microsecond=0)
+    mins_since_open = (now_local - open_time).total_seconds() / 60
+    in_open_window  = 0 <= mins_since_open < cfg.get("open_filter_min", 15)
+    open_conf_gate  = cfg.get("open_filter_confidence", 85)
+
+    # ── 7. Index trend gate ───────────────────────────────────────────────────
+    index_pct = _index_trend.get(market_key, 0.0)
+    index_ok  = index_pct >= cfg.get("index_min_pct", -0.5)
+    if not index_ok:
+        apex_log.info(
+            f"[{market_key.upper()}] Index filter: {index_pct:+.2f}% — "
+            f"suppressing new longs"
+        )
+
     open_pos = len(mstate["positions"])
+    now_utc  = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
     for a in sorted(analyses, key=lambda x: x["confidence"], reverse=True):
         sym    = a["symbol"]
         in_pos = sym in mstate["positions"]
-        if (not in_pos
-                and a["confidence"] >= cfg["confidence_threshold"]
+
+        # Signal exit for held positions (no window restriction)
+        if in_pos and a["score"] < -30:
+            paper_sell(sym, 0, prices, mstate, "SIGNAL EXIT")
+            _dc["sell"] += 1
+            continue
+
+        if in_pos:
+            apex_log.debug(
+                f"[{market_key.upper()}] HOLD  {sym}  "
+                f"score={a['score']:+d}  conf={a['confidence']:.0f}%"
+            )
+            _dc["hold"] += 1
+            continue
+
+        # ── New entry checks ─────────────────────────────────────────────────
+        conf = a["confidence"]
+
+        # Open window: only allow trades if confidence >= 85%
+        if in_open_window and conf < open_conf_gate:
+            apex_log.debug(
+                f"[{market_key.upper()}] OBSERVE  {sym}  "
+                f"conf={conf:.0f}% < {open_conf_gate}% (open window)"
+            )
+            _dc["watch"] += 1
+            continue
+
+        # Index trend gate
+        if not index_ok:
+            _dc["watch"] += 1
+            continue
+
+        # ADX trend gate
+        adx_val = a.get("adx", 25.0)
+        if adx_val < cfg.get("adx_min", 20):
+            apex_log.debug(
+                f"[{market_key.upper()}] NO-TREND  {sym}  ADX={adx_val:.1f}"
+            )
+            _dc["watch"] += 1
+            continue
+
+        # Re-entry cooldown
+        cooldown_until = mstate.get("cooldown_until", {}).get(sym, "")
+        if cooldown_until and now_utc < cooldown_until:
+            apex_log.debug(f"[COOLDOWN] {sym}  blocked until {cooldown_until}")
+            _dc["watch"] += 1
+            continue
+        elif cooldown_until and now_utc >= cooldown_until:
+            mstate["cooldown_until"].pop(sym, None)
+
+        # Core entry conditions
+        if (conf >= cfg["confidence_threshold"]
                 and a["score"] > 0
                 and open_pos < max_pos
                 and mstate["cash"] > a["price"] * 2):
-            if paper_buy(sym, 0, prices, mstate):
+            if paper_buy(sym, 0, prices, mstate, atr=a.get("atr")):
                 open_pos += 1
                 _dc["buy"] += 1
-        elif in_pos and a["score"] < -30:
-            paper_sell(sym, 0, prices, mstate, "SIGNAL EXIT")
-            _dc["sell"] += 1
         else:
-            label = "HOLD" if in_pos else "WATCH"
             apex_log.debug(
-                f"[{market_key.upper()}] {label}  {sym}  "
-                f"score={a['score']:+d}  conf={a['confidence']:.0f}%"
+                f"[{market_key.upper()}] WATCH  {sym}  "
+                f"score={a['score']:+d}  conf={conf:.0f}%  ADX={adx_val:.1f}"
             )
-            _dc["hold" if in_pos else "watch"] += 1
+            _dc["watch"] += 1
 
     apex_log.info(
         f"[{market_key.upper()}] think loop ■  "
         f"BUY:{_dc['buy']}  SELL:{_dc['sell']}  "
         f"HOLD:{_dc['hold']}  WATCH:{_dc['watch']}  "
-        f"cash={mstate['cash']:.0f}  pos={len(mstate['positions'])}"
+        f"cash={mstate['cash']:.0f}  pos={len(mstate['positions'])}  "
+        f"index={index_pct:+.2f}%"
+        + (f"  [OPEN WINDOW {mins_since_open:.0f}m/{cfg['open_filter_min']}m]"
+           if in_open_window else "")
     )
 
 def portfolio_value(mstate: dict, prices: dict) -> float:
@@ -622,14 +872,14 @@ def unrealised_pnl(mstate: dict, prices: dict) -> float:
 
 # ─── PAPER TRADING LAYER ──────────────────────────────────────────────────────
 
-def paper_buy(symbol: str, qty: int, latest_prices: dict, mstate: dict):
+def paper_buy(symbol: str, qty: int, latest_prices: dict, mstate: dict, atr: float = None):
     """Paper-trade a buy using the price from the snapshot.
     qty is advisory; actual qty is computed from risk settings inside execute_buy."""
     price = latest_prices.get(symbol)
     if price is None:
         apex_log.warning(f"paper_buy: no price for {symbol} in snapshot — skipping")
         return None
-    return execute_buy(symbol, price, mstate)
+    return execute_buy(symbol, price, mstate, atr=atr)
 
 def paper_sell(symbol: str, qty: int, latest_prices: dict, mstate: dict, reason: str = "SIGNAL"):
     """Paper-trade a sell using the price from the snapshot (falls back to live fetch)."""
@@ -688,6 +938,10 @@ def agent_loop():
     _agent["status"] = "running"
     apex_log.info("Agent started — dual-market cycle active")
 
+    # Track previous open state to detect market-close transitions
+    _prev_india_open = False
+    _prev_us_open    = False
+
     while _agent["running"]:
         if _agent["paused"]:
             _agent["status"] = "paused"
@@ -714,7 +968,23 @@ def agent_loop():
         # Rotate session if the calendar date has changed
         with _lock:
             _check_session_rotation(prices_snapshot)
-            save_state(_state)
+
+        # ── Auto end session when a market transitions open → closed ──────────
+        with _lock:
+            if _prev_india_open and not india_open:
+                apex_log.info("[SESSION] India market just closed — auto-archiving session")
+                _close_session("india", prices_snapshot)
+                save_state(_state)
+            if _prev_us_open and not us_open:
+                apex_log.info("[SESSION] US market just closed — auto-archiving session")
+                _close_session("us", prices_snapshot)
+                save_state(_state)
+
+        _prev_india_open = india_open
+        _prev_us_open    = us_open
+
+        # Refresh index trend once per cycle (no lock needed — floats are atomic)
+        _refresh_index_trend()
 
         if india_open:
             _agent["status"] = "Scanning India"
@@ -748,7 +1018,7 @@ def agent_loop():
 
         with _lock:
             save_state(_state)
-        apex_log.info("State saved to disk")
+        apex_log.info("State saved")
 
         _agent["last_update"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         sleep_min = cfg["check_interval_min"] if (india_open or us_open) else cfg["idle_interval_min"]
