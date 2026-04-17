@@ -13,7 +13,7 @@ from gymnasium import spaces
 
 class TradingEnv(gym.Env):
     """
-    Long-only trading environment with reward shaping around rolling Sharpe.
+    Long-only trading environment with benchmark-aware reward shaping.
 
     The environment samples one ticker per episode and gives the agent a flat
     normalized observation vector. Actions map to:
@@ -33,6 +33,11 @@ class TradingEnv(gym.Env):
         transaction_cost: float = 0.001,
         sharpe_window: int = 30,
         sharpe_reward_weight: float = 0.01,
+        benchmark_reward_weight: float = 1.0,
+        benchmark_opportunity_cost_weight: float = 0.35,
+        flat_position_penalty: float = 0.0002,
+        flat_penalty_after_steps: int = 8,
+        invalid_action_penalty: float = 0.0005,
         random_start: bool = True,
         episode_length: int | None = 252,
         fixed_ticker: str | None = None,
@@ -54,6 +59,11 @@ class TradingEnv(gym.Env):
         self.transaction_cost = float(transaction_cost)
         self.sharpe_window = int(sharpe_window)
         self.sharpe_reward_weight = float(sharpe_reward_weight)
+        self.benchmark_reward_weight = float(benchmark_reward_weight)
+        self.benchmark_opportunity_cost_weight = float(benchmark_opportunity_cost_weight)
+        self.flat_position_penalty = float(flat_position_penalty)
+        self.flat_penalty_after_steps = int(flat_penalty_after_steps)
+        self.invalid_action_penalty = float(invalid_action_penalty)
         self.random_start = bool(random_start)
         self.episode_length = episode_length
         self.fixed_ticker = fixed_ticker
@@ -84,6 +94,13 @@ class TradingEnv(gym.Env):
         self.portfolio_history: list[float] = []
         self.benchmark_history: list[float] = []
         self.benchmark_shares: float = 0.0
+        self.action_counts: dict[str, int] = {}
+        self.invalid_action_count: int = 0
+        self.flat_steps: int = 0
+        self.position_steps: int = 0
+        self.flat_steps_in_row: int = 0
+        self.holding_periods: list[int] = []
+        self.last_buy_step: int | None = None
 
         self._validate_frames()
 
@@ -112,6 +129,10 @@ class TradingEnv(gym.Env):
             return self.shares_held * price
         return self.cash
 
+    def _benchmark_value(self, price: float) -> float:
+        """Mark the simple buy-and-hold benchmark to market."""
+        return self.benchmark_shares * price
+
     def _compute_sharpe_bonus(self) -> float:
         """Compute a rolling Sharpe estimate from recent daily returns."""
         if len(self.daily_returns) < 2:
@@ -135,10 +156,65 @@ class TradingEnv(gym.Env):
         self.daily_returns = deque(maxlen=self.sharpe_window)
         self.portfolio_dates = [first_date]
         self.portfolio_history = [self.initial_cash]
+        self.action_counts = {"hold": 0, "buy": 0, "sell": 0}
+        self.invalid_action_count = 0
+        self.flat_steps = 0
+        self.position_steps = 0
+        self.flat_steps_in_row = 0
+        self.holding_periods = []
+        self.last_buy_step = None
 
         # Benchmark is a simple buy-and-hold position opened at the episode start.
         self.benchmark_shares = self.initial_cash / first_price
         self.benchmark_history = [self.initial_cash]
+
+    def _close_position(self, price: float, date: pd.Timestamp, reason: str) -> float:
+        """Close an open position and record both trade PnL and holding period."""
+        gross_value = self.shares_held * price
+        net_value = gross_value * (1.0 - self.transaction_cost)
+        pnl = net_value - (self.shares_held * self.entry_price)
+        self.cash = net_value
+        self.shares_held = 0.0
+        self.position = 0
+
+        if self.last_buy_step is not None:
+            holding_period = max(self.current_step - self.last_buy_step, 1)
+            self.holding_periods.append(holding_period)
+            self.last_buy_step = None
+
+        self.trade_log.append(
+            {
+                "date": date.isoformat(),
+                "ticker": self.current_ticker,
+                "side": "SELL",
+                "price": price,
+                "shares": 0.0,
+                "pnl": pnl,
+                "reason": reason,
+            }
+        )
+        return pnl
+
+    def get_episode_diagnostics(self) -> dict[str, Any]:
+        """Expose agent behavior diagnostics for evaluation and debugging."""
+        total_steps = self.flat_steps + self.position_steps
+        closed_trades = sum(1 for trade in self.trade_log if trade.get("side") == "SELL")
+        avg_holding_period = (
+            float(np.mean(self.holding_periods))
+            if self.holding_periods
+            else 0.0
+        )
+        return {
+            "action_counts": dict(self.action_counts),
+            "invalid_action_count": self.invalid_action_count,
+            "flat_steps": self.flat_steps,
+            "position_steps": self.position_steps,
+            "flat_steps_in_row": self.flat_steps_in_row,
+            "time_in_market_ratio": (self.position_steps / total_steps) if total_steps else 0.0,
+            "closed_trade_count": closed_trades,
+            "average_holding_period_days": avg_holding_period,
+            "zero_trade_episode": closed_trades == 0,
+        }
 
     def _sample_episode_bounds(self) -> tuple[int, int]:
         """Select a valid [start, end] window for the upcoming episode."""
@@ -206,7 +282,12 @@ class TradingEnv(gym.Env):
         current_date = pd.Timestamp(self.episode_frame.index[self.current_step])
         current_price = float(current_row["close_raw"])
         previous_portfolio_value = self._portfolio_value(current_price)
+        previous_benchmark_value = self._benchmark_value(current_price)
         trade_penalty = 0.0
+        invalid_action_penalty = 0.0
+
+        action_name = {0: "hold", 1: "buy", 2: "sell"}.get(int(action), "hold")
+        self.action_counts[action_name] = self.action_counts.get(action_name, 0) + 1
 
         if action == 1 and self.position == 0:
             investable_cash = self.cash * (1.0 - self.transaction_cost)
@@ -214,6 +295,7 @@ class TradingEnv(gym.Env):
             self.entry_price = current_price
             self.cash = 0.0
             self.position = 1
+            self.last_buy_step = self.current_step
             trade_penalty = self.transaction_cost
             self.trade_log.append(
                 {
@@ -225,25 +307,15 @@ class TradingEnv(gym.Env):
                     "reason": "agent_action",
                 }
             )
+        elif action == 1 and self.position == 1:
+            self.invalid_action_count += 1
+            invalid_action_penalty = self.invalid_action_penalty
         elif action == 2 and self.position == 1:
-            gross_value = self.shares_held * current_price
-            net_value = gross_value * (1.0 - self.transaction_cost)
-            pnl = net_value - (self.shares_held * self.entry_price)
-            self.cash = net_value
-            self.shares_held = 0.0
-            self.position = 0
+            self._close_position(price=current_price, date=current_date, reason="agent_action")
             trade_penalty = self.transaction_cost
-            self.trade_log.append(
-                {
-                    "date": current_date.isoformat(),
-                    "ticker": self.current_ticker,
-                    "side": "SELL",
-                    "price": current_price,
-                    "shares": 0.0,
-                    "pnl": pnl,
-                    "reason": "agent_action",
-                }
-            )
+        elif action == 2 and self.position == 0:
+            self.invalid_action_count += 1
+            invalid_action_penalty = self.invalid_action_penalty
 
         self.current_step += 1
         terminated = self.current_step >= self.end_step
@@ -255,47 +327,78 @@ class TradingEnv(gym.Env):
 
         if terminated and self.position == 1:
             # Force liquidation on the final bar so every episode finishes flat.
-            gross_value = self.shares_held * next_price
-            net_value = gross_value * (1.0 - self.transaction_cost)
-            pnl = net_value - (self.shares_held * self.entry_price)
-            self.cash = net_value
-            self.shares_held = 0.0
-            self.position = 0
-            self.trade_log.append(
-                {
-                    "date": next_date.isoformat(),
-                    "ticker": self.current_ticker,
-                    "side": "SELL",
-                    "price": next_price,
-                    "shares": 0.0,
-                    "pnl": pnl,
-                    "reason": "episode_end",
-                }
-            )
+            self._close_position(price=next_price, date=next_date, reason="episode_end")
 
         new_portfolio_value = self._portfolio_value(next_price)
+        new_benchmark_value = self._benchmark_value(next_price)
         daily_return = (
             (new_portfolio_value - previous_portfolio_value) / previous_portfolio_value
             if previous_portfolio_value > 0
             else 0.0
         )
+        benchmark_return = (
+            (new_benchmark_value - previous_benchmark_value) / previous_benchmark_value
+            if previous_benchmark_value > 0
+            else 0.0
+        )
+        excess_return = daily_return - benchmark_return
         self.daily_returns.append(daily_return)
 
+        if self.position == 0:
+            self.flat_steps += 1
+            self.flat_steps_in_row += 1
+        else:
+            self.position_steps += 1
+            self.flat_steps_in_row = 0
+
+        opportunity_cost_penalty = (
+            max(benchmark_return, 0.0) * self.benchmark_opportunity_cost_weight
+            if self.position == 0
+            else 0.0
+        )
+        flat_position_penalty = (
+            self.flat_position_penalty
+            if self.position == 0 and self.flat_steps_in_row >= self.flat_penalty_after_steps
+            else 0.0
+        )
         sharpe_bonus = self._compute_sharpe_bonus()
-        reward = float(daily_return - trade_penalty + (self.sharpe_reward_weight * sharpe_bonus))
+        reward = float(
+            daily_return
+            + (self.benchmark_reward_weight * excess_return)
+            - trade_penalty
+            - invalid_action_penalty
+            - opportunity_cost_penalty
+            - flat_position_penalty
+            + (self.sharpe_reward_weight * sharpe_bonus)
+        )
 
         self.portfolio_dates.append(next_date)
         self.portfolio_history.append(float(new_portfolio_value))
-        self.benchmark_history.append(float(self.benchmark_shares * next_price))
+        self.benchmark_history.append(float(new_benchmark_value))
 
         info = {
             "ticker": self.current_ticker,
             "date": next_date.isoformat(),
             "portfolio_value": float(new_portfolio_value),
-            "benchmark_value": float(self.benchmark_shares * next_price),
+            "benchmark_value": float(new_benchmark_value),
             "position": self.position,
             "daily_return": float(daily_return),
+            "benchmark_return": float(benchmark_return),
+            "excess_return": float(excess_return),
             "trade_count": len(self.trade_log),
+            "action_counts": dict(self.action_counts),
+            "invalid_action_count": self.invalid_action_count,
+            "reward_components": {
+                "daily_return": float(daily_return),
+                "benchmark_return": float(benchmark_return),
+                "excess_return": float(excess_return),
+                "trade_penalty": float(trade_penalty),
+                "invalid_action_penalty": float(invalid_action_penalty),
+                "opportunity_cost_penalty": float(opportunity_cost_penalty),
+                "flat_position_penalty": float(flat_position_penalty),
+                "sharpe_bonus": float(sharpe_bonus),
+            },
+            "episode_diagnostics": self.get_episode_diagnostics() if terminated else None,
             "trade_log": self.trade_log if terminated else None,
         }
         return self._get_observation(), reward, terminated, truncated, info

@@ -34,21 +34,22 @@ class EpisodeEvaluation:
     equity_curve: pd.Series
     benchmark_curve: pd.Series
     trade_log: list[dict[str, Any]]
-    metrics: dict[str, float]
-    benchmark_metrics: dict[str, float]
+    metrics: dict[str, Any]
+    benchmark_metrics: dict[str, Any]
+    diagnostics: dict[str, Any]
 
 
-def _safe_float(value: Any) -> float:
-    """Convert pandas/numpy scalars into JSON-safe Python floats."""
+def _json_safe_number(value: Any) -> float | None:
+    """Convert pandas/numpy scalars into JSON-safe Python numbers while preserving ``None``."""
     if value is None:
-        return 0.0
+        return None
     return float(value)
 
 
 def compute_performance_metrics(
     equity_curve: pd.Series,
     trade_log: list[dict[str, Any]],
-) -> dict[str, float]:
+) -> dict[str, Any]:
     """
     Compute the headline backtest metrics requested by the project brief.
 
@@ -88,16 +89,21 @@ def compute_performance_metrics(
     win_rate = (len(winning_trades) / total_trades) if total_trades else 0.0
     gross_profit = sum(winning_trades)
     gross_loss = abs(sum(losing_trades))
-    profit_factor = gross_profit / max(gross_loss, 1e-8)
+    if total_trades == 0:
+        profit_factor: float | None = 0.0
+    elif gross_loss == 0.0 and gross_profit > 0.0:
+        profit_factor = None
+    else:
+        profit_factor = gross_profit / max(gross_loss, 1e-8)
 
     return {
-        "cumulative_return": _safe_float(equity_curve.iloc[-1] / equity_curve.iloc[0] - 1.0),
-        "sharpe_ratio": _safe_float(sharpe_ratio),
-        "max_drawdown": _safe_float(max_drawdown),
-        "win_rate": _safe_float(win_rate),
-        "profit_factor": _safe_float(profit_factor),
-        "total_trades": _safe_float(total_trades),
-        "ending_value": _safe_float(equity_curve.iloc[-1]),
+        "cumulative_return": _json_safe_number(equity_curve.iloc[-1] / equity_curve.iloc[0] - 1.0),
+        "sharpe_ratio": _json_safe_number(sharpe_ratio),
+        "max_drawdown": _json_safe_number(max_drawdown),
+        "win_rate": _json_safe_number(win_rate),
+        "profit_factor": _json_safe_number(profit_factor),
+        "total_trades": _json_safe_number(total_trades),
+        "ending_value": _json_safe_number(equity_curve.iloc[-1]),
     }
 
 
@@ -126,6 +132,7 @@ def evaluate_model_on_env(
         trade_log=list(env.trade_log),
         metrics=compute_performance_metrics(strategy_curve, env.trade_log),
         benchmark_metrics=compute_performance_metrics(benchmark_curve, []),
+        diagnostics=env.get_episode_diagnostics(),
     )
 
 
@@ -176,6 +183,7 @@ def evaluate_model_on_frames(
     current_settings: Settings = settings,
     split_name: str = "test",
     save_artifacts: bool = False,
+    dataset_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Evaluate one model across a full validation or test split."""
     episode_results: list[EpisodeEvaluation] = []
@@ -188,28 +196,94 @@ def evaluate_model_on_frames(
             transaction_cost=current_settings.transaction_cost,
             sharpe_window=current_settings.sharpe_window,
             sharpe_reward_weight=current_settings.sharpe_reward_weight,
+            benchmark_reward_weight=current_settings.benchmark_reward_weight,
+            benchmark_opportunity_cost_weight=current_settings.benchmark_opportunity_cost_weight,
+            flat_position_penalty=current_settings.flat_position_penalty,
+            flat_penalty_after_steps=current_settings.flat_penalty_after_steps,
+            invalid_action_penalty=current_settings.invalid_action_penalty,
             random_start=False,
             episode_length=None,
             fixed_ticker=ticker,
             min_episode_length=current_settings.min_episode_length,
             seed=current_settings.random_seed,
         )
-        episode_results.append(evaluate_model_on_env(model=model, env=evaluation_env, deterministic=True))
+        try:
+            episode_results.append(evaluate_model_on_env(model=model, env=evaluation_env, deterministic=True))
+        finally:
+            evaluation_env.close()
 
     aggregate_strategy = _aggregate_curves([result.equity_curve for result in episode_results])
     aggregate_benchmark = _aggregate_curves([result.benchmark_curve for result in episode_results])
     all_trade_logs = [trade for result in episode_results for trade in result.trade_log]
+    overall_metrics = compute_performance_metrics(aggregate_strategy, all_trade_logs)
+    benchmark_metrics = compute_performance_metrics(aggregate_benchmark, [])
+    zero_trade_tickers = [
+        result.ticker for result in episode_results if result.diagnostics.get("zero_trade_episode", False)
+    ]
+    action_counts = {"hold": 0, "buy": 0, "sell": 0}
+    invalid_action_count = 0
+    total_holding_periods: list[float] = []
+    total_time_in_market = 0.0
+
+    for result in episode_results:
+        result_action_counts = result.diagnostics.get("action_counts", {})
+        for action_name in action_counts:
+            action_counts[action_name] += int(result_action_counts.get(action_name, 0))
+        invalid_action_count += int(result.diagnostics.get("invalid_action_count", 0))
+        if result.diagnostics.get("average_holding_period_days", 0.0) > 0.0:
+            total_holding_periods.append(float(result.diagnostics["average_holding_period_days"]))
+        total_time_in_market += float(result.diagnostics.get("time_in_market_ratio", 0.0))
 
     summary: dict[str, Any] = {
         "split": split_name,
         "tickers": [result.ticker for result in episode_results],
-        "overall_metrics": compute_performance_metrics(aggregate_strategy, all_trade_logs),
-        "benchmark_metrics": compute_performance_metrics(aggregate_benchmark, []),
+        "overall_metrics": {
+            **overall_metrics,
+            "excess_return_vs_benchmark": (
+                float(overall_metrics["cumulative_return"]) - float(benchmark_metrics["cumulative_return"])
+                if overall_metrics.get("cumulative_return") is not None
+                and benchmark_metrics.get("cumulative_return") is not None
+                else None
+            ),
+        },
+        "benchmark_metrics": benchmark_metrics,
+        "diagnostics": {
+            "action_counts": action_counts,
+            "invalid_action_count": invalid_action_count,
+            "zero_trade_tickers": zero_trade_tickers,
+            "zero_trade_ticker_count": len(zero_trade_tickers),
+            "zero_trade_ticker_ratio": (
+                len(zero_trade_tickers) / len(episode_results) if episode_results else 0.0
+            ),
+            "trade_coverage_ratio": (
+                (len(episode_results) - len(zero_trade_tickers)) / len(episode_results)
+                if episode_results
+                else 0.0
+            ),
+            "average_time_in_market_ratio": (
+                total_time_in_market / len(episode_results) if episode_results else 0.0
+            ),
+            "average_holding_period_days": (
+                float(np.mean(total_holding_periods)) if total_holding_periods else 0.0
+            ),
+            "skipped_tickers": (
+                dataset_metadata.get("skipped_tickers", {}) if dataset_metadata else {}
+            ),
+        },
         "per_ticker": {
             result.ticker: {
-                "strategy_metrics": result.metrics,
+                "strategy_metrics": {
+                    **result.metrics,
+                    "excess_return_vs_benchmark": (
+                        float(result.metrics["cumulative_return"]) - float(result.benchmark_metrics["cumulative_return"])
+                        if result.metrics.get("cumulative_return") is not None
+                        and result.benchmark_metrics.get("cumulative_return") is not None
+                        else None
+                    ),
+                },
                 "benchmark_metrics": result.benchmark_metrics,
                 "trade_count": len(result.trade_log),
+                "diagnostics": result.diagnostics,
             }
             for result in episode_results
         },
@@ -270,5 +344,6 @@ def run_evaluation(
         current_settings=current_settings,
         split_name="test",
         save_artifacts=True,
+        dataset_metadata=bundle.metadata,
     )
     return evaluation_summary

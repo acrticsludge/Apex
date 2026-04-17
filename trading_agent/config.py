@@ -231,7 +231,26 @@ class Settings:
     min_episode_length: int = int(os.getenv("RL_MIN_EPISODE_LENGTH", "64"))
     sharpe_window: int = 30
     sharpe_reward_weight: float = float(os.getenv("RL_SHARPE_REWARD_WEIGHT", "0.01"))
+    benchmark_reward_weight: float = float(os.getenv("RL_BENCHMARK_REWARD_WEIGHT", "1.0"))
+    benchmark_opportunity_cost_weight: float = float(
+        os.getenv("RL_BENCHMARK_OPPORTUNITY_COST_WEIGHT", "0.35")
+    )
+    flat_position_penalty: float = float(os.getenv("RL_FLAT_POSITION_PENALTY", "0.0002"))
+    flat_penalty_after_steps: int = int(os.getenv("RL_FLAT_PENALTY_AFTER_STEPS", "8"))
+    invalid_action_penalty: float = float(os.getenv("RL_INVALID_ACTION_PENALTY", "0.0005"))
     random_seed: int = int(os.getenv("RL_RANDOM_SEED", "42"))
+
+    # Institutional feature toggles
+    enable_vwap: bool = field(default_factory=lambda: os.getenv("RL_ENABLE_VWAP", "true").lower() == "true")
+    enable_volume_profile: bool = field(
+        default_factory=lambda: os.getenv("RL_ENABLE_VOLUME_PROFILE", "true").lower() == "true"
+    )
+    enable_liquidity_sweeps: bool = field(
+        default_factory=lambda: os.getenv("RL_ENABLE_LIQUIDITY_SWEEPS", "true").lower() == "true"
+    )
+    vwap_lookback: int = field(default_factory=lambda: int(os.getenv("RL_VWAP_LOOKBACK", "30")))
+    vp_lookback: int = field(default_factory=lambda: int(os.getenv("RL_VP_LOOKBACK", "20")))
+    swing_lookback: int = field(default_factory=lambda: int(os.getenv("RL_SWING_LOOKBACK", "20")))
 
     # PPO hyperparameters required by the project brief
     learning_rate: float = 3e-4
@@ -244,6 +263,10 @@ class Settings:
     eval_freq: int = int(os.getenv("RL_EVAL_FREQ", "10000"))
     checkpoint_freq: int = int(os.getenv("RL_CHECKPOINT_FREQ", "25000"))
     policy_hidden_layers: list[int] = field(default_factory=lambda: [256, 256])
+    validation_sharpe_weight: float = float(os.getenv("RL_VALIDATION_SHARPE_WEIGHT", "1.0"))
+    validation_excess_return_weight: float = float(os.getenv("RL_VALIDATION_EXCESS_RETURN_WEIGHT", "2.0"))
+    validation_drawdown_weight: float = float(os.getenv("RL_VALIDATION_DRAWDOWN_WEIGHT", "0.75"))
+    validation_trade_coverage_weight: float = float(os.getenv("RL_VALIDATION_TRADE_COVERAGE_WEIGHT", "0.25"))
 
     # Serving settings
     api_host: str = os.getenv("TRADING_AGENT_HOST", "0.0.0.0")
@@ -269,6 +292,17 @@ class Settings:
         self.chart_path = self.model_dir / "cumulative_return_comparison.png"
         self.latest_model_path = self.model_dir / "latest_model.zip"
         self.best_model_path = self.model_dir / "best_model.zip"
+
+        if self.enable_vwap:
+            self.feature_columns += ["vwap_dist", "vwap_above", "vwap_band_2_dist"]
+        if self.enable_volume_profile:
+            self.feature_columns += ["vp_poc_dist", "vp_in_value_area", "vp_above_poc"]
+        if self.enable_liquidity_sweeps:
+            self.feature_columns += [
+                "ls_pdh_dist", "ls_pdl_dist",
+                "ls_swing_high_dist", "ls_swing_low_dist",
+                "ls_sweep", "ls_choch",
+            ]
 
     def ensure_directories(self) -> None:
         """Create all writable directories used by the pipeline."""

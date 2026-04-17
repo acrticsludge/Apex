@@ -15,7 +15,10 @@ from sklearn.preprocessing import MinMaxScaler
 
 from trading_agent.config import Settings, settings
 from trading_agent.data.indicator_engine import add_technical_indicators
+from trading_agent.data.liquidity_sweeps import add_liquidity_sweeps
 from trading_agent.data.sentiment_engine import add_sentiment_feature
+from trading_agent.data.volume_profile import add_volume_profile
+from trading_agent.data.vwap_engine import add_daily_vwap
 
 
 logger = logging.getLogger(__name__)
@@ -162,6 +165,12 @@ def prepare_datasets(
         try:
             ohlcv_frame = download_ohlcv_history(ticker=ticker, current_settings=current_settings)
             feature_frame = add_technical_indicators(ohlcv_frame)
+            if current_settings.enable_vwap:
+                feature_frame = add_daily_vwap(feature_frame, lookback=current_settings.vwap_lookback)
+            if current_settings.enable_volume_profile:
+                feature_frame = add_volume_profile(feature_frame, lookback=current_settings.vp_lookback)
+            if current_settings.enable_liquidity_sweeps:
+                feature_frame = add_liquidity_sweeps(feature_frame, swing_lookback=current_settings.swing_lookback)
             feature_frame = add_sentiment_feature(
                 price_frame=feature_frame,
                 ticker=ticker,

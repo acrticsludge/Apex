@@ -86,8 +86,10 @@ What training does:
 - fetches Finnhub company news, scores it into a `[-1, +1]` sentiment feature, and caches it
 - splits chronologically into 80% train / 10% validation / 10% test
 - fits a `MinMaxScaler` on the train split only
+- rewards the policy for absolute returns plus excess return versus buy-and-hold
+- penalizes repeated flat exposure in rising markets and invalid over-trading actions
 - trains PPO for `500000` timesteps
-- saves the best checkpoint by validation Sharpe ratio
+- saves the best checkpoint by a validation selection score that combines Sharpe, benchmark outperformance, drawdown, and trade coverage
 - saves periodic resume checkpoints during training
 
 Saved outputs land in `trading_agent/agent/model/`:
@@ -117,11 +119,13 @@ This saves:
 Reported metrics:
 
 - Cumulative Return
+- Excess Return vs Buy-and-Hold
 - Sharpe Ratio
 - Max Drawdown
 - Win Rate
 - Profit Factor
 - Buy-and-Hold benchmark comparison
+- Action mix, zero-trade ticker count, average holding period, and skipped ticker diagnostics
 
 ## Serve
 

@@ -36,11 +36,12 @@ class TrainingResult:
 
 class ValidationSharpeEvalCallback(EvalCallback):
     """
-    EvalCallback variant that chooses the best checkpoint by validation Sharpe.
+    EvalCallback variant that chooses the best checkpoint by validation portfolio quality.
 
-    The base Stable-Baselines3 callback saves by mean reward. In trading, a
-    reward-shaped training objective is useful, but model selection is usually
-    better tied to portfolio metrics on a chronological validation split.
+    The base Stable-Baselines3 callback saves by mean reward. In trading, the
+    shaped reward is useful for learning, but checkpoint selection should stay
+    tied to chronological validation behavior: Sharpe, excess return, drawdown,
+    and whether the policy actually trades.
     """
 
     def __init__(
@@ -50,6 +51,7 @@ class ValidationSharpeEvalCallback(EvalCallback):
         current_settings: Settings,
         eval_freq: int,
         best_model_save_path: Path,
+        dataset_metadata: dict[str, Any] | None = None,
         verbose: int = 1,
     ) -> None:
         dummy_eval_env = DummyVecEnv(
@@ -62,6 +64,11 @@ class ValidationSharpeEvalCallback(EvalCallback):
                         transaction_cost=current_settings.transaction_cost,
                         sharpe_window=current_settings.sharpe_window,
                         sharpe_reward_weight=current_settings.sharpe_reward_weight,
+                        benchmark_reward_weight=current_settings.benchmark_reward_weight,
+                        benchmark_opportunity_cost_weight=current_settings.benchmark_opportunity_cost_weight,
+                        flat_position_penalty=current_settings.flat_position_penalty,
+                        flat_penalty_after_steps=current_settings.flat_penalty_after_steps,
+                        invalid_action_penalty=current_settings.invalid_action_penalty,
                         random_start=False,
                         episode_length=None,
                         min_episode_length=current_settings.min_episode_length,
@@ -84,8 +91,30 @@ class ValidationSharpeEvalCallback(EvalCallback):
         self.feature_columns = feature_columns
         self.current_settings = current_settings
         self.best_model_path = best_model_save_path
+        self.dataset_metadata = dataset_metadata or {}
         self.best_validation_sharpe = -np.inf
+        self.best_validation_score = -np.inf
         self.latest_summary: dict[str, Any] = {}
+
+    def _selection_score(self, summary: dict[str, Any]) -> float:
+        """Score validation runs using outperformance, Sharpe, drawdown, and trade coverage."""
+        overall_metrics = summary["overall_metrics"]
+        benchmark_metrics = summary["benchmark_metrics"]
+        diagnostics = summary.get("diagnostics", {})
+
+        excess_return = float(overall_metrics["cumulative_return"]) - float(
+            benchmark_metrics["cumulative_return"]
+        )
+        sharpe_ratio = float(overall_metrics["sharpe_ratio"])
+        max_drawdown = float(overall_metrics["max_drawdown"])
+        trade_coverage_ratio = float(diagnostics.get("trade_coverage_ratio", 0.0))
+
+        return (
+            (self.current_settings.validation_sharpe_weight * sharpe_ratio)
+            + (self.current_settings.validation_excess_return_weight * excess_return)
+            - (self.current_settings.validation_drawdown_weight * max_drawdown)
+            + (self.current_settings.validation_trade_coverage_weight * trade_coverage_ratio)
+        )
 
     def _on_step(self) -> bool:
         """Run a full validation backtest every ``eval_freq`` environment steps."""
@@ -99,18 +128,27 @@ class ValidationSharpeEvalCallback(EvalCallback):
             current_settings=self.current_settings,
             split_name="validation",
             save_artifacts=False,
+            dataset_metadata=self.dataset_metadata,
         )
 
         self.latest_summary = summary
         validation_sharpe = float(summary["overall_metrics"]["sharpe_ratio"])
         validation_return = float(summary["overall_metrics"]["cumulative_return"])
+        benchmark_return = float(summary["benchmark_metrics"]["cumulative_return"])
+        validation_excess_return = validation_return - benchmark_return
+        validation_score = self._selection_score(summary)
+        trade_coverage_ratio = float(summary.get("diagnostics", {}).get("trade_coverage_ratio", 0.0))
 
         self.logger.record("validation/sharpe_ratio", validation_sharpe)
         self.logger.record("validation/cumulative_return", validation_return)
+        self.logger.record("validation/excess_return", validation_excess_return)
         self.logger.record("validation/max_drawdown", float(summary["overall_metrics"]["max_drawdown"]))
+        self.logger.record("validation/trade_coverage_ratio", trade_coverage_ratio)
+        self.logger.record("validation/selection_score", validation_score)
 
-        if validation_sharpe > self.best_validation_sharpe:
+        if validation_score > self.best_validation_score:
             self.best_validation_sharpe = validation_sharpe
+            self.best_validation_score = validation_score
             self.model.save(str(self.best_model_path))
             self.current_settings.validation_metrics_path.write_text(
                 json.dumps(summary, indent=2),
@@ -118,7 +156,13 @@ class ValidationSharpeEvalCallback(EvalCallback):
             )
 
             if self.verbose >= 1:
-                logger.info("New best validation Sharpe %.4f. Saved model to %s", validation_sharpe, self.best_model_path)
+                logger.info(
+                    "New best validation score %.4f (Sharpe %.4f, excess return %.4f). Saved model to %s",
+                    validation_score,
+                    validation_sharpe,
+                    validation_excess_return,
+                    self.best_model_path,
+                )
 
         return True
 
@@ -135,6 +179,11 @@ def _make_train_env(bundle: PreparedDataBundle, current_settings: Settings) -> D
                     transaction_cost=current_settings.transaction_cost,
                     sharpe_window=current_settings.sharpe_window,
                     sharpe_reward_weight=current_settings.sharpe_reward_weight,
+                    benchmark_reward_weight=current_settings.benchmark_reward_weight,
+                    benchmark_opportunity_cost_weight=current_settings.benchmark_opportunity_cost_weight,
+                    flat_position_penalty=current_settings.flat_position_penalty,
+                    flat_penalty_after_steps=current_settings.flat_penalty_after_steps,
+                    invalid_action_penalty=current_settings.invalid_action_penalty,
                     random_start=True,
                     episode_length=current_settings.episode_length,
                     min_episode_length=current_settings.min_episode_length,
@@ -194,6 +243,7 @@ def run_training(
         current_settings=current_settings,
         eval_freq=current_settings.eval_freq,
         best_model_save_path=current_settings.best_model_path,
+        dataset_metadata=bundle.metadata,
         verbose=1,
     )
     checkpoint_callback = CheckpointCallback(
@@ -226,6 +276,7 @@ def run_training(
             current_settings=current_settings,
             split_name="validation",
             save_artifacts=False,
+            dataset_metadata=bundle.metadata,
         )
         current_settings.validation_metrics_path.write_text(
             json.dumps(validation_callback.latest_summary, indent=2),
@@ -233,6 +284,9 @@ def run_training(
         )
         validation_callback.best_validation_sharpe = float(
             validation_callback.latest_summary["overall_metrics"]["sharpe_ratio"]
+        )
+        validation_callback.best_validation_score = validation_callback._selection_score(
+            validation_callback.latest_summary
         )
         model.save(str(current_settings.best_model_path))
         selected_model_path = current_settings.best_model_path
@@ -248,6 +302,7 @@ def run_training(
         "storage_root": str(current_settings.storage_root),
         "checkpoint_dir": str(current_settings.checkpoint_dir),
         "best_validation_sharpe": float(validation_callback.best_validation_sharpe),
+        "best_validation_selection_score": float(validation_callback.best_validation_score),
         "validation_summary": validation_callback.latest_summary,
     }
     current_settings.training_summary_path.write_text(
