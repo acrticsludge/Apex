@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 from pathlib import Path
 
 from trading_agent.agent.evaluate import run_evaluation
@@ -78,7 +79,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     """CLI wrapper for common Colab training flows."""
     parser = argparse.ArgumentParser(description="Colab launcher for the RL trading agent")
     parser.add_argument("--tickers", nargs="*", help="Optional ticker override.")
-    parser.add_argument("--timesteps", type=int, default=500_000, help="Total PPO timesteps.")
+    parser.add_argument("--timesteps", type=int, default=int(os.getenv("RL_TOTAL_TIMESTEPS", "500000")), help="Total PPO timesteps.")
     parser.add_argument("--refresh-sentiment", action="store_true", help="Refresh Finnhub sentiment cache.")
     parser.add_argument("--resume", action="store_true", help="Resume from the latest saved checkpoint.")
     parser.add_argument("--skip-evaluate", action="store_true", help="Train only and skip test evaluation.")

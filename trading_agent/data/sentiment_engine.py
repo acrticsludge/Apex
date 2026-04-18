@@ -65,7 +65,8 @@ def _load_cached_sentiment(cache_path: Path) -> pd.Series:
 
 def _save_cached_sentiment(cache_path: Path, sentiment_series: pd.Series) -> None:
     """Persist the fetched sentiment series so future runs avoid re-downloading it."""
-    cache_frame = sentiment_series.rename("sentiment").reset_index(names="date")
+    cache_frame = sentiment_series.rename("sentiment").reset_index()
+    cache_frame.columns = ["date", "sentiment"]
     cache_frame.to_csv(cache_path, index=False)
 
 
