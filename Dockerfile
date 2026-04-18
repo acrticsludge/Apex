@@ -6,11 +6,12 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy source
-COPY apex_dashboard.py .
+# Copy full project
+COPY . .
 
-# Gunicorn: 1 worker (single-process so _state/_latest_prices stay in-memory),
-# threads for concurrent requests, port from Railway's $PORT env var.
+# Make trading_agent importable as a package
+RUN pip install --no-deps -e .
+
 ENV PORT=7000
 EXPOSE 7000
 

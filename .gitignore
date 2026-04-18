@@ -1,3 +1,5 @@
 # graphify outputs
 graphify-out/
 .graphify_*
+
+.env

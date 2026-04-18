@@ -16,6 +16,17 @@ Controls everything end-to-end:
 import threading
 import json
 import os
+
+# ── RL mode: agent drives all buy/sell decisions; user only sets capital ──────
+RL_MODE = os.getenv("RL_MODE", "true").lower() == "true"
+
+try:
+    from trading_agent.integration.rl_signal import get_rl_signal as _get_rl_signal
+    _RL_AVAILABLE = True
+except Exception as _rl_import_err:  # noqa: BLE001
+    _RL_AVAILABLE = False
+    _get_rl_signal = None  # type: ignore[assignment]
+
 import time
 import warnings
 import logging
@@ -40,8 +51,9 @@ except ImportError:
 # ─── CONFIG (mutable at runtime via /api/config) ─────────────────────────────
 
 cfg = {
-    "india_capital":        50_000,
-    "us_capital":            1_800,
+    "india_capital":        int(os.getenv("INDIA_CAPITAL", "50000")),
+    "us_capital":           int(os.getenv("US_CAPITAL", "1800")),
+    "rl_mode":              RL_MODE,
     "india_max_positions":       16,
     "us_max_positions":          16,
     "risk_per_trade":         0.02,   # % of session_start_cash risked per trade (ATR-normalised)
@@ -918,17 +930,31 @@ def execute_cover(symbol: str, price: float, reason: str, mstate: dict):
 # ─── MARKET CYCLE ─────────────────────────────────────────────────────────────
 
 def fetch_cycle_data(watchlist: list, prices: dict) -> tuple:
-    """Phase 1: fetch OHLCV data (slow, no lock needed).
-    Prices come from the shared price-updater snapshot — never fetched mid-strategy."""
+    """Phase 1: fetch signals (slow, no lock needed).
+    In RL mode uses PPO inference on daily bars; falls back to rule-based on failure."""
     analyses = []
     for symbol in watchlist:
+        live = prices.get(symbol)
+        if cfg.get("rl_mode") and _RL_AVAILABLE:
+            if live is None:
+                df = fetch_data(symbol)
+                live = float(df["close"].iloc[-1]) if df is not None else None
+            if live:
+                try:
+                    result = _get_rl_signal(symbol, live)
+                    if result is not None:
+                        analyses.append(result)
+                        time.sleep(0.1)
+                        continue
+                except Exception as exc:
+                    apex_log.warning("RL signal error for %s: %s — falling back", symbol, exc)
+        # Rule-based fallback
         df = fetch_data(symbol)
         if df is None:
             continue
-        live = prices.get(symbol) or float(df["close"].iloc[-1])
+        live = live or float(df["close"].iloc[-1])
         analyses.append(analyse(symbol, df, live))
         time.sleep(0.2)
-    # Return only the symbols relevant to this watchlist
     wl_prices = {s: prices[s] for s in watchlist if s in prices}
     return analyses, wl_prices
 
@@ -1213,7 +1239,7 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int):
 
         if (conf >= cfg["confidence_threshold"]
                 and a["score"] > 0
-                and index_ok                           # longs require healthy index
+                and (a.get("rl_action") is not None or index_ok)  # RL bypasses index gate
                 and open_pos < max_pos
                 and mstate["cash"] > a["price"] * 2):
             think_log("ENTRY",
@@ -1225,6 +1251,7 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int):
 
         # ── SHORT entry ──────────────────────────────────────────────────────
         elif (short_enabled
+                and a.get("rl_action") is None      # RL agent is long-only
                 and not in_open_window              # too volatile at open; skip shorts
                 and bearish_conf >= short_threshold
                 and a["score"] < 0
