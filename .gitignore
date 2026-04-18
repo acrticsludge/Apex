@@ -3,3 +3,4 @@ graphify-out/
 .graphify_*
 
 .env
+error.txt
