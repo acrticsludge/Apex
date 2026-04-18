@@ -4,6 +4,7 @@ WORKDIR /app
 
 # Install deps first (layer-cached)
 COPY requirements.txt .
+RUN pip install --no-cache-dir --pre pandas-ta==0.3.14b0
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy full project
