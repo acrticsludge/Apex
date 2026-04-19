@@ -40,8 +40,8 @@ except ImportError:
 # ─── CONFIG (mutable at runtime via /api/config) ─────────────────────────────
 
 cfg = {
-    "india_capital":        50_000,
-    "us_capital":            1_800,
+    "india_capital":        1_80_000,
+    "us_capital":            18_000,
     "india_max_positions":       16,
     "us_max_positions":          16,
     "risk_per_trade":         0.02,   # % of session_start_cash risked per trade (ATR-normalised)
