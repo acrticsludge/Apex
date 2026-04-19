@@ -1723,7 +1723,6 @@ def api_think():
     return jsonify(list(_think_buffer))
 
 @app.route("/api/rl/decisions")
-@login_required
 def api_rl_decisions():
     if not _sb:
         return jsonify([])
