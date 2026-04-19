@@ -57,8 +57,8 @@ except ImportError:
 # ─── CONFIG (mutable at runtime via /api/config) ─────────────────────────────
 
 cfg = {
-    "india_capital":        int(os.getenv("INDIA_CAPITAL", "50000")),
-    "us_capital":           int(os.getenv("US_CAPITAL", "1800")),
+    "india_capital":        int(os.getenv("INDIA_CAPITAL", "180000")),
+    "us_capital":           int(os.getenv("US_CAPITAL", "18000")),
     "rl_mode":              RL_MODE,
     "india_max_positions":       16,
     "us_max_positions":          16,
