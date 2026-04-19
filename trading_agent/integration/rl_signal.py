@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 
 import numpy as np
@@ -112,6 +113,21 @@ def _build_observation(ticker: str) -> np.ndarray | None:
         return None
 
 
+def _get_extreme_features(obs: np.ndarray, cols: list[str]) -> list[dict]:
+    """Return top-3 features furthest from neutral (0.5 in MinMax-scaled space)."""
+    deviations = [(abs(float(v) - 0.5), i) for i, v in enumerate(obs)]
+    deviations.sort(reverse=True)
+    result = []
+    for dev, idx in deviations[:3]:
+        val = float(obs[idx])
+        result.append({
+            "feature":   cols[idx] if idx < len(cols) else f"feat_{idx}",
+            "value":     round(val, 3),
+            "direction": "high" if val > 0.5 else "low",
+        })
+    return result
+
+
 def get_rl_signal(symbol: str, live_price: float) -> dict | None:
     """
     Return an analyse()-compatible dict driven by the PPO policy.
@@ -137,6 +153,11 @@ def get_rl_signal(symbol: str, live_price: float) -> dict | None:
 
         action = int(np.argmax(probs))
         top_prob = float(probs[action])
+
+        entropy  = -sum(float(p) * math.log(float(p) + 1e-9) for p in probs)
+        sorted_p = sorted(float(p) for p in probs)
+        margin   = sorted_p[-1] - sorted_p[-2]
+        extremes = _get_extreme_features(obs, _feature_columns)
 
         # Map to score/confidence values that route through apply_cycle correctly:
         #   action=1 (buy)  → high confidence + positive score  → long entry allowed
@@ -168,6 +189,9 @@ def get_rl_signal(symbol: str, live_price: float) -> dict | None:
             "news_count":      0,
             "rl_action":       action,
             "rl_probs":        probs.tolist(),
+            "rl_entropy":      round(entropy, 4),
+            "rl_margin":       round(margin, 4),
+            "rl_extremes":     extremes,
         }
 
     except Exception as exc:

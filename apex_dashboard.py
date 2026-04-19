@@ -647,6 +647,29 @@ def save_cfg():
     except Exception as e:
         apex_log.error(f"Config save error: {e}")
 
+def _save_rl_decision(symbol: str, market: str, sig: dict):
+    if not _sb:
+        return
+    try:
+        probs = sig.get("rl_probs", [0.0, 0.0, 0.0])
+        _sb.table("apex_rl_decisions").insert({
+            "symbol":    symbol,
+            "market":    market,
+            "action":    int(sig.get("rl_action", 0)),
+            "prob_hold": float(probs[0]),
+            "prob_buy":  float(probs[1]),
+            "prob_sell": float(probs[2]),
+            "confidence": float(sig.get("confidence", 0)),
+            "price":     float(sig.get("price", 0)),
+            "reasoning": {
+                "entropy":  sig.get("rl_entropy"),
+                "margin":   sig.get("rl_margin"),
+                "extremes": sig.get("rl_extremes", []),
+            },
+        }).execute()
+    except Exception as e:
+        apex_log.warning(f"RL decision log failed: {e}")
+
 # ─── SESSION MANAGEMENT ───────────────────────────────────────────────────────
 
 def _close_session(market_key: str, prices: dict):
@@ -929,7 +952,7 @@ def execute_cover(symbol: str, price: float, reason: str, mstate: dict):
 
 # ─── MARKET CYCLE ─────────────────────────────────────────────────────────────
 
-def fetch_cycle_data(watchlist: list, prices: dict) -> tuple:
+def fetch_cycle_data(watchlist: list, prices: dict, market_key: str = "india") -> tuple:
     """Phase 1: fetch signals (slow, no lock needed).
     In RL mode uses PPO inference on daily bars; falls back to rule-based on failure."""
     analyses = []
@@ -943,6 +966,18 @@ def fetch_cycle_data(watchlist: list, prices: dict) -> tuple:
                 try:
                     result = _get_rl_signal(symbol, live)
                     if result is not None:
+                        action_name = {1: "BUY", 2: "SELL", 0: "HOLD"}.get(result.get("rl_action", 0), "HOLD")
+                        probs       = result.get("rl_probs", [0, 0, 0])
+                        extremes    = result.get("rl_extremes", [])
+                        ext_str     = ", ".join(f"{e['feature']}={e['value']:.2f}" for e in extremes)
+                        think_log(
+                            "RL",
+                            f"{action_name} | H:{probs[0]:.0%} B:{probs[1]:.0%} S:{probs[2]:.0%} | "
+                            f"conf={result.get('confidence', 0):.0f}% margin={result.get('rl_margin', 0):.2f} | "
+                            f"extremes: {ext_str or 'none'}",
+                            symbol,
+                        )
+                        _save_rl_decision(symbol, market_key, result)
                         analyses.append(result)
                         time.sleep(0.1)
                         continue
@@ -1409,6 +1444,12 @@ def agent_loop():
         _state = load_state()
     _agent["status"] = "running"
     apex_log.info("Agent started — dual-market cycle active")
+    if RL_MODE and _RL_AVAILABLE:
+        apex_log.info("RL agent ACTIVE — model loaded, inference enabled")
+        think_log("RL", "RL agent online. Model loaded successfully.", "SYSTEM")
+    elif RL_MODE and not _RL_AVAILABLE:
+        apex_log.warning("RL_MODE=true but model failed to load — falling back to rule-based")
+        think_log("RL", "WARNING: RL model not found. Falling back to rule-based signals.", "SYSTEM")
 
     # Track previous open state to detect market-close transitions
     _prev_india_open = False
@@ -1429,6 +1470,9 @@ def agent_loop():
             f"Cycle  India={'OPEN' if india_open else 'closed'}  "
             f"US={'OPEN' if us_open else 'closed'}"
         )
+        if RL_MODE and _RL_AVAILABLE:
+            watchlist_len = (len(INDIA_WATCHLIST) if india_open else 0) + (len(US_WATCHLIST) if us_open else 0)
+            think_log("RL", f"Cycle start — scanning {watchlist_len} symbols in RL mode", "SYSTEM")
 
         india_analyses, india_prices = [], {}
         us_analyses,    us_prices    = [], {}
@@ -1461,7 +1505,7 @@ def agent_loop():
         if india_open:
             _agent["status"] = "Scanning India"
             apex_log.info("Scanning India watchlist…")
-            india_analyses, india_prices = fetch_cycle_data(INDIA_WATCHLIST, prices_snapshot)
+            india_analyses, india_prices = fetch_cycle_data(INDIA_WATCHLIST, prices_snapshot, "india")
             apex_log.info(
                 f"India scan done: {len(india_analyses)}/{len(INDIA_WATCHLIST)} symbols  "
                 f"prices={len(india_prices)}"
@@ -1476,7 +1520,7 @@ def agent_loop():
         if us_open:
             _agent["status"] = "Scanning US"
             apex_log.info("Scanning US watchlist…")
-            us_analyses, us_prices = fetch_cycle_data(US_WATCHLIST, prices_snapshot)
+            us_analyses, us_prices = fetch_cycle_data(US_WATCHLIST, prices_snapshot, "us")
             apex_log.info(
                 f"US scan done: {len(us_analyses)}/{len(US_WATCHLIST)} symbols  "
                 f"prices={len(us_prices)}"
@@ -1677,6 +1721,17 @@ def api_logs():
 @app.route("/api/think")
 def api_think():
     return jsonify(list(_think_buffer))
+
+@app.route("/api/rl/decisions")
+@login_required
+def api_rl_decisions():
+    if not _sb:
+        return jsonify([])
+    try:
+        resp = _sb.table("apex_rl_decisions").select("*").order("ts", desc=True).limit(100).execute()
+        return jsonify(resp.data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/api/reset/<market>", methods=["POST"])
 def reset_market(market):
@@ -1929,6 +1984,7 @@ tr:hover td{background:#1c2330}
 .dcat-EXIT  {background:#2a0a0a;color:#e05454}
 .dcat-RISK  {background:#3a0000;color:#ff4444;font-weight:900}
 .dcat-INDEX {background:#1a0a30;color:#b47fff}
+.dcat-RL    {background:#1a0040;color:#c060ff;font-weight:900}
 .dsym{color:#bbb;min-width:88px;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .dmsg{color:#ddd;flex:1;white-space:pre-wrap;word-break:break-word}
 /* Position side badges */
@@ -2156,6 +2212,7 @@ input:focus{outline:none;border-color:var(--blue)}
     <div class="tab"     onclick="tab('sessions',this)">Sessions <span id="sess-tab-cnt" style="font-size:9px;color:var(--muted)"></span></div>
     <div class="tab"     onclick="tab('settings',this)">Settings</div>
     <div class="tab"     onclick="tab('logs',this)">All Logs</div>
+    <div class="tab"     onclick="tab('agent',this)" style="color:#c060ff">Agent Terminal</div>
   </div>
 
   <!-- India pane -->
@@ -2308,6 +2365,7 @@ input:focus{outline:none;border-color:var(--blue)}
       <button class="btn btn-muted btn-sm log-filter-btn"   id="df-RISK"   onclick="setDlogFilter('RISK',this)">RISK</button>
       <button class="btn btn-muted btn-sm log-filter-btn"   id="df-INDEX"  onclick="setDlogFilter('INDEX',this)">INDEX</button>
       <button class="btn btn-muted btn-sm log-filter-btn"   id="df-CYCLE"  onclick="setDlogFilter('CYCLE',this)">CYCLE</button>
+      <button class="btn btn-muted btn-sm log-filter-btn"   id="df-RL"     onclick="setDlogFilter('RL',this)" style="color:#c060ff">RL</button>
       <label style="display:flex;align-items:center;gap:5px;font-size:10px;color:var(--muted);
                     margin-left:8px;text-transform:none;letter-spacing:0;cursor:pointer">
         <input type="checkbox" id="dlog-autoscroll" checked> Auto-scroll
@@ -2342,6 +2400,27 @@ input:focus{outline:none;border-color:var(--blue)}
     <div class="sec" style="margin-top:18px"><span class="sec-title">All Trade Activity</span></div>
     <div class="log-box" style="max-height:320px" id="all-log">
       <div class="log-row"><span class="lt">—</span><span class="muted">No trades yet</span></div>
+    </div>
+  </div>
+
+  <!-- Agent Terminal pane -->
+  <div class="pane" id="pane-agent">
+    <div class="sec">
+      <span class="sec-title">RL Agent Terminal</span>
+      <span id="rl-status-badge" style="padding:2px 10px;border-radius:10px;font-size:11px;font-weight:700;background:#1a0040;color:#666">● CHECKING</span>
+      <span style="margin-left:auto;font-size:10px;color:var(--muted)">live PPO reasoning — updates every 4s</span>
+    </div>
+    <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap">
+      <button class="btn btn-muted btn-sm" onclick="clearAgentTerminal()">Clear</button>
+      <label style="display:flex;align-items:center;gap:5px;font-size:10px;color:var(--muted);text-transform:none;letter-spacing:0;cursor:pointer">
+        <input type="checkbox" id="agent-autoscroll" checked> Auto-scroll
+      </label>
+      <span id="agent-live-dot" style="font-size:9px;color:var(--muted)">● live</span>
+    </div>
+    <div id="agent-terminal" style="background:#0a0c10;border:1px solid #30363d;border-radius:6px;
+         padding:14px;height:500px;overflow-y:auto;font-family:'Courier New',monospace;
+         font-size:12px;color:#c9d1d9;line-height:1.6">
+      <span style="color:#484f58">—</span> <span style="color:#666">Agent not yet started or no RL decisions recorded</span>
     </div>
   </div>
 
@@ -2385,6 +2464,7 @@ let _cfg = {};   // latest config snapshot — set in doRefresh
 let _activeTab = "india";
 let _logPollTimer = null;
 let _sessPollTimer = null;
+let _agentPollTimer = null;
 let _logFilter = "ALL";
 let _autoScroll = true;
 let _lastLogEntries = null;
@@ -2445,6 +2525,7 @@ function tab(name, el) {
   document.getElementById("pane-"+name).classList.add("on");
   clearInterval(_logPollTimer);
   clearInterval(_sessPollTimer);
+  clearInterval(_agentPollTimer);
   if (name === "logs") {
     _logPollTimer = setInterval(pollLogs, 5000);
     setInterval(pollDecisions, 4000);
@@ -2453,6 +2534,9 @@ function tab(name, el) {
   } else if (name === "sessions") {
     _sessPollTimer = setInterval(pollSessions, 15000);
     pollSessions();
+  } else if (name === "agent") {
+    _agentPollTimer = setInterval(pollAgentTerminal, 4000);
+    pollAgentTerminal();
   }
 }
 
@@ -2486,6 +2570,56 @@ async function pollDecisions() {
     const dot = document.getElementById("dlog-live-dot");
     if (dot) { dot.style.color = "var(--green)"; setTimeout(()=>{ dot.style.color="var(--muted)"; }, 800); }
   } catch(e) {}
+}
+
+// ── Agent Terminal ────────────────────────────────────────────────────────
+const _RL_COLORS = {BUY:'#3fb950', SELL:'#f85149', HOLD:'#8b949e', WARNING:'#f0883e', online:'#3fb950', Cycle:'#58a6ff'};
+
+function renderAgentTerminal(entries) {
+  const el = document.getElementById('agent-terminal');
+  if (!el) return;
+  const badge = document.getElementById('rl-status-badge');
+  if (!entries || !entries.length) {
+    el.innerHTML = '<span style="color:#484f58">—</span> <span style="color:#666">No RL decisions yet — start the agent</span>';
+    if (badge) { badge.textContent = '● INACTIVE'; badge.style.color = '#f85149'; }
+    return;
+  }
+  const isActive = entries.some(e => Date.now() - new Date(e.ts).getTime() < 600000);
+  if (badge) {
+    badge.textContent = isActive ? '● ACTIVE' : '● INACTIVE';
+    badge.style.color  = isActive ? '#3fb950' : '#f85149';
+    badge.style.background = isActive ? '#0a2016' : '#2a0a0a';
+  }
+  el.innerHTML = entries.map(e => {
+    const colorKey = Object.keys(_RL_COLORS).find(k => e.msg && e.msg.includes(k));
+    const c = colorKey ? _RL_COLORS[colorKey] : '#58a6ff';
+    const ts = (e.ts || '').slice(11, 19);
+    const sym = (e.sym && e.sym !== 'SYSTEM') ? `<span style="color:#58a6ff;margin-right:6px">${e.sym}</span>` : '';
+    return `<div style="margin-bottom:3px;border-bottom:1px solid #161b22;padding-bottom:3px">` +
+      `<span style="color:#484f58">${ts}</span>` +
+      `<span style="color:#8b949e;margin:0 6px;font-size:10px">[RL]</span>` +
+      sym +
+      `<span style="color:${c}">${e.msg || ''}</span></div>`;
+  }).join('');
+  const auto = document.getElementById('agent-autoscroll');
+  if (auto?.checked) el.scrollTop = el.scrollHeight;
+}
+
+async function pollAgentTerminal() {
+  try {
+    const r = await fetch('/api/think');
+    if (!r.ok) return;
+    const entries = await r.json();
+    const rl = entries.filter(e => e.cat === 'RL');
+    renderAgentTerminal(rl);
+    const dot = document.getElementById('agent-live-dot');
+    if (dot) { dot.style.color='var(--green)'; setTimeout(()=>{ dot.style.color='var(--muted)'; }, 800); }
+  } catch(e) {}
+}
+
+function clearAgentTerminal() {
+  const el = document.getElementById('agent-terminal');
+  if (el) el.innerHTML = '<span style="color:#484f58">—</span> <span style="color:#666">Cleared — waiting for next cycle</span>';
 }
 
 function setDlogFilter(cat, el) {
