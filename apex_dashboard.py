@@ -20,6 +20,12 @@ import os
 # ── RL mode: agent drives all buy/sell decisions; user only sets capital ──────
 RL_MODE = os.getenv("RL_MODE", "true").lower() == "true"
 
+# ── Deployment namespace — set APEX_ENV per Railway deployment so each has
+#    its own Supabase rows and never stomps the other deployment's state. ──────
+_APEX_ENV      = os.getenv("APEX_ENV", "main")
+_STATE_ID      = f"{_APEX_ENV}-singleton"
+_CONFIG_ID     = f"{_APEX_ENV}-config"
+
 try:
     from trading_agent.integration.rl_signal import get_rl_signal as _get_rl_signal
     _RL_AVAILABLE = True
@@ -570,7 +576,7 @@ def _normalize_state(st: dict) -> dict:
 def load_state() -> dict:
     if _sb:
         try:
-            resp = _sb.table("apex_state").select("data").eq("id", "singleton").execute()
+            resp = _sb.table("apex_state").select("data").eq("id", _STATE_ID).execute()
             if resp.data:
                 apex_log.info("State loaded from Supabase")
                 return _normalize_state(resp.data[0]["data"])
@@ -597,7 +603,7 @@ def save_state(st: dict):
     if _sb:
         try:
             _sb.table("apex_state").upsert({
-                "id":         "singleton",
+                "id":         _STATE_ID,
                 "data":       json.loads(json.dumps(st, default=str)),
                 "updated_at": datetime.now().isoformat(),
             }).execute()
@@ -624,7 +630,7 @@ def load_cfg():
     if not _sb:
         return
     try:
-        resp = _sb.table("apex_state").select("data").eq("id", "config").execute()
+        resp = _sb.table("apex_state").select("data").eq("id", _CONFIG_ID).execute()
         if resp.data:
             saved = resp.data[0]["data"]
             for k in _CFG_PERSIST_KEYS:
@@ -640,7 +646,7 @@ def save_cfg():
         return
     try:
         _sb.table("apex_state").upsert({
-            "id":         "config",
+            "id":         _CONFIG_ID,
             "data":       {k: cfg[k] for k in _CFG_PERSIST_KEYS},
             "updated_at": datetime.now().isoformat(),
         }).execute()
@@ -1663,6 +1669,8 @@ def agent_start():
 def agent_stop():
     apex_log.info("Agent stop requested via dashboard")
     _agent["running"] = False
+    _agent["status"]  = "stopped"
+    think_log("RL", "Agent stopped by user.", "SYSTEM")
     return jsonify({"ok": True, "msg": "Stopping agent after current cycle"})
 
 @app.route("/api/agent/pause", methods=["POST"])
@@ -1721,6 +1729,11 @@ def api_logs():
 @app.route("/api/think")
 def api_think():
     return jsonify(list(_think_buffer))
+
+@app.route("/api/think/clear", methods=["POST"])
+def api_think_clear():
+    _think_buffer.clear()
+    return jsonify({"ok": True})
 
 @app.route("/api/rl/decisions")
 def api_rl_decisions():
@@ -2617,8 +2630,12 @@ async function pollAgentTerminal() {
 }
 
 function clearAgentTerminal() {
+  fetch('/api/think/clear', {method:'POST'}).catch(()=>{});
   const el = document.getElementById('agent-terminal');
   if (el) el.innerHTML = '<span style="color:#484f58">—</span> <span style="color:#666">Cleared — waiting for next cycle</span>';
+  _lastDlogEntries = [];
+  const dbox = document.getElementById("dlog-box");
+  if (dbox) renderDlog([]);
 }
 
 function setDlogFilter(cat, el) {
