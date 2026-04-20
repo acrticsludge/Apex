@@ -2,9 +2,6 @@ __pycache__/
 *.pyc
 .env
 data/cache/
-agent/model/*.zip
-agent/model/*.joblib
-agent/model/*.json
 agent/model/*.png
 agent/model/tensorboard/
 agent/model/checkpoints/
