@@ -608,6 +608,15 @@ def _normalize_state(st: dict) -> dict:
             st[mkt]["session_start_cash"] = float(cap)
         st[mkt].setdefault("trading_halted", False)
         st[mkt].setdefault("cooldown_until", {})
+        # ── Carry-over: if cash was reset to env-var capital, restore from last session ──
+        env_cap = float(cfg["india_capital"] if mkt == "india" else cfg["us_capital"])
+        if abs(st[mkt].get("cash", env_cap) - env_cap) < 0.01 and not st[mkt].get("positions"):
+            mkt_sessions = [s for s in st.get("sessions", []) if s.get("market") == mkt]
+            if mkt_sessions:
+                last_end = sorted(mkt_sessions, key=lambda s: s.get("date", ""))[-1].get("end_cash")
+                if last_end and float(last_end) > 0 and abs(float(last_end) - env_cap) > 0.01:
+                    st[mkt]["cash"] = float(last_end)
+                    st[mkt]["session_start_cash"] = float(last_end)
         # ── Migrate positions to short-selling schema ─────────────────────────
         for pos in st[mkt].get("positions", {}).values():
             pos.setdefault("side", "long")           # all pre-existing positions are longs
