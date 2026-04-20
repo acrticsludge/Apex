@@ -95,6 +95,7 @@ cfg = {
     "short_selling_enabled":       True,
     "short_confidence_threshold":    75,  # bearish confidence needed to short (0–100)
     "index_max_pct_for_short":      0.5,  # block shorts if index UP more than +0.5%
+    "settings_enabled":            True,  # False = full liberty: bypass threshold/ADX/index/cap filters
 }
 
 INDIA_WATCHLIST = [
@@ -548,29 +549,6 @@ def _normalize_state(st: dict) -> dict:
             if pos.get("side") == "short":
                 pos.setdefault("running_low", pos.get("entry", 0))
 
-    # ── Carry-over migration ──────────────────────────────────────────────────
-    # If a session was archived by the old code (which always reset to the config
-    # default capital), detect it and apply the correct end_cash from history.
-    for mkt, cap_key in [("india", "india_capital"), ("us", "us_capital")]:
-        if mkt not in st:
-            continue
-        default_cap = cfg[cap_key]
-        current_cash = st[mkt].get("cash", default_cap)
-        start_cash   = st[mkt].get("session_start_cash", default_cap)
-        if abs(current_cash - default_cap) < 0.01 and abs(start_cash - default_cap) < 0.01:
-            mkt_sessions = [s for s in st.get("sessions", []) if s.get("market") == mkt]
-            if mkt_sessions:
-                last = max(mkt_sessions, key=lambda s: s.get("archived_at", ""))
-                last_end = last.get("end_cash")
-                if last_end and abs(last_end - default_cap) > 0.01:
-                    st[mkt]["cash"]               = round(last_end, 2)
-                    st[mkt]["session_start_cash"] = round(last_end, 2)
-                    st[mkt]["peak_portfolio"]     = round(last_end, 2)
-                    apex_log.info(
-                        f"[MIGRATE] {mkt.upper()} carry-over applied: "
-                        f"{default_cap} → {last_end} (from session {last.get('id')})"
-                    )
-
     return st
 
 def load_state() -> dict:
@@ -617,12 +595,16 @@ def save_state(st: dict):
     except Exception as e:
         apex_log.error(f"JSON save error: {e}")
 
+def _settings_active() -> bool:
+    return cfg.get("settings_enabled", True)
+
 # ── Keys the user can change via the Settings panel ───────────────────────────
 _CFG_PERSIST_KEYS = (
     "risk_per_trade", "confidence_threshold", "stop_loss_pct", "target_pct",
     "check_interval_min", "idle_interval_min",
     "india_max_positions", "us_max_positions",
     "eod_harvest_min", "eod_exit_min",
+    "settings_enabled",
 )
 
 def load_cfg():
@@ -734,12 +716,11 @@ def _close_session(market_key: str, prices: dict):
         f"{record['wins']}W/{record['losses']}L  WR={wr}  {n_trades} trades"
     )
 
-    # Reset for next session — carry over the final cash balance so capital compounds
-    carry_cash = round(mstate["cash"], 2)
-    _state[market_key] = _empty_mstate(carry_cash, today)
+    # Reset for next session — always start fresh with env-var capital (cash is constant)
+    cap = cfg["india_capital"] if market_key == "india" else cfg["us_capital"]
+    _state[market_key] = _empty_mstate(float(cap), today)
     apex_log.info(
-        f"[SESSION] {market_key.upper()} reset — "
-        f"carry-over capital={sym}{carry_cash:.2f}  ({today})"
+        f"[SESSION] {market_key.upper()} reset — capital={sym}{cap:.0f}  ({today})"
     )
 
 
@@ -795,8 +776,9 @@ def execute_buy(symbol: str, price: float, mstate: dict, atr: float = None):
         sl_cap   = price * cfg["stop_loss_pct"] * 2.0
         tp_floor = price * cfg["target_pct"]    * 0.5
         tp_cap   = price * cfg["target_pct"]    * 2.0
-        sl_dist  = max(sl_floor, min(sl_cap, sl_dist))
-        tp_dist  = max(tp_floor, min(tp_cap, tp_dist))
+        if cfg.get("settings_enabled", True):
+            sl_dist = max(sl_floor, min(sl_cap, sl_dist))
+            tp_dist = max(tp_floor, min(tp_cap, tp_dist))
         # Risk-adjusted qty: how many shares until 1 SL hit = risk_dollars
         qty = max(1, int(risk_dollars / sl_dist)) if sl_dist > 0 else 1
     else:
@@ -856,8 +838,9 @@ def execute_short(symbol: str, price: float, mstate: dict, atr: float = None):
         sl_cap   = price * cfg["stop_loss_pct"] * 2.0
         tp_floor = price * cfg["target_pct"]    * 0.5
         tp_cap   = price * cfg["target_pct"]    * 2.0
-        sl_dist  = max(sl_floor, min(sl_cap, sl_dist))
-        tp_dist  = max(tp_floor, min(tp_cap, tp_dist))
+        if cfg.get("settings_enabled", True):
+            sl_dist = max(sl_floor, min(sl_cap, sl_dist))
+            tp_dist = max(tp_floor, min(tp_cap, tp_dist))
         qty = max(1, int(risk_dollars / sl_dist)) if sl_dist > 0 else 1
     else:
         sl_dist = price * cfg["stop_loss_pct"]
@@ -963,6 +946,8 @@ def fetch_cycle_data(watchlist: list, prices: dict, market_key: str = "india") -
     In RL mode uses PPO inference on daily bars; falls back to rule-based on failure."""
     analyses = []
     for symbol in watchlist:
+        if not _agent["running"]:
+            break
         live = prices.get(symbol)
         if cfg.get("rl_mode") and _RL_AVAILABLE:
             if live is None:
@@ -1006,6 +991,9 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int):
     harvest_min  = cfg["eod_harvest_min"]
     exit_min     = cfg["eod_exit_min"]
     _dc          = {"buy": 0, "sell": 0, "hold": 0, "watch": 0}
+    _strict      = _settings_active()
+    conf_thr     = cfg["confidence_threshold"] if _strict else 50
+    max_pos_eff  = max_pos if _strict else 999
     apex_log.info(
         f"[{market_key.upper()}] think loop ▶  "
         f"{len(analyses)} symbols scanned  "
@@ -1167,7 +1155,7 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int):
 
     # ── 7. Index trend gate ───────────────────────────────────────────────────
     index_pct = _index_trend.get(market_key, 0.0)
-    index_ok  = index_pct >= cfg.get("index_min_pct", -0.5)
+    index_ok  = (not _strict) or (index_pct >= cfg.get("index_min_pct", -0.5))
     if not index_ok:
         apex_log.info(
             f"[{market_key.upper()}] Index filter: {index_pct:+.2f}% — "
@@ -1250,7 +1238,7 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int):
         #  so a bearish signal can still go to the short entry branch on a down-index day)
 
         # ADX trend gate — applies to both longs and shorts
-        if adx_val < cfg.get("adx_min", 20):
+        if _strict and adx_val < cfg.get("adx_min", 20):
             think_log("FILTER",
                       f"{sym} SKIP ADX: {adx_val:.1f} < {cfg.get('adx_min', 20)}  "
                       f"(market not trending, signals unreliable)", sym)
@@ -1275,13 +1263,13 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int):
         # ── LONG entry ───────────────────────────────────────────────────────
         short_enabled    = cfg.get("short_selling_enabled", False)
         bearish_conf     = 100 - conf
-        short_threshold  = cfg.get("short_confidence_threshold", 75)
+        short_threshold  = cfg.get("short_confidence_threshold", 75) if _strict else 60
         index_max_short  = cfg.get("index_max_pct_for_short", 0.5)
 
-        if (conf >= cfg["confidence_threshold"]
+        if (conf >= conf_thr
                 and a["score"] > 0
                 and (a.get("rl_action") is not None or index_ok)  # RL bypasses index gate
-                and open_pos < max_pos
+                and open_pos < max_pos_eff
                 and mstate["cash"] > a["price"] * 2):
             think_log("ENTRY",
                       f"{sym} ENTRY: conf={conf:.0f}%  score={a['score']:+d}  "
@@ -1297,7 +1285,7 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int):
                 and bearish_conf >= short_threshold
                 and a["score"] < 0
                 and index_pct <= index_max_short    # block shorts on strongly bullish days
-                and open_pos < max_pos
+                and open_pos < max_pos_eff
                 and mstate["cash"] > a["price"] * 2):
             think_log("ENTRY",
                       f"{sym} SHORT ENTRY: bearish_conf={bearish_conf:.0f}%  score={a['score']:+d}  "
@@ -1308,9 +1296,9 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int):
 
         else:
             # Diagnose which condition failed
-            if open_pos >= max_pos:
+            if open_pos >= max_pos_eff:
                 think_log("FILTER",
-                          f"{sym} SKIP: max positions ({max_pos}) already open", sym)
+                          f"{sym} SKIP: max positions ({max_pos_eff}) already open", sym)
             elif mstate["cash"] <= a["price"] * 2:
                 think_log("FILTER",
                           f"{sym} SKIP: insufficient cash  "
@@ -1509,6 +1497,8 @@ def agent_loop():
         _refresh_index_trend()
 
         if india_open:
+            if not _agent["running"]:
+                break
             _agent["status"] = "Scanning India"
             apex_log.info("Scanning India watchlist…")
             india_analyses, india_prices = fetch_cycle_data(INDIA_WATCHLIST, prices_snapshot, "india")
@@ -1524,6 +1514,8 @@ def agent_loop():
             apex_log.debug("India market closed — skipping")
 
         if us_open:
+            if not _agent["running"]:
+                break
             _agent["status"] = "Scanning US"
             apex_log.info("Scanning US watchlist…")
             us_analyses, us_prices = fetch_cycle_data(US_WATCHLIST, prices_snapshot, "us")
@@ -1544,7 +1536,8 @@ def agent_loop():
 
         _agent["last_update"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         sleep_min = cfg["check_interval_min"] if (india_open or us_open) else cfg["idle_interval_min"]
-        _agent["status"] = "waiting"
+        if _agent["running"]:
+            _agent["status"] = "waiting"
         next_t = (datetime.now(timezone.utc) + timedelta(minutes=sleep_min)).isoformat(timespec="seconds")
         _agent["next_check"] = next_t
         apex_log.info(f"Waiting {sleep_min} min — next check at {next_t}")
@@ -1669,6 +1662,7 @@ def agent_start():
 def agent_stop():
     apex_log.info("Agent stop requested via dashboard")
     _agent["running"] = False
+    _agent["paused"]  = False
     _agent["status"]  = "stopped"
     think_log("RL", "Agent stopped by user.", "SYSTEM")
     return jsonify({"ok": True, "msg": "Stopping agent after current cycle"})
@@ -1718,6 +1712,9 @@ def update_config():
         if k in data:
             cfg[k] = int(data[k]) if k in int_keys else float(data[k])
             changed.append(k)
+    if "settings_enabled" in data:
+        cfg["settings_enabled"] = bool(data["settings_enabled"])
+        changed.append("settings_enabled")
     save_cfg()
     apex_log.info(f"Config updated: {', '.join(changed)}")
     return jsonify({"ok": True, "config": cfg})
@@ -2306,18 +2303,25 @@ input:focus{outline:none;border-color:var(--blue)}
   <!-- Settings pane -->
   <div class="pane" id="pane-settings">
     <div style="max-width:580px">
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;padding:12px 14px;background:#161b22;border:1px solid #30363d;border-radius:6px">
+        <input type="checkbox" id="settings-toggle" onchange="toggleSettings(this)" checked
+               style="width:18px;height:18px;cursor:pointer;accent-color:#3fb950">
+        <span style="font-weight:600;font-size:13px">Settings Constraints</span>
+        <span id="settings-toggle-label" style="color:#3fb950;font-size:11px;margin-left:4px">● ACTIVE</span>
+        <span style="color:#484f58;font-size:11px;margin-left:auto">Unchecked = full liberty (no filters)</span>
+      </div>
       <div class="sec"><span class="sec-title">Risk Parameters</span></div>
       <div class="fgrid">
-        <div class="fg"><label>Risk per Trade (0.01–1.0)</label><input type="number" id="s-risk" step="0.01" min="0.01" max="1"></div>
-        <div class="fg"><label>Confidence Threshold (%)</label><input type="number" id="s-conf" step="1"    min="50"   max="95"></div>
-        <div class="fg"><label>Stop Loss (0.005–0.2)</label>   <input type="number" id="s-sl"   step="0.005" min="0.005" max="0.2"></div>
-        <div class="fg"><label>Target (0.01–0.5)</label>       <input type="number" id="s-tgt"  step="0.005" min="0.01"  max="0.5"></div>
-        <div class="fg"><label>Check Interval (min)</label>    <input type="number" id="s-chk"  step="1"    min="1"    max="60"></div>
-        <div class="fg"><label>Idle Interval (min)</label>     <input type="number" id="s-idle" step="1"    min="5"    max="120"></div>
-        <div class="fg"><label>India Max Positions</label>     <input type="number" id="s-ip"   step="1"    min="1"    max="16"></div>
-        <div class="fg"><label>US Max Positions</label>        <input type="number" id="s-up"   step="1"    min="1"    max="16"></div>
-        <div class="fg"><label>EOD Profit Harvest (min before close)</label><input type="number" id="s-eod-h" step="1" min="10" max="60"></div>
-        <div class="fg"><label>EOD Force Exit (min before close)</label>    <input type="number" id="s-eod-e" step="1" min="3"  max="30"></div>
+        <div class="fg"><label>Risk per Trade (0.01–1.0)</label><input class="settings-input" type="number" id="s-risk" step="0.01" min="0.01" max="1"></div>
+        <div class="fg"><label>Confidence Threshold (%)</label><input class="settings-input" type="number" id="s-conf" step="1"    min="50"   max="95"></div>
+        <div class="fg"><label>Stop Loss (0.005–0.2)</label>   <input class="settings-input" type="number" id="s-sl"   step="0.005" min="0.005" max="0.2"></div>
+        <div class="fg"><label>Target (0.01–0.5)</label>       <input class="settings-input" type="number" id="s-tgt"  step="0.005" min="0.01"  max="0.5"></div>
+        <div class="fg"><label>Check Interval (min)</label>    <input class="settings-input" type="number" id="s-chk"  step="1"    min="1"    max="60"></div>
+        <div class="fg"><label>Idle Interval (min)</label>     <input class="settings-input" type="number" id="s-idle" step="1"    min="5"    max="120"></div>
+        <div class="fg"><label>India Max Positions</label>     <input class="settings-input" type="number" id="s-ip"   step="1"    min="1"    max="16"></div>
+        <div class="fg"><label>US Max Positions</label>        <input class="settings-input" type="number" id="s-up"   step="1"    min="1"    max="16"></div>
+        <div class="fg"><label>EOD Profit Harvest (min before close)</label><input class="settings-input" type="number" id="s-eod-h" step="1" min="10" max="60"></div>
+        <div class="fg"><label>EOD Force Exit (min before close)</label>    <input class="settings-input" type="number" id="s-eod-e" step="1" min="3"  max="30"></div>
       </div>
       <div style="margin-top:14px;display:flex;gap:10px">
         <button class="btn btn-blue" onclick="saveConfig()">Save Settings</button>
@@ -2988,6 +2992,19 @@ function renderAgent(a) {
 }
 
 // ── Load config into form ─────────────────────────────────────────────────
+function toggleSettings(el) {
+  const on = el.checked;
+  const lbl = document.getElementById('settings-toggle-label');
+  lbl.textContent = on ? '● ACTIVE' : '○ FULL LIBERTY';
+  lbl.style.color = on ? '#3fb950' : '#484f58';
+  document.querySelectorAll('.settings-input').forEach(inp => inp.disabled = !on);
+  fetch('/api/config', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({settings_enabled: on})
+  });
+}
+
 function loadCfg(c) {
   document.getElementById("s-risk").value  = c.risk_per_trade;
   document.getElementById("s-conf").value  = c.confidence_threshold;
@@ -2999,6 +3016,15 @@ function loadCfg(c) {
   document.getElementById("s-up").value    = c.us_max_positions;
   document.getElementById("s-eod-h").value = c.eod_harvest_min;
   document.getElementById("s-eod-e").value = c.eod_exit_min;
+  // Sync settings toggle state
+  const stToggle = document.getElementById('settings-toggle');
+  if (stToggle && c.settings_enabled !== undefined) {
+    const on = !!c.settings_enabled;
+    stToggle.checked = on;
+    const lbl = document.getElementById('settings-toggle-label');
+    if (lbl) { lbl.textContent = on ? '● ACTIVE' : '○ FULL LIBERTY'; lbl.style.color = on ? '#3fb950' : '#484f58'; }
+    document.querySelectorAll('.settings-input').forEach(inp => inp.disabled = !on);
+  }
 }
 
 // ── Load editable state into form ─────────────────────────────────────────
