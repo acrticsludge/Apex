@@ -38,7 +38,7 @@ import warnings
 import logging
 from collections import deque
 from datetime import datetime, timezone, timedelta
-from flask import Flask, jsonify, request, render_template_string, session, redirect
+from flask import Flask, jsonify, request, render_template_string, session, redirect, Response, stream_with_context
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -242,6 +242,10 @@ _nse_session      = None
 _nse_session_ts   = 0.0
 _NSE_SESSION_TTL  = 300  # refresh cookies every 5 min
 
+# SSE subscribers — each is a Queue that gets fresh price dicts pushed into it
+_price_subscribers: list = []
+_price_sub_lock = threading.Lock()
+
 def _get_nse_session():
     """Return a curl_cffi session with fresh NSE cookies."""
     global _nse_session, _nse_session_ts
@@ -261,55 +265,72 @@ def _get_nse_session():
             _nse_session = None
     return _nse_session
 
-def _fetch_nse_price(nse_sym: str) -> float | None:
-    """Fetch live price from NSE for a bare symbol (no .NS suffix)."""
+def _fetch_nse_price(sym: str) -> tuple[str, float | None]:
+    """Fetch live NSE price; returns (yf_symbol, price_or_None)."""
+    nse_sym = sym.replace(".NS", "").replace(".BO", "")
     s = _get_nse_session()
-    if s is None:
-        return None
+    if s is not None:
+        try:
+            r = s.get(
+                f"https://www.nseindia.com/api/quote-equity?symbol={nse_sym}",
+                timeout=8,
+            )
+            if r.status_code == 200 and r.text:
+                p = r.json().get("priceInfo", {}).get("lastPrice")
+                if p:
+                    return sym, float(p)
+        except Exception:
+            global _nse_session
+            _nse_session = None
+    # fallback
     try:
-        r = s.get(
-            f"https://www.nseindia.com/api/quote-equity?symbol={nse_sym}",
-            timeout=8,
-        )
-        if r.status_code == 200 and r.text:
-            p = r.json().get("priceInfo", {}).get("lastPrice")
-            return float(p) if p else None
+        fb = yf.Ticker(sym).fast_info.last_price
+        if fb and fb > 0:
+            return sym, float(fb)
     except Exception:
-        _nse_session = None  # force re-init on next call
-    return None
+        pass
+    return sym, None
+
+def _fetch_us_price(sym: str) -> tuple[str, float | None]:
+    try:
+        p = yf.Ticker(sym).fast_info.last_price
+        if p and p > 0:
+            return sym, float(p)
+    except Exception:
+        pass
+    return sym, None
 
 def _price_updater():
-    """Polls prices every 15 s — NSE (curl_cffi) for Indian stocks, fast_info for US."""
+    """Fetches all symbols in parallel every 5 s, pushes updates via SSE."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    pool = ThreadPoolExecutor(max_workers=12, thread_name_prefix="price")
     while True:
+        futures = (
+            [pool.submit(_fetch_nse_price, s) for s in INDIA_WATCHLIST] +
+            [pool.submit(_fetch_us_price,  s) for s in US_WATCHLIST]
+        )
         fresh = {}
-        # ── Indian stocks via NSE API ──────────────────────────────────────────
-        for sym in INDIA_WATCHLIST:
-            nse_sym = sym.replace(".NS", "").replace(".BO", "")
-            p = _fetch_nse_price(nse_sym)
-            if p and p > 0:
-                fresh[sym] = p
-            else:  # fallback to yfinance
-                try:
-                    fb = yf.Ticker(sym).fast_info.last_price
-                    if fb and fb > 0:
-                        fresh[sym] = float(fb)
-                except Exception:
-                    pass
-        # ── US stocks via yfinance fast_info ──────────────────────────────────
-        for sym in US_WATCHLIST:
-            try:
-                p = yf.Ticker(sym).fast_info.last_price
-                if p and p > 0:
-                    fresh[sym] = float(p)
-            except Exception:
-                pass
+        for f in as_completed(futures):
+            sym, price = f.result()
+            if price:
+                fresh[sym] = price
         if fresh:
             with _price_lock:
                 _latest_prices.update(fresh)
+            # push to SSE subscribers
+            with _price_sub_lock:
+                dead = []
+                for q in _price_subscribers:
+                    try:
+                        q.put_nowait(dict(fresh))
+                    except Exception:
+                        dead.append(q)
+                for q in dead:
+                    _price_subscribers.remove(q)
             apex_log.info(
                 f"[PRICE] tick — {len(fresh)}/{len(INDIA_WATCHLIST + US_WATCHLIST)} symbols refreshed"
             )
-        time.sleep(15)
+        time.sleep(5)
 
 # ─── INDEX TREND FILTER ───────────────────────────────────────────────────────
 
@@ -1768,6 +1789,40 @@ def update_config():
 def api_logs():
     return jsonify(list(_log_buffer))
 
+@app.route("/api/prices/stream")
+def api_prices_stream():
+    """SSE endpoint — pushes price updates to the browser as they arrive."""
+    from queue import Queue, Empty
+    q = Queue(maxsize=10)
+    with _price_sub_lock:
+        _price_subscribers.append(q)
+    # send current snapshot immediately so the page doesn't wait for first tick
+    with _price_lock:
+        snapshot = dict(_latest_prices)
+
+    def generate():
+        try:
+            if snapshot:
+                yield f"data: {json.dumps(snapshot)}\n\n"
+            while True:
+                try:
+                    prices = q.get(timeout=25)
+                    yield f"data: {json.dumps(prices)}\n\n"
+                except Empty:
+                    yield ": ping\n\n"  # keepalive so proxy doesn't close connection
+        finally:
+            with _price_sub_lock:
+                try:
+                    _price_subscribers.remove(q)
+                except ValueError:
+                    pass
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
 @app.route("/api/think")
 def api_think():
     return jsonify(list(_think_buffer))
@@ -2521,7 +2576,8 @@ input:focus{outline:none;border-color:var(--blue)}
 <script>
 const INTERVAL = 30;
 let _progStart = null, _progTimer = null, _refreshTimer = null;
-let _cfg = {};   // latest config snapshot — set in doRefresh
+let _cfg = {};        // latest config snapshot — set in doRefresh
+let _lastState = null; // last full /api/state response for SSE PnL recalc
 let _activeTab = "india";
 let _logPollTimer = null;
 let _sessPollTimer = null;
@@ -3267,6 +3323,7 @@ async function doRefresh() {
     const r = await fetch("/api/state");
     const d = await r.json();
     _cfg = d.config;
+    _lastState = d;
     renderStats(d);
     renderAgent(d.agent);
     loadCfg(d.config);
@@ -3288,6 +3345,48 @@ async function doRefresh() {
     startProg();
   } catch(e) { toast("Refresh failed: "+e.message, false); }
 }
+
+// ── SSE live price updates ─────────────────────────────────────────────────
+(function startPriceSSE() {
+  const src = new EventSource('/api/prices/stream');
+  src.onmessage = (e) => {
+    try {
+      const prices = JSON.parse(e.data);
+      if (!_lastState) return;
+      // recalculate PnL for each market using cached positions + fresh prices
+      ['india', 'us'].forEach(mkt => {
+        const sym  = mkt === 'india' ? '₹' : '$';
+        const m    = _lastState[mkt];
+        const cap  = mkt === 'india' ? _cfg.india_capital : _cfg.us_capital;
+        if (!m) return;
+        // merge: latest prices override signal prices
+        const merged = Object.assign({}, _lastState.signals[mkt+'_prices'], prices);
+        let upnl = 0;
+        Object.entries(m.positions || {}).forEach(([s, p]) => {
+          const cur = merged[s] || p.entry;
+          upnl += p.side === 'short'
+            ? (p.entry - cur) * p.qty
+            : (cur - p.entry) * p.qty;
+        });
+        const pv    = m.cash + Object.entries(m.positions||{}).reduce((acc,[s,p])=>{
+          const cur = merged[s]||p.entry;
+          return acc + (p.side==='short' ? (p.entry-cur)*p.qty : cur*p.qty);
+        }, 0);
+        const tpnl  = (m.realised_pnl||0) + upnl;
+        const df    = pv - cap, pct = cap > 0 ? df/cap*100 : 0;
+        const fc    = (v,s) => s+(Math.abs(v)<1e6 ? Math.abs(v).toLocaleString(undefined,{maximumFractionDigits:0}) : (Math.abs(v)/1e5).toFixed(1)+'L');
+        const sc    = v => v>=0?'green':'red';
+        const sgn   = v => v>=0?'+':'-';
+        const el    = id => document.getElementById(mkt+'-'+id);
+        if (el('pv'))   { el('pv').textContent = fc(pv,sym); el('pv').className='c-val mono '+sc(df); }
+        if (el('diff')) el('diff').innerHTML = `<span class="${sc(df)}">${sgn(df)}${fc(df,sym)} (${sgn(pct)}${Math.abs(pct).toFixed(1)}%)</span>`;
+        if (el('tpnl')) { el('tpnl').textContent=(tpnl>=0?'+':'')+fc(tpnl,sym); el('tpnl').className='c-val mono '+sc(tpnl); }
+        if (el('upnl')) el('upnl').innerHTML=`Float: <span class="${sc(upnl)}">${sgn(upnl)}${fc(upnl,sym)}</span>`;
+      });
+    } catch(_) {}
+  };
+  src.onerror = () => { src.close(); setTimeout(startPriceSSE, 5000); };
+})();
 
 function scheduleRefresh() {
   clearTimeout(_refreshTimer);
