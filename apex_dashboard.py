@@ -239,32 +239,24 @@ def fetch_prices(symbols: list) -> dict:
 # ─── THREAD 1: PRICE UPDATER (every 10 s) ────────────────────────────────────
 
 def _price_updater():
-    """Continuously polls yfinance every 10 s and writes to _latest_prices."""
+    """Continuously polls yfinance every 15 s using fast_info for live prices."""
     all_symbols = INDIA_WATCHLIST + US_WATCHLIST
-    tickers     = " ".join(all_symbols)
-    sym_set     = set(all_symbols)
     while True:
-        try:
-            data = yf.download(tickers, period="1d", interval="1m",
-                               progress=False, auto_adjust=True)
-            if not data.empty:
-                close = data["Close"]
-                fresh = {}
-                for sym in all_symbols:
-                    try:
-                        col = close[sym] if isinstance(close, pd.DataFrame) else close
-                        fresh[sym] = float(col.dropna().iloc[-1])
-                    except Exception:
-                        pass
-                if fresh:
-                    with _price_lock:
-                        _latest_prices.update(fresh)
-                    apex_log.info(
-                        f"[PRICE] tick — {len(fresh)}/{len(all_symbols)} symbols refreshed"
-                    )
-        except Exception as e:
-            apex_log.warning(f"Price updater error: {e}")
-        time.sleep(10)
+        fresh = {}
+        for sym in all_symbols:
+            try:
+                price = yf.Ticker(sym).fast_info.last_price
+                if price and price > 0:
+                    fresh[sym] = float(price)
+            except Exception:
+                pass
+        if fresh:
+            with _price_lock:
+                _latest_prices.update(fresh)
+            apex_log.info(
+                f"[PRICE] tick — {len(fresh)}/{len(all_symbols)} symbols refreshed"
+            )
+        time.sleep(15)
 
 # ─── INDEX TREND FILTER ───────────────────────────────────────────────────────
 
@@ -2609,7 +2601,7 @@ function renderAgentTerminal(entries) {
   el.innerHTML = entries.map(e => {
     const colorKey = Object.keys(_RL_COLORS).find(k => e.msg && e.msg.includes(k));
     const c = colorKey ? _RL_COLORS[colorKey] : '#58a6ff';
-    const ts = (e.ts || '').slice(11, 19);
+    const ts = e.ts ? new Date(e.ts).toLocaleString(undefined,{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}).replace(',','') : '';
     const sym = (e.sym && e.sym !== 'SYSTEM') ? `<span style="color:#58a6ff;margin-right:6px">${e.sym}</span>` : '';
     return `<div style="margin-bottom:3px;border-bottom:1px solid #161b22;padding-bottom:3px">` +
       `<span style="color:#484f58">${ts}</span>` +
