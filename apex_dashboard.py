@@ -238,23 +238,76 @@ def fetch_prices(symbols: list) -> dict:
 
 # ─── THREAD 1: PRICE UPDATER (every 10 s) ────────────────────────────────────
 
+_nse_session      = None
+_nse_session_ts   = 0.0
+_NSE_SESSION_TTL  = 300  # refresh cookies every 5 min
+
+def _get_nse_session():
+    """Return a curl_cffi session with fresh NSE cookies."""
+    global _nse_session, _nse_session_ts
+    try:
+        from curl_cffi import requests as curl_requests
+    except ImportError:
+        return None
+    now = time.time()
+    if _nse_session is None or (now - _nse_session_ts) > _NSE_SESSION_TTL:
+        try:
+            s = curl_requests.Session(impersonate="chrome120")
+            s.get("https://www.nseindia.com", timeout=10)
+            _nse_session    = s
+            _nse_session_ts = now
+        except Exception as e:
+            apex_log.debug(f"[NSE] session init failed: {e}")
+            _nse_session = None
+    return _nse_session
+
+def _fetch_nse_price(nse_sym: str) -> float | None:
+    """Fetch live price from NSE for a bare symbol (no .NS suffix)."""
+    s = _get_nse_session()
+    if s is None:
+        return None
+    try:
+        r = s.get(
+            f"https://www.nseindia.com/api/quote-equity?symbol={nse_sym}",
+            timeout=8,
+        )
+        if r.status_code == 200 and r.text:
+            p = r.json().get("priceInfo", {}).get("lastPrice")
+            return float(p) if p else None
+    except Exception:
+        _nse_session = None  # force re-init on next call
+    return None
+
 def _price_updater():
-    """Continuously polls yfinance every 15 s using fast_info for live prices."""
-    all_symbols = INDIA_WATCHLIST + US_WATCHLIST
+    """Polls prices every 15 s — NSE (curl_cffi) for Indian stocks, fast_info for US."""
     while True:
         fresh = {}
-        for sym in all_symbols:
+        # ── Indian stocks via NSE API ──────────────────────────────────────────
+        for sym in INDIA_WATCHLIST:
+            nse_sym = sym.replace(".NS", "").replace(".BO", "")
+            p = _fetch_nse_price(nse_sym)
+            if p and p > 0:
+                fresh[sym] = p
+            else:  # fallback to yfinance
+                try:
+                    fb = yf.Ticker(sym).fast_info.last_price
+                    if fb and fb > 0:
+                        fresh[sym] = float(fb)
+                except Exception:
+                    pass
+        # ── US stocks via yfinance fast_info ──────────────────────────────────
+        for sym in US_WATCHLIST:
             try:
-                price = yf.Ticker(sym).fast_info.last_price
-                if price and price > 0:
-                    fresh[sym] = float(price)
+                p = yf.Ticker(sym).fast_info.last_price
+                if p and p > 0:
+                    fresh[sym] = float(p)
             except Exception:
                 pass
         if fresh:
             with _price_lock:
                 _latest_prices.update(fresh)
             apex_log.info(
-                f"[PRICE] tick — {len(fresh)}/{len(all_symbols)} symbols refreshed"
+                f"[PRICE] tick — {len(fresh)}/{len(INDIA_WATCHLIST + US_WATCHLIST)} symbols refreshed"
             )
         time.sleep(15)
 
