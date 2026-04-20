@@ -16,7 +16,7 @@ _scaler = None
 _feature_columns: list[str] = []
 
 # ── Per-ticker observation cache (TTL = 1 hour, daily bars don't change faster) ──
-_obs_cache: dict[str, tuple[float, np.ndarray]] = {}
+_obs_cache: dict[str, tuple[float, np.ndarray, float]] = {}  # (ts, obs, raw_atr)
 _OBS_TTL = 3600
 
 
@@ -50,11 +50,11 @@ def _ensure_loaded() -> bool:
         return False
 
 
-def _build_observation(ticker: str) -> np.ndarray | None:
+def _build_observation(ticker: str) -> tuple[np.ndarray, float] | None:
     now = time.time()
     cached = _obs_cache.get(ticker)
     if cached and (now - cached[0]) < _OBS_TTL:
-        return cached[1]
+        return cached[1], cached[2]
 
     try:
         import pandas as pd
@@ -101,12 +101,14 @@ def _build_observation(ticker: str) -> np.ndarray | None:
         if frame.empty:
             return None
 
+        raw_atr = float(frame["atr_14"].iloc[-1]) if "atr_14" in frame.columns else 0.0
+
         last_row = frame[_feature_columns].iloc[[-1]]
         obs = (_scaler.transform(last_row) if _scaler is not None else last_row.values)[0]
         obs = obs.astype(np.float32)
 
-        _obs_cache[ticker] = (now, obs)
-        return obs
+        _obs_cache[ticker] = (now, obs, raw_atr)
+        return obs, raw_atr
 
     except Exception as exc:
         logger.warning("Observation build failed for %s: %s", ticker, exc)
@@ -139,9 +141,10 @@ def get_rl_signal(symbol: str, live_price: float) -> dict | None:
     if not _ensure_loaded():
         return None
 
-    obs = _build_observation(symbol)
-    if obs is None:
+    result = _build_observation(symbol)
+    if result is None:
         return None
+    obs, raw_atr = result
 
     try:
         import torch
@@ -159,16 +162,26 @@ def get_rl_signal(symbol: str, live_price: float) -> dict | None:
         margin   = sorted_p[-1] - sorted_p[-2]
         extremes = _get_extreme_features(obs, _feature_columns)
 
-        # Map to score/confidence values that route through apply_cycle correctly:
-        #   action=1 (buy)  → high confidence + positive score  → long entry allowed
-        #   action=2 (sell) → low  confidence + negative score  → signal exit triggered
-        #   action=0 (hold) → mid  confidence + zero score      → nothing triggered
-        if action == 1:
-            score, confidence = 80, 85.0
-        elif action == 2:
-            score, confidence = -80, 15.0
-        else:
+        # Gate: skip signals where the model is uncertain
+        if entropy > math.log(3) * 0.90 or margin < 0.08:
+            return None
+
+        # Scale confidence/score by conviction — a 35% plurality BUY is not the same
+        # as a 90% BUY. Normalize top_prob out of [1/3 (random), 1.0].
+        rand_floor = 1.0 / 3.0
+        norm_prob  = min(1.0, max(0.0, (top_prob - rand_floor) / (1.0 - rand_floor)))
+
+        if action == 1:   # BUY
+            score      = round(40 + norm_prob * 60.0)
+            confidence = round(55.0 + norm_prob * 40.0, 1)
+        elif action == 2: # SELL / bearish
+            score      = -round(40 + norm_prob * 60.0)
+            confidence = round(45.0 - norm_prob * 40.0, 1)
+        else:             # HOLD
             score, confidence = 0, 50.0
+
+        # Use the actual ATR from the fetched data for correct SL/TP sizing
+        atr = raw_atr if raw_atr > 0 else live_price * 0.015
 
         label = ["HOLD", "BUY", "SELL"][action]
         return {
@@ -180,8 +193,8 @@ def get_rl_signal(symbol: str, live_price: float) -> dict | None:
             "rsi":             50.0,
             "bb_upper":        live_price * 1.05,
             "bb_lower":        live_price * 0.95,
-            "atr":             live_price * 0.015,
-            "adx":             30.0,   # always above the ADX filter threshold
+            "atr":             atr,
+            "adx":             30.0,
             "hist_win_days":   0,
             "hist_total_days": 0,
             "hist_bias":       0.0,
