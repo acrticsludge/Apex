@@ -782,11 +782,11 @@ def _close_session(market_key: str, prices: dict):
         f"{record['wins']}W/{record['losses']}L  WR={wr}  {n_trades} trades"
     )
 
-    # Reset for next session — always start fresh with env-var capital (cash is constant)
-    cap = cfg["india_capital"] if market_key == "india" else cfg["us_capital"]
-    _state[market_key] = _empty_mstate(float(cap), today)
+    # Reset for next session — carry forward end-of-session cash
+    carry_cash = round(mstate["cash"], 2)
+    _state[market_key] = _empty_mstate(carry_cash, today)
     apex_log.info(
-        f"[SESSION] {market_key.upper()} reset — capital={sym}{cap:.0f}  ({today})"
+        f"[SESSION] {market_key.upper()} reset — carry_cash={sym}{carry_cash:.0f}  ({today})"
     )
 
 
