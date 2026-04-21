@@ -976,6 +976,13 @@ def execute_sell(symbol: str, price: float, reason: str, mstate: dict):
     apex_log.info(f"SELL {pos['qty']}x {symbol} @ {price:.2f}  P&L={sign}{pnl:.0f}  reason={reason}")
     del mstate["positions"][symbol]
 
+    # Online learning: feed closed long trade back to PPO
+    try:
+        from trading_agent.integration.online_learner import record_exit as _rl_exit
+        _rl_exit(symbol, price, pnl, pos.get("atr", 0.0), side="long")
+    except Exception:
+        pass
+
     # Set re-entry cooldown after a stop-loss
     if reason == "STOP LOSS":
         cooldown_min = cfg.get("cooldown_after_sl_min", 60)
@@ -1005,6 +1012,13 @@ def execute_cover(symbol: str, price: float, reason: str, mstate: dict):
               "SELL" if net_pnl >= 0 else "LOSS")
     apex_log.info(f"COVER {pos['qty']}x {symbol} @ {price:.2f}  P&L={sign}{net_pnl:.0f}  reason={reason}")
     del mstate["positions"][symbol]
+
+    # Online learning: feed closed short trade back to PPO
+    try:
+        from trading_agent.integration.online_learner import record_exit as _rl_exit
+        _rl_exit(symbol, price, net_pnl, pos.get("atr", 0.0), side="short")
+    except Exception:
+        pass
 
     if reason == "STOP LOSS":
         cooldown_min = cfg.get("cooldown_after_sl_min", 60)
@@ -1352,6 +1366,16 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int):
             if paper_buy(sym, 0, prices, mstate, atr=a.get("atr")):
                 open_pos += 1
                 _dc["buy"] += 1
+                # Online learning: record entry obs+action for RL-driven trades
+                if a.get("rl_action") is not None:
+                    try:
+                        from trading_agent.integration.rl_signal import get_cached_obs as _get_obs
+                        from trading_agent.integration.online_learner import record_entry as _rl_entry
+                        _obs = _get_obs(sym)
+                        if _obs is not None:
+                            _rl_entry(sym, _obs, a["rl_action"], a["price"], a.get("atr", 0.0))
+                    except Exception:
+                        pass
 
         # ── SHORT entry ──────────────────────────────────────────────────────
         elif (short_enabled
@@ -1840,6 +1864,26 @@ def api_think():
 def api_think_clear():
     _think_buffer.clear()
     return jsonify({"ok": True})
+
+@app.route("/api/retrain/log")
+def api_retrain_log():
+    try:
+        from trading_agent.integration.online_learner import (
+            get_retrain_log, _new_count, _is_training, _buffer, _total_updates,
+        )
+        return jsonify({
+            "log":           get_retrain_log(),
+            "is_training":   _is_training,
+            "new_count":     _new_count,
+            "buffer_size":   len(_buffer),
+            "total_updates": _total_updates,
+            "threshold":     16,
+        })
+    except ImportError:
+        return jsonify({
+            "log": [], "is_training": False,
+            "new_count": 0, "buffer_size": 0, "total_updates": 0, "threshold": 16,
+        })
 
 @app.route("/api/rl/decisions")
 def api_rl_decisions():
@@ -2331,6 +2375,7 @@ input:focus{outline:none;border-color:var(--blue)}
     <div class="tab"     onclick="tab('settings',this)">Settings</div>
     <div class="tab"     onclick="tab('logs',this)">All Logs</div>
     <div class="tab"     onclick="tab('agent',this)" style="color:#c060ff">Agent Terminal</div>
+    <div class="tab"     onclick="tab('retrain',this)" style="color:#f0883e">Retraining</div>
   </div>
 
   <!-- India pane -->
@@ -2549,6 +2594,38 @@ input:focus{outline:none;border-color:var(--blue)}
     </div>
   </div>
 
+  <!-- Retraining Terminal pane -->
+  <div class="pane" id="pane-retrain">
+    <div class="sec">
+      <span class="sec-title">RL Retraining Terminal</span>
+      <span id="retrain-status-badge" style="padding:2px 10px;border-radius:10px;font-size:11px;font-weight:700;background:#1a1a1a;color:#8b949e">● IDLE</span>
+      <span style="margin-left:auto;font-size:10px;color:var(--muted)">auto-triggered after every 16 closed RL trades</span>
+    </div>
+    <div style="display:flex;gap:10px;margin-bottom:12px;flex-wrap:wrap">
+      <div style="background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:8px 14px;font-size:11px;min-width:160px">
+        <span style="color:var(--muted)">Trade buffer </span>
+        <span id="retrain-buf-count" style="color:var(--text);font-weight:600">0</span>
+        <span style="color:var(--muted)"> / 16</span>
+        <div id="retrain-buf-bar" style="margin-top:5px;height:4px;background:#21262d;border-radius:2px">
+          <div id="retrain-buf-fill" style="height:4px;background:#f0883e;border-radius:2px;width:0%;transition:width .4s"></div>
+        </div>
+      </div>
+      <div style="background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:8px 14px;font-size:11px;min-width:130px">
+        <span style="color:var(--muted)">Total updates </span>
+        <span id="retrain-total" style="color:var(--text);font-weight:600">0</span>
+      </div>
+      <div style="background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:8px 14px;font-size:11px;min-width:130px">
+        <span style="color:var(--muted)">Pending trades </span>
+        <span id="retrain-pending" style="color:var(--text);font-weight:600">0</span>
+      </div>
+    </div>
+    <div id="retrain-terminal" style="background:#0a0c10;border:1px solid #30363d;border-radius:6px;
+         padding:14px;height:450px;overflow-y:auto;font-family:'Courier New',monospace;
+         font-size:12px;color:#c9d1d9;line-height:1.7">
+      <span style="color:#484f58">—</span> <span style="color:#666">No retraining events yet — waiting for 16 closed RL trades to accumulate</span>
+    </div>
+  </div>
+
   <!-- Footer -->
   <div class="foot">
     <span id="last-upd">Last update: —</span>
@@ -2591,6 +2668,7 @@ let _activeTab = "india";
 let _logPollTimer = null;
 let _sessPollTimer = null;
 let _agentPollTimer = null;
+let _retrainPollTimer = null;
 let _logFilter = "ALL";
 let _autoScroll = true;
 let _lastLogEntries = null;
@@ -2652,6 +2730,7 @@ function tab(name, el) {
   clearInterval(_logPollTimer);
   clearInterval(_sessPollTimer);
   clearInterval(_agentPollTimer);
+  clearInterval(_retrainPollTimer);
   if (name === "logs") {
     _logPollTimer = setInterval(pollLogs, 5000);
     setInterval(pollDecisions, 4000);
@@ -2663,6 +2742,9 @@ function tab(name, el) {
   } else if (name === "agent") {
     _agentPollTimer = setInterval(pollAgentTerminal, 4000);
     pollAgentTerminal();
+  } else if (name === "retrain") {
+    _retrainPollTimer = setInterval(pollRetrainTerminal, 5000);
+    pollRetrainTerminal();
   }
 }
 
@@ -2750,6 +2832,84 @@ function clearAgentTerminal() {
   _lastDlogEntries = [];
   const dbox = document.getElementById("dlog-box");
   if (dbox) renderDlog([]);
+}
+
+// ── Retraining Terminal ───────────────────────────────────────────────────
+function renderRetrainTerminal(data) {
+  const el      = document.getElementById('retrain-terminal');
+  const badge   = document.getElementById('retrain-status-badge');
+  const bufCnt  = document.getElementById('retrain-buf-count');
+  const bufFill = document.getElementById('retrain-buf-fill');
+  const total   = document.getElementById('retrain-total');
+  const pending = document.getElementById('retrain-pending');
+  if (!el) return;
+
+  const thr  = data.threshold || 16;
+  const nc   = data.new_count  || 0;
+  const bufsz= data.buffer_size || 0;
+
+  if (bufCnt)  bufCnt.textContent  = nc;
+  if (bufFill) bufFill.style.width = Math.min(100, Math.round(nc / thr * 100)) + '%';
+  if (total)   total.textContent   = data.total_updates || 0;
+  if (pending) pending.textContent = bufsz;
+
+  if (badge) {
+    if (data.is_training) {
+      badge.textContent = '⟳ TRAINING'; badge.style.color = '#f0883e'; badge.style.background = '#2a1800';
+    } else if ((data.total_updates || 0) > 0) {
+      badge.textContent = '● UPDATED';  badge.style.color = '#3fb950'; badge.style.background = '#0a2016';
+    } else {
+      badge.textContent = '● IDLE';     badge.style.color = '#8b949e'; badge.style.background = '#1a1a1a';
+    }
+  }
+
+  const entries = data.log || [];
+  if (!entries.length) {
+    el.innerHTML = '<span style="color:#484f58">—</span> <span style="color:#666">No retraining events yet — waiting for 16 closed RL trades to accumulate</span>';
+    return;
+  }
+
+  el.innerHTML = [...entries].reverse().map(e => {
+    const ts = e.ts ? new Date(e.ts).toLocaleString(undefined,
+      {month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}
+    ).replace(',','') : '';
+
+    let color, prefix, icon;
+    if (e.event === 'started') {
+      color = '#58a6ff'; prefix = 'STARTED'; icon = '🔄';
+    } else if (e.event === 'completed') {
+      color = (e.improvement_pct || 0) >= 0 ? '#3fb950' : '#f0883e';
+      prefix = 'APPLIED'; icon = '✓';
+    } else if (e.event === 'failed') {
+      color = '#f85149'; prefix = 'FAILED'; icon = '✗';
+    } else if (e.event === 'skipped') {
+      color = '#8b949e'; prefix = 'SKIPPED'; icon = '○';
+    } else {
+      color = '#8b949e'; prefix = (e.event || '').toUpperCase(); icon = '·';
+    }
+
+    const tradesTag = e.trades
+      ? `<span style="color:#484f58;font-size:10px;margin-left:8px">${e.trades} trades</span>` : '';
+    const improvTag = e.improvement_pct !== undefined
+      ? `<span style="color:${(e.improvement_pct||0)>=0?'#3fb950':'#f85149'};font-size:10px;margin-left:8px">${e.improvement_pct>0?'+':''}${e.improvement_pct}%</span>` : '';
+    const errTag = e.error
+      ? `<div style="color:#f85149;font-size:10px;margin-left:16px;margin-top:2px">${e.error}</div>` : '';
+
+    return `<div style="margin-bottom:5px;border-bottom:1px solid #161b22;padding-bottom:5px">` +
+      `<span style="color:#484f58">${ts}</span>` +
+      `<span style="color:${color};margin:0 7px;font-weight:700">${icon} ${prefix}</span>` +
+      `<span style="color:${color}">${e.msg || ''}</span>` +
+      tradesTag + improvTag + errTag +
+      `</div>`;
+  }).join('');
+}
+
+async function pollRetrainTerminal() {
+  try {
+    const r = await fetch('/api/retrain/log');
+    if (!r.ok) return;
+    renderRetrainTerminal(await r.json());
+  } catch(e) {}
 }
 
 function setDlogFilter(cat, el) {

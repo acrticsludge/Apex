@@ -130,6 +130,14 @@ def _get_extreme_features(obs: np.ndarray, cols: list[str]) -> list[dict]:
     return result
 
 
+def get_cached_obs(ticker: str) -> np.ndarray | None:
+    """Return the most-recently-built observation array for a ticker, or None."""
+    entry = _obs_cache.get(ticker)
+    if entry is None:
+        return None
+    return entry[1].copy()
+
+
 def get_rl_signal(symbol: str, live_price: float) -> dict | None:
     """
     Return an analyse()-compatible dict driven by the PPO policy.
