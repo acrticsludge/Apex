@@ -1370,16 +1370,18 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int):
             if paper_buy(sym, 0, prices, mstate, atr=a.get("atr")):
                 open_pos += 1
                 _dc["buy"] += 1
-                # Online learning: record entry obs+action for RL-driven trades
-                if a.get("rl_action") is not None:
-                    try:
-                        from trading_agent.integration.rl_signal import get_cached_obs as _get_obs
-                        from trading_agent.integration.online_learner import record_entry as _rl_entry
-                        _obs = _get_obs(sym)
-                        if _obs is not None:
-                            _rl_entry(sym, _obs, a["rl_action"], a["price"], a.get("atr", 0.0))
-                    except Exception:
-                        pass
+                # Online learning: record obs+action for any trade where RL built
+                # an observation (RL mode runs _build_observation for all symbols
+                # even when the entropy gate rejects the signal). For rule-based
+                # fallback trades we use action=1 (BUY) to teach the model the outcome.
+                try:
+                    from trading_agent.integration.rl_signal import get_cached_obs as _get_obs
+                    from trading_agent.integration.online_learner import record_entry as _rl_entry
+                    _obs = _get_obs(sym)
+                    if _obs is not None:
+                        _rl_entry(sym, _obs, a.get("rl_action", 1), a["price"], a.get("atr", 0.0))
+                except Exception:
+                    pass
 
         # ── SHORT entry ──────────────────────────────────────────────────────
         elif (short_enabled
@@ -1396,6 +1398,14 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int):
             if paper_short(sym, 0, prices, mstate, atr=a.get("atr")):
                 open_pos += 1
                 _dc["buy"] += 1
+                try:
+                    from trading_agent.integration.rl_signal import get_cached_obs as _get_obs
+                    from trading_agent.integration.online_learner import record_entry as _rl_entry
+                    _obs = _get_obs(sym)
+                    if _obs is not None:
+                        _rl_entry(sym, _obs, 2, a["price"], a.get("atr", 0.0))  # 2=SELL
+                except Exception:
+                    pass
 
         else:
             # Diagnose which condition failed
