@@ -83,6 +83,8 @@ cfg = {
     "trailing_stop_enabled":  True,
     "trailing_activation_mult": 1.0,  # activate once price rises by 1× ATR from entry
     "trailing_dist_mult":      1.5,   # trail at 1.5× ATR below the running high
+    # ── RL exit ──────────────────────────────────────────────────────────────
+    "rl_exit_confidence":       55,   # min RL confidence to trigger early exit
     # ── Signal filters ───────────────────────────────────────────────────────
     "adx_min":                  20,   # only trade when ADX confirms a trend
     "index_min_pct":          -0.5,   # block new longs if index is down > 0.5% on the day
@@ -679,6 +681,7 @@ _CFG_PERSIST_KEYS = (
     "check_interval_min", "idle_interval_min",
     "india_max_positions", "us_max_positions",
     "eod_harvest_min", "eod_exit_min",
+    "rl_exit_confidence",
     "settings_enabled",
 )
 
@@ -1205,11 +1208,40 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int):
         else:
             pnl_pct = ((pos["entry"] - price) / pos["entry"] * 100 if is_short
                        else (price - pos["entry"]) / pos["entry"] * 100)
-            apex_log.debug(
-                f"[{market_key.upper()}] SL-CHECK HOLD  {sym}  "
-                f"price={price:.2f}  P&L={pnl_pct:+.1f}%  "
-                f"SL={pos['stop_loss']:.2f}  T={pos['target']:.2f}"
-            )
+
+            # RL agent gets to vote on early exit while SL/TP not yet hit
+            rl_exited = False
+            if cfg.get("rl_mode") and _RL_AVAILABLE:
+                try:
+                    rl_result = _get_rl_signal(sym, price)
+                    if rl_result is not None:
+                        rl_action = rl_result.get("rl_action", 0)
+                        rl_conf   = rl_result.get("confidence", 0)
+                        rl_exit_thr = cfg.get("rl_exit_confidence", 55)
+                        should_exit = (
+                            (not is_short and rl_action == 2 and rl_conf >= rl_exit_thr) or
+                            (is_short     and rl_action == 1 and rl_conf >= rl_exit_thr)
+                        )
+                        if should_exit:
+                            think_log("EXIT",
+                                      f"{sym} RL EXIT  conf={rl_conf:.0f}%  "
+                                      f"P&L={pnl_pct:+.1f}%  "
+                                      f"action={'SELL' if rl_action == 2 else 'BUY-TO-COVER'}", sym)
+                            if is_short:
+                                paper_cover(sym, pos["qty"], prices, mstate, "RL EXIT")
+                            else:
+                                paper_sell(sym, pos["qty"], prices, mstate, "RL EXIT")
+                            _dc["sell"] += 1
+                            rl_exited = True
+                except Exception:
+                    pass
+
+            if not rl_exited:
+                apex_log.debug(
+                    f"[{market_key.upper()}] SL-CHECK HOLD  {sym}  "
+                    f"price={price:.2f}  P&L={pnl_pct:+.1f}%  "
+                    f"SL={pos['stop_loss']:.2f}  T={pos['target']:.2f}"
+                )
 
     # ── 4. Block new buys when EOD exit mode is active ───────────────────────
     if mtc is not None and mtc <= harvest_min:
@@ -1821,7 +1853,8 @@ def update_config():
     for k in ("risk_per_trade", "confidence_threshold", "stop_loss_pct", "target_pct",
               "check_interval_min", "idle_interval_min",
               "india_max_positions", "us_max_positions",
-              "eod_harvest_min", "eod_exit_min"):
+              "eod_harvest_min", "eod_exit_min",
+              "rl_exit_confidence"):
         if k in data:
             cfg[k] = int(data[k]) if k in int_keys else float(data[k])
             changed.append(k)
@@ -2490,6 +2523,7 @@ input:focus{outline:none;border-color:var(--blue)}
         <div class="fg"><label>US Max Positions</label>        <input class="settings-input" type="number" id="s-up"   step="1"    min="1"    max="16"></div>
         <div class="fg"><label>EOD Profit Harvest (min before close)</label><input class="settings-input" type="number" id="s-eod-h" step="1" min="10" max="60"></div>
         <div class="fg"><label>EOD Force Exit (min before close)</label>    <input class="settings-input" type="number" id="s-eod-e" step="1" min="3"  max="30"></div>
+        <div class="fg"><label>RL Exit Confidence (%)</label>               <input class="settings-input" type="number" id="s-rl-exit" step="1" min="50" max="95" title="Min RL confidence to trigger early exit from a held position"></div>
       </div>
       <div style="margin-top:14px;display:flex;gap:10px">
         <button class="btn btn-blue" onclick="saveConfig()">Save Settings</button>
@@ -3300,6 +3334,7 @@ function loadCfg(c) {
   document.getElementById("s-up").value    = c.us_max_positions;
   document.getElementById("s-eod-h").value = c.eod_harvest_min;
   document.getElementById("s-eod-e").value = c.eod_exit_min;
+  document.getElementById("s-rl-exit").value = c.rl_exit_confidence ?? 55;
   // Sync settings toggle state
   const stToggle = document.getElementById('settings-toggle');
   if (stToggle && c.settings_enabled !== undefined) {
@@ -3614,6 +3649,7 @@ async function saveConfig() {
     us_max_positions:     parseInt(document.getElementById("s-up").value),
     eod_harvest_min:      parseInt(document.getElementById("s-eod-h").value),
     eod_exit_min:         parseInt(document.getElementById("s-eod-e").value),
+    rl_exit_confidence:   parseInt(document.getElementById("s-rl-exit").value),
   };
   const r = await fetch("/api/config",{method:"POST",
     headers:{"Content-Type":"application/json"},body:JSON.stringify(p)});
