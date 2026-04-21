@@ -1050,11 +1050,15 @@ def fetch_cycle_data(watchlist: list, prices: dict, market_key: str = "india") -
                         probs       = result.get("rl_probs", [0, 0, 0])
                         extremes    = result.get("rl_extremes", [])
                         ext_str     = ", ".join(f"{e['feature']}={e['value']:.2f}" for e in extremes)
+                        trend_tag = (
+                            f"trend={result.get('trend_5d_pct', 0):+.1f}% "
+                            f"({'✓' if result.get('trend_aligned') else '✗'})"
+                        )
                         think_log(
                             "RL",
                             f"{action_name} | H:{probs[0]:.0%} B:{probs[1]:.0%} S:{probs[2]:.0%} | "
                             f"conf={result.get('confidence', 0):.0f}% margin={result.get('rl_margin', 0):.2f} | "
-                            f"extremes: {ext_str or 'none'}",
+                            f"{trend_tag} | extremes: {ext_str or 'none'}",
                             symbol,
                         )
                         _save_rl_decision(symbol, market_key, result)

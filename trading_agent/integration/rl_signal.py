@@ -16,7 +16,7 @@ _scaler = None
 _feature_columns: list[str] = []
 
 # ── Per-ticker observation cache (TTL = 1 hour, daily bars don't change faster) ──
-_obs_cache: dict[str, tuple[float, np.ndarray, float]] = {}  # (ts, obs, raw_atr)
+_obs_cache: dict[str, tuple[float, np.ndarray, float, float]] = {}  # (ts, obs, raw_atr, trend_5d_pct)
 _OBS_TTL = 3600
 
 
@@ -50,11 +50,11 @@ def _ensure_loaded() -> bool:
         return False
 
 
-def _build_observation(ticker: str) -> tuple[np.ndarray, float] | None:
+def _build_observation(ticker: str) -> tuple[np.ndarray, float, float] | None:
     now = time.time()
     cached = _obs_cache.get(ticker)
     if cached and (now - cached[0]) < _OBS_TTL:
-        return cached[1], cached[2]
+        return cached[1], cached[2], cached[3]
 
     try:
         import pandas as pd
@@ -107,8 +107,15 @@ def _build_observation(ticker: str) -> tuple[np.ndarray, float] | None:
         obs = (_scaler.transform(last_row) if _scaler is not None else last_row.values)[0]
         obs = obs.astype(np.float32)
 
-        _obs_cache[ticker] = (now, obs, raw_atr)
-        return obs, raw_atr
+        # 5-day close-to-close trend (uses last 6 bars; safe even on short frames)
+        closes = frame["close"].values
+        if len(closes) >= 6:
+            trend_5d_pct = float((closes[-1] - closes[-6]) / (closes[-6] + 1e-9) * 100)
+        else:
+            trend_5d_pct = 0.0
+
+        _obs_cache[ticker] = (now, obs, raw_atr, trend_5d_pct)
+        return obs, raw_atr, trend_5d_pct
 
     except Exception as exc:
         logger.warning("Observation build failed for %s: %s", ticker, exc)
@@ -152,7 +159,7 @@ def get_rl_signal(symbol: str, live_price: float) -> dict | None:
     result = _build_observation(symbol)
     if result is None:
         return None
-    obs, raw_atr = result
+    obs, raw_atr, trend_5d_pct = result
 
     try:
         import torch
@@ -179,14 +186,26 @@ def get_rl_signal(symbol: str, live_price: float) -> dict | None:
         rand_floor = 1.0 / 3.0
         norm_prob  = min(1.0, max(0.0, (top_prob - rand_floor) / (1.0 - rand_floor)))
 
+        # Trend alignment: how well the last 5 trading days confirm the signal.
+        # ±3 % move = full alignment/opposition; clipped to [-1, 1].
+        if action == 1:    # uptrend confirms BUY
+            trend_align = max(-1.0, min(1.0, trend_5d_pct / 3.0))
+        elif action == 2:  # downtrend confirms SELL
+            trend_align = max(-1.0, min(1.0, -trend_5d_pct / 3.0))
+        else:
+            trend_align = 0.0
+
+        # Base score from model conviction ± up to 12 pts from trend alignment.
+        # confidence uses the same (score+100)/2 formula as analyse() so values
+        # are directly comparable across RL and rule-based modes.
         if action == 1:   # BUY
-            score      = round(40 + norm_prob * 60.0)
-            confidence = round(55.0 + norm_prob * 40.0, 1)
-        elif action == 2: # SELL / bearish
-            score      = -round(40 + norm_prob * 60.0)
-            confidence = round(45.0 - norm_prob * 40.0, 1)
+            score = round(max(0,    min(100,  40 + norm_prob * 60.0 + trend_align * 12.0)))
+        elif action == 2: # SELL
+            score = round(max(-100, min(0,  -(40 + norm_prob * 60.0 + trend_align * 12.0))))
         else:             # HOLD
-            score, confidence = 0, 50.0
+            score = 0
+
+        confidence = round(min(100, max(0, (score + 100) / 2)), 1)
 
         # Use the actual ATR from the fetched data for correct SL/TP sizing
         atr = raw_atr if raw_atr > 0 else live_price * 0.015
@@ -197,7 +216,7 @@ def get_rl_signal(symbol: str, live_price: float) -> dict | None:
             "price":           live_price,
             "score":           score,
             "confidence":      confidence,
-            "signals":         {"RL": {"value": f"{label} {top_prob:.0%}", "signal": label}},
+            "signals":         {"RL": {"value": f"{label} {top_prob:.0%} trend={trend_5d_pct:+.1f}%", "signal": label}},
             "rsi":             50.0,
             "bb_upper":        live_price * 1.05,
             "bb_lower":        live_price * 0.95,
@@ -213,6 +232,8 @@ def get_rl_signal(symbol: str, live_price: float) -> dict | None:
             "rl_entropy":      round(entropy, 4),
             "rl_margin":       round(margin, 4),
             "rl_extremes":     extremes,
+            "trend_5d_pct":    round(trend_5d_pct, 2),
+            "trend_aligned":   trend_align > 0,
         }
 
     except Exception as exc:
