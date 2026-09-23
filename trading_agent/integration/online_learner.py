@@ -50,21 +50,23 @@ def get_retrain_log() -> list[dict]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def record_entry(symbol: str, obs: np.ndarray, action: int,
-                 entry_price: float, atr: float) -> None:
+                 entry_price: float, atr: float, regime: str = "bullish") -> None:
     """Store the observation + action when an RL-driven trade opens."""
     _pending[symbol] = {
         "obs":         obs.copy(),
         "action":      action,
         "entry_price": entry_price,
         "atr":         float(atr),
+        "regime":      regime,  # Task 32: store regime at entry
     }
-    logger.debug("RL entry recorded: %s  action=%d  price=%.2f", symbol, action, entry_price)
+    logger.debug("RL entry recorded: %s  action=%d  price=%.2f  regime=%s", symbol, action, entry_price, regime)
 
 
 def record_exit(symbol: str, exit_price: float, pnl: float,
-                atr_at_entry: float, side: str = "long") -> None:
+                atr_at_entry: float, side: str = "long", portfolio_stress: float = 0.5) -> None:
     """Called when a trade closes.  Computes ATR-normalised reward, buffers
-    the experience, and triggers a gradient update when the threshold is met."""
+    the experience, and triggers a gradient update when the threshold is met.
+    Task 32: Weights reward by inverse portfolio_stress (less learning when stressed)."""
     global _new_count
 
     pending = _pending.pop(symbol, None)
@@ -75,6 +77,7 @@ def record_exit(symbol: str, exit_price: float, pnl: float,
     action = pending["action"]
     entry  = pending["entry_price"]
     atr    = atr_at_entry if atr_at_entry > 0 else pending.get("atr", 0.0)
+    regime = pending.get("regime", "bullish")  # Task 32: get regime at entry
 
     # ATR-normalised reward keeps the scale consistent across volatile/calm stocks
     if atr > 0:
@@ -82,12 +85,14 @@ def record_exit(symbol: str, exit_price: float, pnl: float,
     else:
         raw = pnl / max(entry * 0.015, 1e-9)
 
-    reward = float(max(-3.0, min(3.0, raw)))
+    # Task 32: Weight reward by inverse portfolio_stress (less learning when stressed)
+    stress_weight = max(0.2, 1.0 - portfolio_stress)  # 0.2 to 1.0
+    reward = float(max(-3.0, min(3.0, raw * stress_weight)))
 
-    _buffer.append({"obs": obs, "action": action, "reward": reward})
+    _buffer.append({"obs": obs, "action": action, "reward": reward, "regime": regime})  # Task 32: store regime
     _new_count += 1
-    logger.debug("RL exit: %s  reward=%.3f  buf=%d  new_count=%d",
-                 symbol, reward, len(_buffer), _new_count)
+    logger.debug("RL exit: %s  reward=%.3f  stress_weight=%.2f  buf=%d  new_count=%d",
+                 symbol, reward, stress_weight, len(_buffer), _new_count)
 
     if _new_count >= _UPDATE_THRESHOLD and not _is_training:
         _new_count = 0
@@ -118,57 +123,68 @@ def _run_update() -> None:
             _rt_log("skipped", msg=f"Buffer too small ({len(batch)} < 4) — skipping")
             return
 
+        # Task 32: Stratify by regime for updates
+        regimes = ["bullish", "bearish", "choppy", "crisis"]
+        regime_batches = {r: [e for e in batch if e.get("regime", "bullish") == r] for r in regimes}
+        
         n = len(batch)
         _rt_log("started", trades=n,
                 msg=f"Triggered by {n} closed trades — computing gradients…")
-        logger.info("Online RL update: batch_size=%d", n)
+        logger.info("Online RL update: batch_size=%d, regime_dist=%s", n, 
+                    {r: len(v) for r, v in regime_batches.items()})
 
         import torch as th
         import torch.nn.functional as F
 
-        obs_t = th.tensor(
-            np.stack([e["obs"] for e in batch]).astype(np.float32)
-        )
-        act_t = th.tensor([e["action"] for e in batch], dtype=th.long)
-        ret_t = th.tensor([e["reward"] for e in batch], dtype=th.float32)
-
         with _update_lock:
-            # Baseline loss before touching weights
-            with th.no_grad():
-                vals_old, lp_old, _ = model.policy.evaluate_actions(obs_t, act_t)
-                vals_old = vals_old.squeeze(-1)
-                adv_pre  = ret_t - vals_old
-                loss_before = float((-(lp_old * adv_pre)).mean().abs())
+            # Process each regime separately for stratified updates
+            for regime in regimes:
+                regime_batch = regime_batches[regime]
+                if len(regime_batch) < 2:  # Need at least 2 for gradient
+                    continue
+                    
+                obs_t = th.tensor(
+                    np.stack([e["obs"] for e in regime_batch]).astype(np.float32)
+                )
+                act_t = th.tensor([e["action"] for e in regime_batch], dtype=th.long)
+                ret_t = th.tensor([e["reward"] for e in regime_batch], dtype=th.float32)
 
-            loss_after = loss_before
+                # Baseline loss before touching weights
+                with th.no_grad():
+                    vals_old, lp_old, _ = model.policy.evaluate_actions(obs_t, act_t)
+                    vals_old = vals_old.squeeze(-1)
+                    adv_pre  = ret_t - vals_old
+                    loss_before = float((-(lp_old * adv_pre)).mean().abs())
 
-            for _epoch in range(_N_EPOCHS):
-                vals, log_probs, entropy = model.policy.evaluate_actions(obs_t, act_t)
-                vals = vals.squeeze(-1)
+                loss_after = loss_before
 
-                adv = ret_t - vals.detach()
-                adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+                for _epoch in range(_N_EPOCHS):
+                    vals, log_probs, entropy = model.policy.evaluate_actions(obs_t, act_t)
+                    vals = vals.squeeze(-1)
 
-                ratio   = th.exp(log_probs - lp_old.detach())
-                pg_loss = -th.min(
-                    ratio * adv,
-                    th.clamp(ratio, 1 - _CLIP_EPS, 1 + _CLIP_EPS) * adv,
-                ).mean()
-                v_loss  = F.mse_loss(vals, ret_t)
-                e_loss  = -entropy.mean()
-                loss    = pg_loss + 0.5 * v_loss + 0.01 * e_loss
+                    adv = ret_t - vals.detach()
+                    adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
-                if th.isnan(loss) or th.isinf(loss):
-                    raise ValueError(f"Non-finite loss ({float(loss):.4f}) at epoch {_epoch}")
+                    ratio   = th.exp(log_probs - lp_old.detach())
+                    pg_loss = -th.min(
+                        ratio * adv,
+                        th.clamp(ratio, 1 - _CLIP_EPS, 1 + _CL_EPS) * adv,
+                    ).mean()
+                    v_loss  = F.mse_loss(vals, ret_t)
+                    e_loss  = -entropy.mean()
+                    loss    = pg_loss + 0.5 * v_loss + 0.01 * e_loss
 
-                for pg in model.policy.optimizer.param_groups:
-                    pg["lr"] = _FINE_TUNE_LR
+                    if th.isnan(loss) or th.isinf(loss):
+                        raise ValueError(f"Non-finite loss ({float(loss):.4f}) at epoch {_epoch}")
 
-                model.policy.optimizer.zero_grad()
-                loss.backward()
-                th.nn.utils.clip_grad_norm_(model.policy.parameters(), 0.5)
-                model.policy.optimizer.step()
-                loss_after = float(loss.item())
+                    for pg in model.policy.optimizer.param_groups:
+                        pg["lr"] = _FINE_TUNE_LR
+
+                    model.policy.optimizer.zero_grad()
+                    loss.backward()
+                    th.nn.utils.clip_grad_norm_(model.policy.parameters(), 0.5)
+                    model.policy.optimizer.step()
+                    loss_after = float(loss.item())
 
             improvement = round(
                 (loss_before - loss_after) / (abs(loss_before) + 1e-9) * 100, 1
