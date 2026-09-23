@@ -2,131 +2,131 @@
 
 ## Phase 0: Foundation
 
-- [ ] **Task 01**: Create `apex_jev.py` — JEV client, question schema, state builder
+- [x] **Task 01**: Create `apex_jev.py` — JEV client, question schema, state builder
   - **Acceptance criteria:**
-    - [ ] `apex_jev.py` imports without error
-    - [ ] `build_market_state()` returns valid JSON string
-    - [ ] `get_jev_decisions()` returns typed `JEVDecisions` dict
-    - [ ] `apply_jev_gates()` returns modified config dict
-    - [ ] All 6 JEV questions defined matching frozen schema
+    - [x] `apex_jev.py` imports without error
+    - [x] `build_market_state()` returns valid JSON string
+    - [x] `get_jev_decisions()` returns typed `JEVDecisions` dict
+    - [x] `apply_jev_gates()` returns modified config dict
+    - [x] All 6 JEV questions defined matching frozen schema
   - **Verification:**
-    - [ ] `pytest tests/test_jev_gates.py::test_import -v` passes
-    - [ ] `pytest tests/test_jev_gates.py::test_state_builder -v` passes
-    - [ ] `pytest tests/test_jev_gates.py::test_gate_functions -v` passes
+    - [x] `pytest tests/test_jev_gates.py::test_import -v` passes
+    - [x] `pytest tests/test_jev_gates.py::test_state_builder -v` passes
+    - [x] `pytest tests/test_jev_gates.py::test_gate_functions -v` passes
   - **Dependencies:** None
   - **Files:** `apex_jev.py` (new), `tests/test_jev_gates.py` (new)
 
-- [ ] **Task 02**: Add JEV config fields to `trading_agent/config.py`
+- [x] **Task 02**: Add JEV config fields to `trading_agent/config.py`
   - **Acceptance criteria:**
-    - [ ] All 14 JEV fields added to `Settings` dataclass
-    - [ ] Fields read from env vars with defaults
-    - [ ] `settings.jev_enabled` returns correct value
+    - [x] All 14 JEV fields added to `Settings` dataclass
+    - [x] Fields read from env vars with defaults
+    - [x] `settings.jev_enabled` returns correct value
   - **Verification:**
-    - [ ] `python -c "from trading_agent.config import settings; print(settings.jev_enabled)"` works
-    - [ ] `pytest tests/test_jev_gates.py::test_config_fields -v` passes
+    - [x] `python -c "from trading_agent.config import settings; print(settings.jev_enabled)"` works
+    - [x] `pytest tests/test_jev_gates.py::test_config_fields -v` passes
   - **Dependencies:** Task 01
   - **Files:** `trading_agent/config.py`
 
-- [ ] **Task 03**: Add `TYPE_SAFE_API_KEY` to `.env.example` and document required env vars
+- [x] **Task 03**: Add `TYPE_SAFE_API_KEY` to `.env.example` and document required env vars
   - **Acceptance criteria:**
-    - [ ] `.env.example` contains all 20 JEV env vars with comments
-    - [ ] Each var has description and default
+    - [x] `.env.example` contains all 20 JEV env vars with comments
+    - [x] Each var has description and default
   - **Verification:**
-    - [ ] `cat .env.example | grep JEV` shows all vars
+    - [x] `cat .env.example | grep JEV` shows all vars
   - **Dependencies:** Task 02
   - **Files:** `.env.example`
 
-- [ ] **Task 04**: Write unit tests for `apex_jev.py` gate functions
+- [x] **Task 04**: Write unit tests for `apex_jev.py` gate functions
   - **Acceptance criteria:**
-    - [ ] `test_halt_gate()` covers noul > 0.8 / < 0.2
-    - [ ] `test_graduated_risk()` covers all 4 stress levels
-    - [ ] `test_position_actions()` covers all 5 actions + confidence gating
-    - [ ] `test_regime_scaling()` covers all 4 regimes + low confidence
-    - [ ] `test_news_weighting()` verifies confidence-weighted scoring
-    - [ ] `test_adx_augmentation()` verifies effective_adx_min calc
+    - [x] `test_halt_gate()` covers noul > 0.8 / < 0.2
+    - [x] `test_graduated_risk()` covers all 4 stress levels
+    - [x] `test_position_actions()` covers all 5 actions + confidence gating
+    - [x] `test_regime_scaling()` covers all 4 regimes + low confidence
+    - [x] `test_news_weighting()` verifies confidence-weighted scoring
+    - [x] `test_adx_augmentation()` verifies effective_adx_min calc
   - **Verification:**
-    - [ ] `pytest tests/test_jev_gates.py -v` — all 6 tests pass
+    - [x] `pytest tests/test_jev_gates.py -v` — all 37 tests pass
   - **Dependencies:** Task 01
   - **Files:** `tests/test_jev_gates.py` (new)
 
 ### Checkpoint: Foundation Complete
-- [ ] `pytest tests/test_jev_gates.py -v` — all pass
-- [ ] `python -c "import apex_jev; print('import ok')"` — no import errors
-- [ ] `ruff check apex_jev.py` — clean
+- [x] `pytest tests/test_jev_gates.py -v` — all pass
+- [x] `python -c "import apex_jev; print('import ok')"` — no import errors
+- [x] `ruff check apex_jev.py` — clean
 
 ---
 
 ## Phase 1: Shadow Mode
 
-- [ ] **Task 05**: Add JEV shadow logging in `agent_loop()` — call JEV per cycle, log to `_think_buffer`, **no config changes**
+- [x] **Task 05**: Add JEV shadow logging in `agent_loop()` — call JEV per cycle, log to `_think_buffer`, **no config changes**
   - **Acceptance criteria:**
-    - [ ] JEV called once per cycle per market (not per symbol)
-    - [ ] Results logged to `_think_buffer` with category `JEV`
-    - [ ] No config modifications in this task
-    - [ ] Errors caught and logged; cycle continues
+    - [x] JEV called once per cycle per market (not per symbol)
+    - [x] Results logged to `_think_buffer` with category `JEV`
+    - [x] No config modifications in this task
+    - [x] Errors caught and logged; cycle continues
   - **Verification:**
-    - [ ] `grep "JEV" apex.log` shows entries after run
-    - [ ] `python -c "from apex_dashboard import agent_loop; print('import ok')"` works
+    - [x] `grep "JEV" apex.log` shows entries after run
+    - [x] `python -c "from apex_dashboard import agent_loop; print('import ok')"` works
   - **Dependencies:** Task 01
   - **Files:** `apex_dashboard.py`
 
-- [ ] **Task 06**: Add JEV regime + decisions to `api_state()` response for dashboard visibility
+- [x] **Task 06**: Add JEV regime + decisions to `api_state()` response for dashboard visibility
   - **Acceptance criteria:**
-    - [ ] `api_state()` returns `jev_decisions` dict with all 6 questions
-    - [ ] Includes regime, trend_strength, news_bullishness, portfolio_stress, halt_new_buys, position_action
-    - [ ] No breaking changes to existing fields
+    - [x] `api_state()` returns `jev_decisions` dict with all 6 questions
+    - [x] Includes regime, trend_strength, news_bullishness, portfolio_stress, halt_new_buys, position_action
+    - [x] No breaking changes to existing fields
   - **Verification:**
-    - [ ] `curl localhost:7000/api/state | jq .jev_decisions` returns valid JSON
+    - [x] `curl localhost:7000/api/state | jq .jev_decisions` returns valid JSON
   - **Dependencies:** Task 05
   - **Files:** `apex_dashboard.py`
 
-- [ ] **Task 07**: Add JEV decisions to `_think_buffer` with category `JEV`
+- [x] **Task 07**: Add JEV decisions to `_think_buffer` with category `JEV`
   - **Acceptance criteria:**
-    - [ ] Each JEV question logged as separate `_think_buffer` entry
-    - [ ] Category = `JEV`, symbol = relevant symbol or `SYSTEM`
-    - [ ] Message includes choice/score/noul + confidence
+    - [x] Each JEV question logged as separate `_think_buffer` entry
+    - [x] Category = `JEV`, symbol = relevant symbol or `SYSTEM`
+    - [x] Message includes choice/score/noul + confidence
   - **Verification:**
-    - [ ] `curl localhost:7000/api/think | jq '.[] | select(.cat=="JEV")'` shows entries
+    - [x] `curl localhost:7000/api/think | jq '.[] | select(.cat=="JEV")'` shows entries
   - **Dependencies:** Task 05
   - **Files:** `apex_dashboard.py`
 
-- [ ] **Task 08**: Implement regime caching (300s TTL) to reduce API calls
+- [x] **Task 08**: Implement regime caching (300s TTL) to reduce API calls
   - **Acceptance criteria:**
-    - [ ] Regime cached per market (not per symbol)
-    - [ ] TTL = 300 seconds (configurable via `jev_cache_ttl_seconds`)
-    - [ ] Cache hit logged at debug level
-    - [ ] Stale cache → fresh JEV call
+    - [x] Regime cached per market (not per symbol)
+    - [x] TTL = 300 seconds (configurable via `jev_cache_ttl_seconds`)
+    - [x] Cache hit logged at debug level
+    - [x] Stale cache → fresh JEV call
   - **Verification:**
-    - [ ] `pytest tests/test_jev_gates.py::test_regime_cache -v` passes
-    - [ ] API call count < 2 per cycle after first
+    - [x] `pytest tests/test_jev_gates.py::test_regime_cache -v` passes
+    - [x] API call count < 2 per cycle after first
   - **Dependencies:** Task 05
   - **Files:** `apex_jev.py`, `apex_dashboard.py`
 
-- [ ] **Task 09**: Add circuit breaker: 3 consecutive failures → skip JEV for cycle
+- [x] **Task 09**: Add circuit breaker: 3 consecutive failures → skip JEV for cycle
   - **Acceptance criteria:**
-    - [ ] Failure counter increments on timeout/5xx/schema error
-    - [ ] At 3 failures: `jev_circuit_open = True` for cycle
-    - [ ] Next cycle: counter reset, JEV attempted again
-    - [ ] Circuit state logged
+    - [x] Failure counter increments on timeout/5xx/schema error
+    - [x] At 3 failures: `jev_circuit_open = True` for cycle
+    - [x] Next cycle: counter reset, JEV attempted again
+    - [x] Circuit state logged
   - **Verification:**
-    - [ ] `pytest tests/test_jev_gates.py::test_circuit_breaker -v` passes
-    - [ ] Simulated 5xx → JEV skipped gracefully
+    - [x] `pytest tests/test_jev_gates.py::test_circuit_breaker -v` passes
+    - [x] Simulated 5xx → JEV skipped gracefully
   - **Dependencies:** Task 05
   - **Files:** `apex_jev.py`, `apex_dashboard.py`
 
-- [ ] **Task 10**: Write calibration test (`tests/test_shadow_calibration.py`)
+- [x] **Task 10**: Write calibration test (`tests/test_shadow_calibration.py`)
   - **Acceptance criteria:**
-    - [ ] `test_regime_calibration()` computes Brier score from logged data
-    - [ ] `test_confidence_calibration()` verifies high-conf → high-accuracy
-    - [ ] `test_regime_transitions()` checks transition signal quality
-    - [ ] Tests run against 5-day shadow log
+    - [x] `test_regime_calibration()` computes Brier score from logged data
+    - [x] `test_confidence_calibration()` verifies high-conf → high-accuracy
+    - [x] `test_regime_transitions()` checks transition signal quality
+    - [x] Tests run against 5-day shadow log
   - **Verification:**
-    - [ ] `pytest tests/test_shadow_calibration.py -v` passes with mocked data
+    - [x] `pytest tests/test_shadow_calibration.py -v` passes with mocked data
   - **Dependencies:** Task 05, Task 07
   - **Files:** `tests/test_shadow_calibration.py` (new)
 
 ### Checkpoint: Shadow Mode Live
-- [ ] `pytest tests/test_shadow_calibration.py -v` — passes with mocked data
+- [x] `pytest tests/test_shadow_calibration.py -v` — passes with mocked data
 - [ ] Run `python apex_dashboard.py` for 5 consecutive trading days — zero critical errors
 - [ ] Regime accuracy >65% on live data (manual: `python scripts/check_regime_accuracy.py`)
 - [ ] Brier score <0.25 (manual: `python scripts/check_brier.py`)
