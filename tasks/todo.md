@@ -214,47 +214,47 @@
 
 ## Phase 3: Signal Augmentation
 
-- [ ] **Task 17**: Replace `compute_news_score()` with JEV `news_bullishness` in `analyse()`
+- [x] **Task 17**: Replace `compute_news_score()` with JEV `news_bullishness` in `analyse()`
   - **Acceptance criteria:**
-    - [ ] `analyse()` calls `get_jev_decisions()` for news_bullishness
-    - [ ] Score formula: `score += round(news_score * 15 * confidence)`
-    - [ ] Falls back to keyword scoring if JEV unavailable
-    - [ ] Logs JEV news score + confidence
+    - [x] `analyse()` calls `get_jev_decisions()` for news_bullishness
+    - [x] Score formula: `score += round(news_score * 15 * confidence)`
+    - [x] Falls back to keyword scoring if JEV unavailable
+    - [x] Logs JEV news score + confidence
   - **Verification:**
-    - [ ] `pytest tests/test_jev_gates.py::test_news_replacement -v` passes
+    - [x] `pytest tests/test_jev_gates.py::test_news_replacement -v` passes
     - [ ] Manual: JEV news_score=3.0, conf=0.9 → +40 score
   - **Dependencies:** Task 11
   - **Files:** `apex_dashboard.py`
 
-- [ ] **Task 18**: Weight news by confidence: `score += round(news_score * 15 * confidence)`
+- [x] **Task 18**: Weight news by confidence: `score += round(news_score * 15 * confidence)`
   - **Acceptance criteria:**
-    - [ ] Implemented in Task 17 (same task)
-    - [ ] Low confidence (<0.7) → minimal weight
-    - [ ] High confidence (>0.9) → full weight
+    - [x] Implemented in Task 17 (same task)
+    - [x] Low confidence (<0.7) → minimal weight
+    - [x] High confidence (>0.9) → full weight
   - **Verification:** Covered by Task 17 test
   - **Dependencies:** Task 17
   - **Files:** `apex_dashboard.py`
 
-- [ ] **Task 19**: Augment ADX filter: `effective_adx_min = base * (1 + (trend_strength.score-1.5)*0.2)`
+- [x] **Task 19**: Augment ADX filter: `effective_adx_min = base * (1 + (trend_strength.score-1.5)*0.2)`
   - **Acceptance criteria:**
-    - [ ] In `apply_cycle()` line 1366 ADX check
-    - [ ] Only applied when `trend_strength.confidence > 0.7`
-    - [ ] Score 0→0.7x, 1.5→1.0x, 3→1.3x multiplier
-    - [ ] Logs effective ADX min
+    - [x] In `apply_cycle()` ADX check
+    - [x] Only applied when `trend_strength.confidence > 0.7`
+    - [x] Score 0→0.7x, 1.5→1.0x, 3→1.3x multiplier
+    - [x] Logs effective ADX min
   - **Verification:**
-    - [ ] `pytest tests/test_jev_gates.py::test_adx_augmentation -v` passes
+    - [x] `pytest tests/test_jev_gates.py::test_adx_augmentation -v` passes
     - [ ] Manual: trend_strength=0 → adx_min * 0.7
   - **Dependencies:** Task 11
   - **Files:** `apex_dashboard.py`
 
-- [ ] **Task 20**: Calibrate trailing stop: `dist_mult = base * (2.0 - trend_strength.score/3.0)`
+- [x] **Task 20**: Calibrate trailing stop: `dist_mult = base * (2.0 - trend_strength.score/3.0)`
   - **Acceptance criteria:**
-    - [ ] In `apply_cycle()` line 1152 trailing stop logic
-    - [ ] Only when `trend_strength.confidence > 0.7`
-    - [ ] Strong trend (3.0) → 1.0x (tighter); No trend (0) → 2.0x (wider)
-    - [ ] Logs effective dist_mult
+    - [x] In `apply_cycle()` trailing stop logic
+    - [x] Only when `trend_strength.confidence > 0.7`
+    - [x] Strong trend (3.0) → 1.0x (tighter); No trend (0) → 2.0x (wider)
+    - [x] Logs effective dist_mult
   - **Verification:**
-    - [ ] `pytest tests/test_jev_gates.py::test_trailing_calibration -v` passes
+    - [x] `pytest tests/test_jev_gates.py::test_trailing_calibration -v` passes
     - [ ] Manual: trend_strength=3.0 → dist_mult = base * 1.0
   - **Dependencies:** Task 11
   - **Files:** `apex_dashboard.py`
