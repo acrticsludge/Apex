@@ -519,7 +519,7 @@ def compute_news_score(symbol: str) -> tuple:
 
 # ─── SIGNAL ENGINE ────────────────────────────────────────────────────────────
 
-def analyse(symbol: str, df, live_price: float) -> dict:
+def analyse(symbol: str, df, live_price: float, jev_decisions: dict | None = None) -> dict:
     close  = df["close"].astype(float)
     volume = df["volume"].astype(float)
     price  = live_price or float(close.iloc[-1])
@@ -563,9 +563,20 @@ def analyse(symbol: str, df, live_price: float) -> dict:
     if hist_total >= 2:
         score += round(hist_bias * 10)
 
-    news_score, news_count = compute_news_score(symbol)
-    if news_count > 0:
-        score += round(news_score * 15)
+    # Task 17-18: JEV news_bullishness replaces compute_news_score
+    if jev_decisions and "news_bullishness" in jev_decisions:
+        news = jev_decisions["news_bullishness"]
+        news_score = (news["score"] - 2.0) / 2.0  # Normalize from 0-4 to -1 to +1
+        news_conf = news["confidence"]
+        weight = _jev.get_news_weight(jev_decisions) if _JEV_AVAILABLE else 1.0
+        if news_conf > 0 and news_score != 0:
+            score += round(news_score * 15 * weight)
+    else:
+        # Fallback to keyword-based scoring
+        news_score, news_count = compute_news_score(symbol)
+        if news_count > 0:
+            score += round(news_score * 15)
+    
     score = max(-100, min(100, score))
 
     return {
@@ -582,8 +593,8 @@ def analyse(symbol: str, df, live_price: float) -> dict:
         "hist_win_days":   hist_win,
         "hist_total_days": hist_total,
         "hist_bias":       hist_bias,
-        "news_score":      news_score,
-        "news_count":      news_count,
+        "news_score":      news_score if 'news_score' in locals() else 0.0,
+        "news_count":      news_count if 'news_count' in locals() else 0,
     }
 
 # ─── STATE MANAGEMENT ─────────────────────────────────────────────────────────
@@ -1083,7 +1094,58 @@ def fetch_cycle_data(watchlist: list, prices: dict, market_key: str = "india") -
         if df is None:
             continue
         live = live or float(df["close"].iloc[-1])
-        analyses.append(analyse(symbol, df, live))
+        
+        # Task 17-18: Fetch per-symbol JEV decisions (news_bullishness, position_action)
+        jev_symbol_decisions = None
+        if _JEV_AVAILABLE and cfg.get("jev_enabled", True) and cfg.get("jev_news_enabled", True):
+            try:
+                # Build symbol-specific state for JEV
+                indicators = {
+                    "price": live,
+                    "rsi": calc_rsi(df["close"].astype(float)) if len(df) > 14 else 50.0,
+                    "macd_hist": calc_macd(df["close"].astype(float))[2] if len(df) > 26 else 0.0,
+                    "adx": calc_adx(df) if len(df) > 14 else 20.0,
+                    "atr": calc_atr(df) if len(df) > 14 else 0.0,
+                    "vol_ratio": calc_vol_ratio(df["volume"].astype(float)) if len(df) > 20 else 1.0,
+                }
+                # Fetch news for this symbol
+                news = []
+                try:
+                    yf_news = yf.Ticker(symbol).news or []
+                    recent = [n for n in yf_news if time.time() - float(n.get("providerPublishTime", 0)) < 86400]
+                    for item in recent[:5]:
+                        news.append({"title": item.get("title", ""), "recency_h": (time.time() - float(item.get("providerPublishTime", 0))) / 3600})
+                except Exception:
+                    pass
+                
+                with _lock:
+                    mstate = _state.get(market_key, {})
+                    portfolio_ctx = {
+                        "cash": mstate.get("cash", 0.0),
+                        "drawdown_pct": mstate.get("max_drawdown", 0.0),
+                        "open_positions": len(mstate.get("positions", {})),
+                        "daily_pnl_pct": mstate.get("realised_pnl", 0.0) / max(mstate.get("session_start_cash", 1.0), 1.0),
+                    }
+                
+                market_context = {
+                    "spy_trend_pct": _index_trend.get(market_key, 0.0),
+                    "vix": 20.0,
+                    "breadth": 0.5,
+                }
+                
+                # Get per-symbol JEV decisions (news_bullishness, position_action)
+                symbol_state = _jev.build_market_state(symbol, indicators, news, portfolio_ctx, market_context)
+                symbol_questions = {
+                    "news_bullishness": _jev.JEV_QUESTIONS["news_bullishness"],
+                    "position_action": _jev.JEV_QUESTIONS["position_action"],
+                }
+                symbol_result = _jev._call_jev_api(symbol_state, symbol_questions)
+                if symbol_result:
+                    jev_symbol_decisions = symbol_result
+            except (requests.RequestException, ValueError, KeyError) as e:
+                apex_log.debug(f"[JEV] Per-symbol decisions failed for {symbol}: {e}")
+        
+        analyses.append(analyse(symbol, df, live, jev_symbol_decisions))
         time.sleep(0.2)
     wl_prices = {s: prices[s] for s in watchlist if s in prices}
     return analyses, wl_prices
@@ -1466,13 +1528,18 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int, jev
         # (no hard `continue` here — the check is embedded in the entry conditions below
         #  so a bearish signal can still go to the short entry branch on a down-index day)
 
-        # ADX trend gate — applies to both longs and shorts
-        if _strict and adx_val < cfg.get("adx_min", 20):
+        # ADX trend gate — applies to both longs and shorts (Task 19: JEV trend_strength augmentation)
+        effective_adx_min = cfg.get("adx_min", 20)
+        if _JEV_AVAILABLE and cfg.get("jev_trend_enabled", True):
+            jev_decisions = jev_decisions_per_market.get(market_key)
+            if jev_decisions:
+                effective_adx_min = _jev.get_effective_adx_min(effective_adx_min, jev_decisions)
+        if _strict and adx_val < effective_adx_min:
             think_log("FILTER",
-                      f"{sym} SKIP ADX: {adx_val:.1f} < {cfg.get('adx_min', 20)}  "
+                      f"{sym} SKIP ADX: {adx_val:.1f} < {effective_adx_min:.1f}  "
                       f"(market not trending, signals unreliable)", sym)
             apex_log.debug(
-                f"[{market_key.upper()}] NO-TREND  {sym}  ADX={adx_val:.1f}"
+                f"[{market_key.upper()}] NO-TREND  {sym}  ADX={adx_val:.1f} eff_min={effective_adx_min:.1f}"
             )
             _dc["watch"] += 1
             continue
