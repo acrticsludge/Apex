@@ -212,6 +212,10 @@ def evaluate_model_on_frames(
         finally:
             evaluation_env.close()
 
+    # Task 33-34: Regime-stratified evaluation
+    # Get regime labels from dataset_metadata if available
+    regime_map = dataset_metadata.get("regime_labels", {}) if dataset_metadata else {}
+    
     aggregate_strategy = _aggregate_curves([result.equity_curve for result in episode_results])
     aggregate_benchmark = _aggregate_curves([result.benchmark_curve for result in episode_results])
     all_trade_logs = [trade for result in episode_results for trade in result.trade_log]
@@ -224,6 +228,26 @@ def evaluate_model_on_frames(
     invalid_action_count = 0
     total_holding_periods: list[float] = []
     total_time_in_market = 0.0
+
+    # Task 34: Per-regime metrics
+    regime_metrics = {}
+    for regime in ["bullish", "bearish", "choppy", "crisis"]:
+        regime_tickers = [t for t in split_frames.keys() if regime_map.get(t, "bullish") == regime]
+        if not regime_tickers:
+            continue
+        regime_results = [r for r in episode_results if r.ticker in regime_tickers]
+        if not regime_results:
+            continue
+        regime_strategy = _aggregate_curves([r.equity_curve for r in regime_results])
+        regime_benchmark = _aggregate_curves([r.benchmark_curve for r in regime_results])
+        regime_trades = [trade for r in regime_results for trade in r.trade_log]
+        regime_metrics[regime] = {
+            "tickers": regime_tickers,
+            "metrics": compute_performance_metrics(regime_strategy, regime_trades),
+            "benchmark_metrics": compute_performance_metrics(regime_benchmark, []),
+            "trade_count": len(regime_trades),
+            "ticker_count": len(regime_tickers),
+        }
 
     for result in episode_results:
         result_action_counts = result.diagnostics.get("action_counts", {})
@@ -287,6 +311,8 @@ def evaluate_model_on_frames(
             }
             for result in episode_results
         },
+        # Task 34: Regime-attributed metrics
+        "regime_metrics": regime_metrics,
     }
 
     summary = _json_ready_summary(summary)

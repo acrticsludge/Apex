@@ -109,12 +109,33 @@ class ValidationSharpeEvalCallback(EvalCallback):
         max_drawdown = float(overall_metrics["max_drawdown"])
         trade_coverage_ratio = float(diagnostics.get("trade_coverage_ratio", 0.0))
 
-        return (
+        base_score = (
             (self.current_settings.validation_sharpe_weight * sharpe_ratio)
             + (self.current_settings.validation_excess_return_weight * excess_return)
             - (self.current_settings.validation_drawdown_weight * max_drawdown)
             + (self.current_settings.validation_trade_coverage_weight * trade_coverage_ratio)
         )
+
+        # Task 33: Add regime-stratified component
+        regime_metrics = summary.get("regime_metrics", {})
+        if regime_metrics:
+            regime_weights = {
+                "bullish": 0.3,
+                "bearish": 0.3,
+                "choppy": 0.2,
+                "crisis": 0.2,
+            }
+            regime_score = 0.0
+            for regime, metrics in regime_metrics.items():
+                weight = regime_weights.get(regime, 0.0)
+                if weight > 0 and "metrics" in metrics:
+                    regime_sharpe = metrics["metrics"].get("sharpe_ratio", 0.0)
+                    regime_excess = metrics["metrics"].get("cumulative_return", 0.0) - metrics.get("benchmark_metrics", {}).get("cumulative_return", 0.0)
+                    regime_score += weight * (regime_sharpe + regime_excess)
+            # Blend: 70% overall, 30% regime-stratified
+            return 0.7 * base_score + 0.3 * regime_score
+        
+        return base_score
 
     def _on_step(self) -> bool:
         """Run a full validation backtest every ``eval_freq`` environment steps."""
