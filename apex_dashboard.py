@@ -1485,6 +1485,38 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int, jev
         if in_pos:
             pos = mstate["positions"][sym]
             pos_side = pos.get("side", "long")
+            
+            # JEV Exit Override (Task 24): Check JEV position_action for exit/trim
+            jev_exit_triggered = False
+            if _JEV_AVAILABLE and cfg.get("jev_action_enabled", True):
+                jev_decisions = jev_decisions_per_market.get(market_key)
+                if jev_decisions:
+                    action, action_conf = _jev.get_position_action(jev_decisions)
+                    if action == "exit" and action_conf >= cfg.get("jev_action_confidence_threshold", 0.65):
+                        think_log("EXIT",
+                                  f"{sym} JEV EXIT: conf={action_conf:.2f}  pos_side={pos_side}", sym)
+                        if pos_side == "long":
+                            paper_sell(sym, 0, prices, mstate, "JEV EXIT")
+                        else:
+                            paper_cover(sym, 0, prices, mstate, "JEV EXIT")
+                        _dc["sell"] += 1
+                        jev_exit_triggered = True
+                    elif action == "trim" and action_conf >= 0.7:
+                        think_log("EXIT",
+                                  f"{sym} JEV TRIM: conf={action_conf:.2f}  pos_side={pos_side}", sym)
+                        # Sell 50% of position
+                        qty = pos["qty"] // 2
+                        if qty > 0:
+                            if pos_side == "long":
+                                paper_sell(sym, qty, prices, mstate, "JEV TRIM")
+                            else:
+                                paper_cover(sym, qty, prices, mstate, "JEV TRIM")
+                            _dc["sell"] += 1
+                            jev_exit_triggered = True
+            
+            if jev_exit_triggered:
+                continue
+            
             if pos_side == "long" and a["score"] < -30:
                 think_log("EXIT",
                           f"{sym} SIGNAL EXIT: score={a['score']}  conf={conf:.0f}%  "
@@ -1556,6 +1588,14 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int, jev
         elif cooldown_until and now_utc >= cooldown_until:
             mstate["cooldown_until"].pop(sym, None)
 
+        # ── JEV Position Action Gate (Tasks 22-27) ────────────────────────────────
+        jev_action = None
+        jev_action_conf = 0.0
+        if _JEV_AVAILABLE and cfg.get("jev_action_enabled", True):
+            jev_decisions = jev_decisions_per_market.get(market_key)
+            if jev_decisions:
+                jev_action, jev_action_conf = _jev.get_position_action(jev_decisions)
+
         # ── LONG entry ───────────────────────────────────────────────────────
         short_enabled    = cfg.get("short_selling_enabled", False)
         bearish_conf     = 100 - conf
@@ -1566,7 +1606,9 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int, jev
                 and a["score"] > 0
                 and (a.get("rl_action") is not None or index_ok)  # RL bypasses index gate
                 and open_pos < max_pos_eff
-                and mstate["cash"] > a["price"] * 2):
+                and mstate["cash"] > a["price"] * 2
+                and (jev_action is None or jev_action in ("buy", "add"))  # JEV action gate
+                and (jev_action is None or jev_action_conf >= cfg.get("jev_action_confidence_threshold", 0.65))):
             think_log("ENTRY",
                       f"{sym} ENTRY: conf={conf:.0f}%  score={a['score']:+d}  "
                       f"@ {a['price']:.2f}  ADX={adx_val:.1f}  ATR={a.get('atr', 0):.3f}", sym)
@@ -1594,7 +1636,9 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int, jev
                 and a["score"] < 0
                 and index_pct <= index_max_short    # block shorts on strongly bullish days
                 and open_pos < max_pos_eff
-                and mstate["cash"] > a["price"] * 2):
+                and mstate["cash"] > a["price"] * 2
+                and (jev_action is None or jev_action in ("buy", "add"))  # JEV action gate (buy=short for JEV)
+                and (jev_action is None or jev_action_conf >= cfg.get("jev_action_confidence_threshold", 0.65))):
             think_log("ENTRY",
                       f"{sym} SHORT ENTRY: bearish_conf={bearish_conf:.0f}%  score={a['score']:+d}  "
                       f"@ {a['price']:.2f}  ADX={adx_val:.1f}  ATR={a.get('atr', 0):.3f}", sym)
