@@ -33,6 +33,14 @@ except Exception as _rl_import_err:  # noqa: BLE001
     _RL_AVAILABLE = False
     _get_rl_signal = None  # type: ignore[assignment]
 
+# ── JEV (TypeSafe) integration ──────────────────────────────────────────────────
+try:
+    import apex_jev as _jev
+    _JEV_AVAILABLE = True
+except Exception as _jev_import_err:  # noqa: BLE001
+    _JEV_AVAILABLE = False
+    _jev = None  # type: ignore[assignment]
+
 import time
 import warnings
 import logging
@@ -1641,6 +1649,63 @@ def agent_loop():
         # Refresh index trend once per cycle (no lock needed — floats are atomic)
         _refresh_index_trend()
 
+        # ── JEV Shadow Mode: Log decisions once per cycle per open market ─────────
+        if _JEV_AVAILABLE and cfg.get("jev_enabled", True):
+            # Build market context for JEV
+            market_context = {
+                "spy_trend_pct": _index_trend.get("india", 0.0) if india_open else _index_trend.get("us", 0.0),
+                "vix": 20.0,  # TODO: fetch real VIX
+                "breadth": 0.5,  # TODO: fetch real breadth
+            }
+            
+            for market_key, is_open in [("india", india_open), ("us", us_open)]:
+                if not is_open:
+                    continue
+                try:
+                    # Get portfolio state for this market
+                    with _lock:
+                        mstate = _state.get(market_key, {})
+                        portfolio_ctx = {
+                            "cash": mstate.get("cash", 0.0),
+                            "drawdown_pct": mstate.get("max_drawdown", 0.0),
+                            "open_positions": len(mstate.get("positions", {})),
+                            "daily_pnl_pct": mstate.get("realised_pnl", 0.0) / max(mstate.get("session_start_cash", 1.0), 1.0),
+                        }
+                    
+                    # Call JEV for system-level decisions (regime, trend, stress, halt)
+                    jev_decisions = _jev.get_system_decisions(market_key, portfolio_ctx, market_context)
+                    
+                    if jev_decisions:
+                        # Log each JEV decision to think buffer
+                        regime = jev_decisions["regime"]
+                        think_log("JEV", 
+                            f"regime={regime['choice']} conf={regime['confidence']:.2f} "
+                            f"probs={ {k: f'{v:.2f}' for k, v in regime['probabilities'].items()} }", 
+                            market_key.upper())
+                        
+                        trend = jev_decisions["trend_strength"]
+                        think_log("JEV",
+                            f"trend_strength={trend['score']:.2f} conf={trend['confidence']:.2f}",
+                            market_key.upper())
+                        
+                        stress = jev_decisions["portfolio_stress"]
+                        think_log("JEV",
+                            f"portfolio_stress={stress['score']:.2f} conf={stress['confidence']:.2f}",
+                            market_key.upper())
+                        
+                        halt = jev_decisions["halt_new_buys"]
+                        think_log("JEV",
+                            f"halt_new_buys={halt['noul']:.2f} conf={halt['confidence']:.2f}",
+                            market_key.upper())
+                        
+                        apex_log.info(
+                            f"[JEV] {market_key.upper()} regime={regime['choice']} "
+                            f"trend={trend['score']:.2f} stress={stress['score']:.2f} "
+                            f"halt={halt['noul']:.2f}"
+                        )
+                except (requests.RequestException, ValueError, KeyError) as e:
+                    apex_log.warning(f"[JEV] Shadow logging failed for {market_key}: {e}")
+
         if india_open:
             if not _agent["running"]:
                 break
@@ -1759,6 +1824,31 @@ def api_state():
         peak = mstate.get("peak_portfolio", pv)
         return round((peak - pv) / peak * 100, 2) if peak > 0 else 0.0
 
+    # Get JEV decisions for dashboard
+    jev_decisions = {}
+    if _JEV_AVAILABLE and cfg.get("jev_enabled", True):
+        market_context = {
+            "spy_trend_pct": _index_trend.get("india", 0.0),
+            "vix": 20.0,
+            "breadth": 0.5,
+        }
+        for market_key in ("india", "us"):
+            try:
+                with _lock:
+                    mstate = _state.get(market_key, {})
+                    portfolio_ctx = {
+                        "cash": mstate.get("cash", 0.0),
+                        "drawdown_pct": mstate.get("max_drawdown", 0.0),
+                        "open_positions": len(mstate.get("positions", {})),
+                        "daily_pnl_pct": mstate.get("realised_pnl", 0.0) / max(mstate.get("session_start_cash", 1.0), 1.0),
+                    }
+                decisions = _jev.get_system_decisions(market_key, portfolio_ctx, market_context)
+                if decisions:
+                    jev_decisions[market_key] = decisions
+            except (requests.RequestException, ValueError, KeyError) as e:
+                apex_log.warning(f"[JEV] api_state failed for {market_key}: {e}")
+                jev_decisions[market_key] = {"error": str(e)}
+
     return jsonify({
         "agent":  _agent,
         "config": cfg,
@@ -1787,6 +1877,7 @@ def api_state():
         "live_prices":    live_prices,
         "paper_summary":  get_summary(live_prices),
         "sessions_count": len(st.get("sessions", [])),
+        "jev_decisions":  jev_decisions,
     })
 
 @app.route("/api/agent/start", methods=["POST"])
@@ -1911,6 +2002,16 @@ def api_think():
 def api_think_clear():
     _think_buffer.clear()
     return jsonify({"ok": True})
+
+@app.route("/api/jev/status")
+def api_jev_status():
+    """JEV integration status for monitoring."""
+    if not _JEV_AVAILABLE:
+        return jsonify({"available": False, "error": "apex_jev module not available"})
+    try:
+        return jsonify(_jev.get_jev_status())
+    except (requests.RequestException, ValueError, KeyError) as e:
+        return jsonify({"available": True, "error": str(e)}), 500
 
 @app.route("/api/retrain/log")
 def api_retrain_log():
