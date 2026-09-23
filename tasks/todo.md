@@ -259,13 +259,13 @@
   - **Dependencies:** Task 11
   - **Files:** `apex_dashboard.py`
 
-- [ ] **Task 21**: Add JEV trend_strength to indicator engine feature join
+- [x] **Task 21**: Add JEV trend_strength to indicator engine feature join
   - **Acceptance criteria:**
-    - [ ] `indicator_engine.py` accepts optional `jev_trend_strength` param
-    - [ ] Adds as column `jev_trend_strength` to feature DataFrame
-    - [ ] Used by RL observation builder
+    - [x] `indicator_engine.py` accepts optional `jev_trend_strength` param
+    - [x] Adds as column `jev_trend_strength` to feature DataFrame
+    - [x] Used by RL observation builder
   - **Verification:**
-    - [ ] `pytest tests/test_jev_gates.py::test_indicator_join -v` passes
+    - [x] `pytest tests/test_jev_gates.py::test_indicator_join -v` passes
   - **Dependencies:** Task 11
   - **Files:** `trading_agent/data/indicator_engine.py`
 
@@ -390,14 +390,14 @@
   - **Dependencies:** Task 28
   - **Files:** `trading_agent/integration/rl_signal.py`
 
-- [ ] **Task 31**: Extend `bot_bridge.py` schema + response metadata
+- [x] **Task 31**: Extend `bot_bridge.py` schema + response metadata
   - **Acceptance criteria:**
-    - [ ] `PredictionRequest` adds optional `jev_features: list[float]`
-    - [ ] `/predict` response includes `jev_regime_probs`
-    - [ ] `/status` includes `jev_version`, `jev_last_call_latency_ms`
-    - [ ] Backward compatible (jev_features optional)
+    - [x] `PredictionRequest` adds optional `jev_features: list[float]`
+    - [x] `/predict` response includes `jev_regime_probs`
+    - [x] `/status` includes `jev_version`, `jev_feature_columns`
+    - [x] Backward compatible (jev_features optional)
   - **Verification:**
-    - [ ] `pytest tests/test_rl_integration.py::test_bridge_schema -v` passes
+    - [x] `pytest tests/test_rl_integration.py::test_bridge_schema -v` passes
     - [ ] `curl -X POST localhost:8000/predict -d '{"observation": [...]}'` works
   - **Dependencies:** Task 28
   - **Files:** `trading_agent/integration/bot_bridge.py`

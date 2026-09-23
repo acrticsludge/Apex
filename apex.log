@@ -27,3 +27,104 @@
 2026-04-13 17:33:52,244 [DEBUG] US market closed — skipping
 2026-04-13 17:33:52,245 [INFO] State saved to disk
 2026-04-13 17:33:52,245 [INFO] Waiting 15 min — next check at 17:48
+2026-09-23 17:27:04,761 [INFO] State loaded from apex_dual_state.json
+2026-09-23 17:27:04,765 [INFO] Price updater thread started (10 s interval)
+2026-09-23 17:27:04,765 [INFO] Apex started — Supabase storage, dual-loop active
+2026-09-23 17:27:18,820 [INFO] [PRICE] tick — 32/32 symbols refreshed
+2026-09-23 17:32:10,035 [INFO] State loaded from apex_dual_state.json
+2026-09-23 17:32:10,038 [INFO] Price updater thread started (10 s interval)
+2026-09-23 17:32:10,039 [INFO] Apex started — Supabase storage, dual-loop active
+2026-09-23 17:32:15,898 [INFO] [PRICE] tick — 32/32 symbols refreshed
+2026-09-23 17:42:13,846 [INFO] State loaded from apex_dual_state.json
+2026-09-23 17:42:13,847 [INFO] Price updater thread started (10 s interval)
+2026-09-23 17:42:13,849 [INFO] Apex started — Supabase storage, dual-loop active
+2026-09-23 17:42:19,776 [INFO] [PRICE] tick — 32/32 symbols refreshed
+2026-09-23 17:43:14,704 [INFO] State loaded from apex_dual_state.json
+2026-09-23 17:43:14,706 [INFO] Price updater thread started (10 s interval)
+2026-09-23 17:43:14,707 [INFO] Apex started — Supabase storage, dual-loop active
+2026-09-23 17:59:04,605 [INFO] State loaded from apex_dual_state.json
+2026-09-23 17:59:04,607 [INFO] Price updater thread started (10 s interval)
+2026-09-23 17:59:04,608 [INFO] Apex started — Supabase storage, dual-loop active
+2026-09-23 17:59:10,253 [INFO] [PRICE] tick — 32/32 symbols refreshed
+2026-09-23 17:59:50,337 [INFO] State loaded from apex_dual_state.json
+2026-09-23 17:59:50,339 [INFO] Price updater thread started (10 s interval)
+2026-09-23 17:59:50,340 [INFO] Apex started — Supabase storage, dual-loop active
+2026-09-23 18:06:21,071 [INFO] State loaded from apex_dual_state.json
+2026-09-23 18:06:21,075 [INFO] Price updater thread started (10 s interval)
+2026-09-23 18:06:21,075 [INFO] Apex started — Supabase storage, dual-loop active
+2026-09-23 18:06:26,898 [INFO] [PRICE] tick — 32/32 symbols refreshed
+2026-09-23 18:06:59,183 [INFO] State loaded from apex_dual_state.json
+2026-09-23 18:06:59,186 [INFO] Price updater thread started (10 s interval)
+2026-09-23 18:06:59,186 [INFO] Apex started — Supabase storage, dual-loop active
+2026-09-23 18:20:27,675 [INFO] State loaded from apex_dual_state.json
+2026-09-23 18:20:27,677 [INFO] Price updater thread started (10 s interval)
+2026-09-23 18:20:27,677 [INFO] Apex started — Supabase storage, dual-loop active
+2026-09-23 18:20:31,432 [INFO] [PRICE] tick — 32/32 symbols refreshed
+2026-09-23 18:23:24,428 [INFO] State loaded from apex_dual_state.json
+2026-09-23 18:23:24,430 [INFO] Price updater thread started (10 s interval)
+2026-09-23 18:23:24,430 [INFO] Apex started — Supabase storage, dual-loop active
+2026-09-23 18:23:28,526 [INFO] [PRICE] tick — 32/32 symbols refreshed
+2026-09-23 18:24:36,857 [INFO] State loaded from apex_dual_state.json
+2026-09-23 18:24:36,858 [INFO] Price updater thread started (10 s interval)
+2026-09-23 18:24:36,859 [INFO] Apex started — Supabase storage, dual-loop active
+2026-09-23 18:24:41,088 [INFO] [PRICE] tick — 32/32 symbols refreshed
+2026-09-23 18:29:23,572 [INFO] State loaded from apex_dual_state.json
+2026-09-23 18:29:23,574 [INFO] Price updater thread started (10 s interval)
+2026-09-23 18:29:23,574 [INFO] Apex started — Supabase storage, dual-loop active
+2026-09-23 18:29:26,855 [INFO] [PRICE] tick — 32/32 symbols refreshed
+2026-09-23 18:30:07,423 [INFO] State loaded from apex_dual_state.json
+2026-09-23 18:30:07,424 [INFO] Price updater thread started (10 s interval)
+2026-09-23 18:30:07,424 [INFO] Apex started — Supabase storage, dual-loop active
+2026-09-23 18:30:10,705 [INFO] [PRICE] tick — 32/32 symbols refreshed
+2026-09-23 22:13:59,123 [INFO] State loaded from apex_dual_state.json
+2026-09-23 22:13:59,126 [INFO] Price updater thread started (10 s interval)
+2026-09-23 22:13:59,127 [INFO] Apex started — Supabase storage, dual-loop active
+2026-09-23 22:14:08,667 [INFO] [PRICE] tick — 32/32 symbols refreshed
+2026-09-23 22:14:25,585 [INFO] State loaded from apex_dual_state.json
+2026-09-23 22:14:25,588 [INFO] Price updater thread started (10 s interval)
+2026-09-23 22:14:25,588 [INFO] Apex started — Supabase storage, dual-loop active
+2026-09-23 22:23:55,465 [INFO] State loaded from apex_dual_state.json
+2026-09-23 22:23:55,469 [INFO] Price updater thread started (10 s interval)
+2026-09-23 22:23:55,470 [INFO] Apex started — Supabase storage, dual-loop active
+2026-09-23 22:24:00,494 [INFO] [PRICE] tick — 32/32 symbols refreshed
+2026-09-23 22:24:14,422 [INFO] State loaded from apex_dual_state.json
+2026-09-23 22:24:14,424 [INFO] Price updater thread started (10 s interval)
+2026-09-23 22:24:14,425 [INFO] Apex started — Supabase storage, dual-loop active
+2026-09-23 22:32:32,978 [INFO] State loaded from apex_dual_state.json
+2026-09-23 22:32:32,980 [INFO] Price updater thread started (10 s interval)
+2026-09-23 22:32:32,980 [INFO] Apex started — Supabase storage, dual-loop active
+2026-09-23 22:32:37,549 [INFO] [PRICE] tick — 32/32 symbols refreshed
+2026-09-23 22:33:01,242 [INFO] State loaded from apex_dual_state.json
+2026-09-23 22:33:01,244 [INFO] Price updater thread started (10 s interval)
+2026-09-23 22:33:01,246 [INFO] Apex started — Supabase storage, dual-loop active
+2026-09-23 22:37:59,235 [INFO] State loaded from apex_dual_state.json
+2026-09-23 22:37:59,237 [INFO] Price updater thread started (10 s interval)
+2026-09-23 22:37:59,239 [INFO] Apex started — Supabase storage, dual-loop active
+2026-09-23 22:38:03,956 [INFO] [PRICE] tick — 32/32 symbols refreshed
+2026-09-23 23:00:55,828 [INFO] State loaded from apex_dual_state.json
+2026-09-23 23:00:55,830 [INFO] Price updater thread started (10 s interval)
+2026-09-23 23:00:55,832 [INFO] Apex started — Supabase storage, dual-loop active
+2026-09-23 23:01:01,259 [INFO] [PRICE] tick — 32/32 symbols refreshed
+2026-09-23 23:01:21,651 [INFO] State loaded from apex_dual_state.json
+2026-09-23 23:01:21,652 [INFO] Price updater thread started (10 s interval)
+2026-09-23 23:01:21,653 [INFO] Apex started — Supabase storage, dual-loop active
+2026-09-23 23:12:09,769 [INFO] State loaded from apex_dual_state.json
+2026-09-23 23:12:09,771 [INFO] Price updater thread started (10 s interval)
+2026-09-23 23:12:09,773 [INFO] Apex started — Supabase storage, dual-loop active
+2026-09-23 23:12:14,460 [INFO] [PRICE] tick — 32/32 symbols refreshed
+2026-09-23 23:22:24,032 [INFO] State loaded from apex_dual_state.json
+2026-09-23 23:22:24,034 [INFO] Price updater thread started (10 s interval)
+2026-09-23 23:22:24,035 [INFO] Apex started — Supabase storage, dual-loop active
+2026-09-23 23:22:32,216 [INFO] [PRICE] tick — 32/32 symbols refreshed
+2026-09-23 23:31:27,976 [INFO] State loaded from apex_dual_state.json
+2026-09-23 23:31:27,977 [INFO] Price updater thread started (10 s interval)
+2026-09-23 23:31:27,978 [INFO] Apex started — Supabase storage, dual-loop active
+2026-09-23 23:31:31,305 [INFO] [PRICE] tick — 32/32 symbols refreshed
+2026-09-23 23:35:55,176 [INFO] State loaded from apex_dual_state.json
+2026-09-23 23:35:55,178 [INFO] Price updater thread started (10 s interval)
+2026-09-23 23:35:55,179 [INFO] Apex started — Supabase storage, dual-loop active
+2026-09-23 23:35:58,300 [INFO] [PRICE] tick — 32/32 symbols refreshed
+2026-09-23 23:37:39,330 [INFO] State loaded from apex_dual_state.json
+2026-09-23 23:37:39,331 [INFO] Price updater thread started (10 s interval)
+2026-09-23 23:37:39,332 [INFO] Apex started — Supabase storage, dual-loop active
+2026-09-23 23:37:43,253 [INFO] [PRICE] tick — 32/32 symbols refreshed
