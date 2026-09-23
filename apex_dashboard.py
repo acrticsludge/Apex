@@ -1088,7 +1088,7 @@ def fetch_cycle_data(watchlist: list, prices: dict, market_key: str = "india") -
     wl_prices = {s: prices[s] for s in watchlist if s in prices}
     return analyses, wl_prices
 
-def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int):
+def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int, jev_decisions_per_market: dict | None = None):
     """Phase 2: apply decisions to state (must be called with _lock held)."""
     mstate       = _state[market_key]
     mtc          = minutes_to_close(market_key)
@@ -1109,6 +1109,102 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int):
               f"{len(analyses)} symbols  "
               f"{len(mstate['positions'])} positions open  "
               f"cash={mstate['cash']:.0f}")
+
+    # ── JEV Halt Gate: Check if new entries should be halted ──────────────────────
+    if _JEV_AVAILABLE and cfg.get("jev_risk_enabled", True):
+        jev_decisions = jev_decisions_per_market.get(market_key)
+        if jev_decisions and _jev.should_halt(jev_decisions):
+            think_log("RISK", f"JEV HALT: halt_new_buys={jev_decisions['halt_new_buys']['noul']:.2f} — no new entries this cycle", market_key.upper())
+            apex_log.info(f"[{market_key.upper()}] JEV HALT triggered — skipping new entries")
+            # Still process exits (SL/TP/trailing/EOD) but skip new entries
+            pv = portfolio_value(mstate, prices)
+            if pv > mstate.get("peak_portfolio", pv):
+                mstate["peak_portfolio"] = pv
+            
+            # EOD exit logic still runs
+            if mtc is not None:
+                for sym in list(mstate["positions"].keys()):
+                    pos = mstate["positions"].get(sym)
+                    if not pos:
+                        continue
+                    price = prices.get(sym) or get_price(sym)
+                    if price is None:
+                        continue
+                    is_short = pos.get("side", "long") == "short"
+                    pnl = ((pos["entry"] - price) * pos["qty"] if is_short
+                           else (price - pos["entry"]) * pos["qty"])
+                    if exit_min < mtc <= harvest_min and pnl > 0:
+                        think_log("EXIT", f"{sym} EOD HARVEST: {mtc:.0f}m to close  P&L={pnl:+.0f}", sym)
+                        if is_short:
+                            paper_cover(sym, pos["qty"], prices, mstate, f"EOD PROFIT ({mtc:.0f}m to close)")
+                        else:
+                            paper_sell(sym, pos["qty"], prices, mstate, f"EOD PROFIT ({mtc:.0f}m to close)")
+                        apex_log.info(f"EOD profit harvest: {sym}  P&L={pnl:+.0f}  {mtc:.0f}m left")
+                    elif mtc <= exit_min:
+                        tag = "EOD EXIT" if pnl >= 0 else "EOD CUT LOSS"
+                        think_log("EXIT", f"{sym} EOD FORCE EXIT ({tag}): {mtc:.0f}m to close  P&L={pnl:+.0f}", sym)
+                        if is_short:
+                            paper_cover(sym, pos["qty"], prices, mstate, f"{tag} ({mtc:.0f}m to close)")
+                        else:
+                            paper_sell(sym, pos["qty"], prices, mstate, f"{tag} ({mtc:.0f}m to close)")
+                        apex_log.info(f"EOD force exit: {sym}  P&L={pnl:+.0f}  {mtc:.0f}m left")
+            
+            # Trailing stop updates
+            for sym in list(mstate["positions"].keys()):
+                pos = mstate["positions"].get(sym)
+                if pos is None or prices.get(sym) is None:
+                    continue
+                price = prices[sym]
+                is_short = pos.get("side", "long") == "short"
+                if cfg.get("trailing_stop_enabled", True) and pos.get("atr", 0) > 0:
+                    act_mult = cfg.get("trailing_activation_mult", 1.0)
+                    dist_mult = _jev.get_trailing_dist_mult(cfg.get("trailing_dist_mult", 1.5), jev_decisions)
+                    if not is_short:
+                        activation = pos["entry"] + pos["atr"] * act_mult
+                        if price >= activation:
+                            pos["running_high"] = max(pos.get("running_high", price), price)
+                            new_sl = pos["running_high"] - pos["atr"] * dist_mult
+                            if new_sl > pos["stop_loss"]:
+                                old_sl = pos["stop_loss"]
+                                pos["stop_loss"] = round(new_sl, 2)
+                                think_log("EXIT", f"{sym} TRAIL ↑ SL {old_sl:.2f}→{pos['stop_loss']:.2f} running_high={pos['running_high']:.2f}", sym)
+                    else:
+                        activation = pos["entry"] - pos["atr"] * act_mult
+                        if price <= activation:
+                            pos["running_low"] = min(pos.get("running_low", price), price)
+                            new_sl = pos["running_low"] + pos["atr"] * dist_mult
+                            if new_sl < pos["stop_loss"]:
+                                old_sl = pos["stop_loss"]
+                                pos["stop_loss"] = round(new_sl, 2)
+                                think_log("EXIT", f"{sym} TRAIL ↓ SL {old_sl:.2f}→{pos['stop_loss']:.2f} running_low={pos['running_low']:.2f}", sym)
+                
+                # SL/TP checks
+                for sym in list(mstate["positions"].keys()):
+                    pos = mstate["positions"].get(sym)
+                    if pos is None or prices.get(sym) is None:
+                        continue
+                    price = prices[sym]
+                    is_short = pos.get("side", "long") == "short"
+                    if not is_short:
+                        sl_hit = price <= pos["stop_loss"]
+                        tp_hit = price >= pos["target"]
+                    else:
+                        sl_hit = price >= pos["stop_loss"]
+                        tp_hit = price <= pos["target"]
+                    if sl_hit:
+                        think_log("EXIT", f"{sym} STOP LOSS hit @ {price:.2f}  SL was {pos['stop_loss']:.2f}", sym)
+                        if is_short:
+                            paper_cover(sym, pos["qty"], prices, mstate, "STOP LOSS")
+                        else:
+                            paper_sell(sym, pos["qty"], prices, mstate, "STOP LOSS")
+                    elif tp_hit:
+                        think_log("EXIT", f"{sym} TARGET HIT @ {price:.2f}  T was {pos['target']:.2f}", sym)
+                        if is_short:
+                            paper_cover(sym, pos["qty"], prices, mstate, "TARGET HIT")
+                        else:
+                            paper_sell(sym, pos["qty"], prices, mstate, "TARGET HIT")
+            
+            return
 
     # ── 1. Update peak portfolio (prerequisite for drawdown kill-switch) ──────
     pv = portfolio_value(mstate, prices)
@@ -1649,20 +1745,19 @@ def agent_loop():
         # Refresh index trend once per cycle (no lock needed — floats are atomic)
         _refresh_index_trend()
 
-        # ── JEV Shadow Mode: Log decisions once per cycle per open market ─────────
+        # ── JEV Risk Gates: Apply per-market config overrides ──────────────────────
+        jev_decisions_per_market = {}
         if _JEV_AVAILABLE and cfg.get("jev_enabled", True):
-            # Build market context for JEV
             market_context = {
                 "spy_trend_pct": _index_trend.get("india", 0.0) if india_open else _index_trend.get("us", 0.0),
-                "vix": 20.0,  # TODO: fetch real VIX
-                "breadth": 0.5,  # TODO: fetch real breadth
+                "vix": 20.0,
+                "breadth": 0.5,
             }
             
             for market_key, is_open in [("india", india_open), ("us", us_open)]:
                 if not is_open:
                     continue
                 try:
-                    # Get portfolio state for this market
                     with _lock:
                         mstate = _state.get(market_key, {})
                         portfolio_ctx = {
@@ -1672,10 +1767,14 @@ def agent_loop():
                             "daily_pnl_pct": mstate.get("realised_pnl", 0.0) / max(mstate.get("session_start_cash", 1.0), 1.0),
                         }
                     
-                    # Call JEV for system-level decisions (regime, trend, stress, halt)
                     jev_decisions = _jev.get_system_decisions(market_key, portfolio_ctx, market_context)
                     
                     if jev_decisions:
+                        jev_decisions_per_market[market_key] = jev_decisions
+                        
+                        # Apply JEV gates to config for this market
+                        _jev.apply_jev_gates(cfg, jev_decisions)
+                        
                         # Log each JEV decision to think buffer
                         regime = jev_decisions["regime"]
                         think_log("JEV", 
@@ -1701,10 +1800,12 @@ def agent_loop():
                         apex_log.info(
                             f"[JEV] {market_key.upper()} regime={regime['choice']} "
                             f"trend={trend['score']:.2f} stress={stress['score']:.2f} "
-                            f"halt={halt['noul']:.2f}"
+                            f"halt={halt['noul']:.2f} → risk_per_trade={cfg['risk_per_trade']:.4f} "
+                            f"max_pos={cfg.get(f'{market_key}_max_positions', 4)} "
+                            f"open_window={cfg.get('open_filter_min', 15)}m"
                         )
                 except (requests.RequestException, ValueError, KeyError) as e:
-                    apex_log.warning(f"[JEV] Shadow logging failed for {market_key}: {e}")
+                    apex_log.warning(f"[JEV] Risk gates failed for {market_key}: {e}")
 
         if india_open:
             if not _agent["running"]:
@@ -1717,7 +1818,7 @@ def agent_loop():
                 f"prices={len(india_prices)}"
             )
             with _lock:
-                apply_cycle("india", india_analyses, india_prices, cfg["india_max_positions"])
+                apply_cycle("india", india_analyses, india_prices, cfg["india_max_positions"], jev_decisions_per_market)
                 _signals["india"]        = india_analyses
                 _signals["india_prices"] = india_prices
         else:
@@ -1734,7 +1835,7 @@ def agent_loop():
                 f"prices={len(us_prices)}"
             )
             with _lock:
-                apply_cycle("us", us_analyses, us_prices, cfg["us_max_positions"])
+                apply_cycle("us", us_analyses, us_prices, cfg["us_max_positions"], jev_decisions_per_market)
                 _signals["us"]        = us_analyses
                 _signals["us_prices"] = us_prices
         else:

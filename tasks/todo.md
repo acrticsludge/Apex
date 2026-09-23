@@ -136,69 +136,69 @@
 
 ## Phase 2: Risk Gates
 
-- [ ] **Task 11**: Implement `apply_jev_gates(cfg, jev)` — returns modified config dict
+- [x] **Task 11**: Implement `apply_jev_gates(cfg, jev)` — returns modified config dict
   - **Acceptance criteria:**
-    - [ ] Pure function: input cfg + jev → output cfg (no mutation)
-    - [ ] Applies regime scaling (risk_mult, pos_delta, sl_mult)
-    - [ ] Applies portfolio stress scaling (risk_reduction)
-    - [ ] Returns new dict; original unchanged
+    - [x] Pure function: input cfg + jev → output cfg (no mutation)
+    - [x] Applies regime scaling (risk_mult, pos_delta, sl_mult)
+    - [x] Applies portfolio stress scaling (risk_reduction)
+    - [x] Returns new dict; original unchanged
   - **Verification:**
-    - [ ] `pytest tests/test_jev_gates.py::test_apply_jev_gates -v` passes
-    - [ ] `pytest tests/test_jev_gates.py::test_regime_scaling -v` passes
+    - [x] `pytest tests/test_jev_gates.py::test_apply_jev_gates -v` passes
+    - [x] `pytest tests/test_jev_gates.py::test_regime_scaling -v` passes
   - **Dependencies:** Task 04, Task 05
   - **Files:** `apex_jev.py`
 
-- [ ] **Task 12**: Pre-trade halt gate: `if halt_new_buys.noul > 0.8: return` in `apply_cycle()`
+- [x] **Task 12**: Pre-trade halt gate: `if halt_new_buys.noul > 0.8: return` in `apply_cycle()`
   - **Acceptance criteria:**
-    - [ ] Check at start of `apply_cycle()` before any entry logic
-    - [ ] Logs `think_log("RISK", "JEV halt triggered")` when triggered
-    - [ ] Respects `jev_halt_noul_threshold` config
+    - [x] Check at start of `apply_cycle()` before any entry logic
+    - [x] Logs `think_log("RISK", "JEV halt triggered")` when triggered
+    - [x] Respects `jev_halt_noul_threshold` config
   - **Verification:**
-    - [ ] `pytest tests/test_jev_gates.py::test_halt_gate -v` passes
+    - [x] `pytest tests/test_jev_gates.py::test_halt_gate -v` passes
     - [ ] Manual: inject high halt_noul → no new entries this cycle
   - **Dependencies:** Task 11
   - **Files:** `apex_dashboard.py`
 
-- [ ] **Task 13**: Graduated daily loss limit: stress 0-1→5%, 1-2→3%, 2-3→1.5%, 3+→0.5%
+- [x] **Task 13**: Graduated daily loss limit: stress 0-1→5%, 1-2→3%, 2-3→1.5%, 3+→0.5%
   - **Acceptance criteria:**
-    - [ ] Replaces static `daily_loss_limit_pct` in `apply_cycle()` line 1259
-    - [ ] Uses `portfolio_stress.score` to select tier
-    - [ ] Logs effective limit: `think_log("RISK", f"Daily loss limit: {limit:.1%}")`
+    - [x] Replaces static `daily_loss_limit_pct` in `apply_cycle()` line 1259
+    - [x] Uses `portfolio_stress.score` to select tier
+    - [x] Logs effective limit: `think_log("RISK", f"Daily loss limit: {limit:.1%}")`
   - **Verification:**
-    - [ ] `pytest tests/test_jev_gates.py::test_graduated_daily_loss -v` passes
+    - [x] `pytest tests/test_jev_gates.py::test_graduated_daily_loss -v` passes
     - [ ] Manual: stress=2.5 → limit=1.5%
   - **Dependencies:** Task 11
   - **Files:** `apex_dashboard.py`
 
-- [ ] **Task 14**: Graduated max drawdown: stress 0-1→8%, 1-2→6%, 2-3→4%, 3+→2%
+- [x] **Task 14**: Graduated max drawdown: stress 0-1→8%, 1-2→6%, 2-3→4%, 3+→2%
   - **Acceptance criteria:**
-    - [ ] Replaces static `max_drawdown_pct` in `apply_cycle()` line 1258
-    - [ ] Uses same stress tier as Task 13
-    - [ ] Logs effective limit
+    - [x] Replaces static `max_drawdown_pct` in `apply_cycle()` line 1258
+    - [x] Uses same stress tier as Task 13
+    - [x] Logs effective limit
   - **Verification:**
-    - [ ] `pytest tests/test_jev_gates.py::test_graduated_drawdown -v` passes
+    - [x] `pytest tests/test_jev_gates.py::test_graduated_drawdown -v` passes
     - [ ] Manual: stress=3.2 → limit=2%
   - **Dependencies:** Task 11
   - **Files:** `apex_dashboard.py`
 
-- [ ] **Task 15**: Dynamic max_positions: bullish +2, bearish -2, crisis -50%
+- [x] **Task 15**: Dynamic max_positions: bullish +2, bearish -2, crisis -50%
   - **Acceptance criteria:**
-    - [ ] Applied in `apply_cycle()` before entry loop
-    - [ ] `max_pos_eff = max_pos + pos_delta` (min 1)
-    - [ ] Logs effective max: `think_log("RISK", f"Max positions: {max_pos_eff}")`
+    - [x] Applied in `apply_cycle()` before entry loop
+    - [x] `max_pos_eff = max_pos + pos_delta` (min 1)
+    - [x] Logs effective max: `think_log("RISK", f"Max positions: {max_pos_eff}")`
   - **Verification:**
-    - [ ] `pytest tests/test_jev_gates.py::test_dynamic_max_pos -v` passes
+    - [x] `pytest tests/test_jev_gates.py::test_dynamic_max_pos -v` passes
     - [ ] Manual: regime=bullish → max_pos +2
   - **Dependencies:** Task 11
   - **Files:** `apex_dashboard.py`
 
-- [ ] **Task 16**: Open window adjustment: crisis 30min, bullish 5min, default 15min
+- [x] **Task 16**: Open window adjustment: crisis 30min, bullish 5min, default 15min
   - **Acceptance criteria:**
-    - [ ] Modifies `open_filter_min` in `apply_cycle()` line 1278
-    - [ ] Crisis: 30 min; Bullish: 5 min; Bearish/Choppy/Default: 15 min
-    - [ ] Logs effective window
+    - [x] Modifies `open_filter_min` in `apply_cycle()` line 1278
+    - [x] Crisis: 30 min; Bullish: 5 min; Bearish/Choppy/Default: 15 min
+    - [x] Logs effective window
   - **Verification:**
-    - [ ] `pytest tests/test_jev_gates.py::test_open_window_adjustment -v` passes
+    - [x] `pytest tests/test_jev_gates.py::test_open_window_adjustment -v` passes
     - [ ] Manual: regime=crisis → open_filter_min=30
   - **Dependencies:** Task 11
   - **Files:** `apex_dashboard.py`
