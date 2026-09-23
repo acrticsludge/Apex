@@ -83,7 +83,17 @@ def _build_observation(ticker: str) -> tuple[np.ndarray, float, float] | None:
         raw.columns = [str(c).lower() for c in raw.columns]
         raw = raw.dropna()
 
-        frame = add_technical_indicators(raw)
+        # Get JEV trend_strength for this ticker (from dashboard cache)
+        jev_trend_strength = None
+        try:
+            from apex_dashboard import _signals
+            jev_decisions = _signals.get("jev_decisions", {}).get("india") or _signals.get("jev_decisions", {}).get("us")
+            if jev_decisions and "trend_strength" in jev_decisions:
+                jev_trend_strength = jev_decisions["trend_strength"]["score"]
+        except Exception:
+            pass
+        
+        frame = add_technical_indicators(raw, jev_trend_strength=jev_trend_strength)
 
         if settings.enable_vwap:
             from trading_agent.data.vwap_engine import add_daily_vwap

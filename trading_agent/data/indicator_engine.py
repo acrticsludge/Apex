@@ -6,7 +6,7 @@ import pandas as pd
 import pandas_ta as ta
 
 
-def add_technical_indicators(price_frame: pd.DataFrame) -> pd.DataFrame:
+def add_technical_indicators(price_frame: pd.DataFrame, jev_trend_strength: float | None = None) -> pd.DataFrame:
     """
     Add the required technical indicators to an OHLCV dataframe.
 
@@ -37,5 +37,9 @@ def add_technical_indicators(price_frame: pd.DataFrame) -> pd.DataFrame:
     # Volatility and participation
     frame["atr_14"] = ta.atr(frame["high"], frame["low"], frame["close"], length=14)
     frame["obv"] = ta.obv(frame["close"], frame["volume"])
+
+    # JEV trend strength (Task 21)
+    if jev_trend_strength is not None:
+        frame["jev_trend_strength"] = jev_trend_strength
 
     return frame

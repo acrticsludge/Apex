@@ -211,6 +211,7 @@ class Settings:
             "atr_14",
             "obv",
             "sentiment",
+            "jev_trend_strength",
         ]
     )
 
