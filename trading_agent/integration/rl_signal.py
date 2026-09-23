@@ -171,6 +171,22 @@ def get_rl_signal(symbol: str, live_price: float) -> dict | None:
         return None
     obs, raw_atr, trend_5d_pct = result
 
+    # Fetch JEV regime decisions for this symbol (Task 29, 30)
+    jev_regime = "bullish"
+    jev_trend_strength = 0.0
+    jev_action = "hold"
+    jev_action_conf = 0.0
+    try:
+        from apex_dashboard import _signals
+        jev_decisions = _signals.get("jev_decisions", {}).get("india") or _signals.get("jev_decisions", {}).get("us")
+        if jev_decisions:
+            jev_regime = jev_decisions.get("regime", {}).get("choice", "bullish")
+            jev_trend_strength = jev_decisions.get("trend_strength", {}).get("score", 0.0)
+            jev_action = jev_decisions.get("position_action", {}).get("choice", "hold")
+            jev_action_conf = jev_decisions.get("position_action", {}).get("confidence", 0.0)
+    except Exception:
+        pass
+
     try:
         import torch
 
@@ -187,17 +203,23 @@ def get_rl_signal(symbol: str, live_price: float) -> dict | None:
         margin   = sorted_p[-1] - sorted_p[-2]
         extremes = _get_extreme_features(obs, _feature_columns)
 
+        # Task 29: Regime-aware entropy/margin gating
+        entropy_threshold = math.log(3) * 0.90
+        margin_threshold = 0.08
+        if jev_regime == "crisis":
+            entropy_threshold *= 0.8  # Stricter in crisis
+        elif jev_regime == "bullish":
+            margin_threshold *= 0.9   # Looser in bullish
+        
         # Gate: skip signals where the model is uncertain
-        if entropy > math.log(3) * 0.90 or margin < 0.08:
+        if entropy > entropy_threshold or margin < margin_threshold:
             return None
 
-        # Scale confidence/score by conviction — a 35% plurality BUY is not the same
-        # as a 90% BUY. Normalize top_prob out of [1/3 (random), 1.0].
+        # Scale confidence/score by conviction
         rand_floor = 1.0 / 3.0
         norm_prob  = min(1.0, max(0.0, (top_prob - rand_floor) / (1.0 - rand_floor)))
 
-        # Trend alignment: how well the last 5 trading days confirm the signal.
-        # ±3 % move = full alignment/opposition; clipped to [-1, 1].
+        # Trend alignment
         if action == 1:    # uptrend confirms BUY
             trend_align = max(-1.0, min(1.0, trend_5d_pct / 3.0))
         elif action == 2:  # downtrend confirms SELL
@@ -205,13 +227,17 @@ def get_rl_signal(symbol: str, live_price: float) -> dict | None:
         else:
             trend_align = 0.0
 
-        # Base score from model conviction ± up to 12 pts from trend alignment.
-        # confidence uses the same (score+100)/2 formula as analyse() so values
-        # are directly comparable across RL and rule-based modes.
+        # Task 30: JEV action → RL score mapping
+        jev_score_delta = 0
+        if jev_action_conf >= 0.65:  # Only use JEV action if confident
+            jev_score_map = {"buy": 60, "add": 30, "hold": 0, "trim": -30, "exit": -60}
+            jev_score_delta = jev_score_map.get(jev_action, 0)
+
+        # Base score from model conviction ± up to 12 pts from trend alignment ± JEV delta
         if action == 1:   # BUY
-            score = round(max(0,    min(100,  40 + norm_prob * 60.0 + trend_align * 12.0)))
+            score = round(max(0,    min(100,  40 + norm_prob * 60.0 + trend_align * 12.0 + jev_score_delta)))
         elif action == 2: # SELL
-            score = round(max(-100, min(0,  -(40 + norm_prob * 60.0 + trend_align * 12.0))))
+            score = round(max(-100, min(0,  -(40 + norm_prob * 60.0 + trend_align * 12.0 + jev_score_delta))))
         else:             # HOLD
             score = 0
 
@@ -226,7 +252,7 @@ def get_rl_signal(symbol: str, live_price: float) -> dict | None:
             "price":           live_price,
             "score":           score,
             "confidence":      confidence,
-            "signals":         {"RL": {"value": f"{label} {top_prob:.0%} trend={trend_5d_pct:+.1f}%", "signal": label}},
+            "signals":         {"RL": {"value": f"{label} {top_prob:.0%} trend={trend_5d_pct:+.1f}% jev={jev_regime}", "signal": label}},
             "rsi":             50.0,
             "bb_upper":        live_price * 1.05,
             "bb_lower":        live_price * 0.95,
@@ -244,6 +270,10 @@ def get_rl_signal(symbol: str, live_price: float) -> dict | None:
             "rl_extremes":     extremes,
             "trend_5d_pct":    round(trend_5d_pct, 2),
             "trend_aligned":   trend_align > 0,
+            "jev_regime":      jev_regime,
+            "jev_trend_strength": jev_trend_strength,
+            "jev_action":      jev_action,
+            "jev_action_conf": jev_action_conf,
         }
 
     except Exception as exc:

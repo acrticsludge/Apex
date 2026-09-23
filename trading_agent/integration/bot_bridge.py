@@ -28,6 +28,7 @@ class PredictionRequest(BaseModel):
     """Schema for external trading bots that want an action from the PPO model."""
 
     observation: list[float] = Field(..., description="Normalized feature vector in saved feature order.")
+    jev_features: list[float] | None = Field(None, description="Optional JEV features (8 dims: regime_bullish, regime_bearish, regime_choppy, regime_crisis, trend_strength, news_bullishness, portfolio_stress, halt_noul).")
 
 
 class PredictionResponse(BaseModel):
@@ -35,6 +36,7 @@ class PredictionResponse(BaseModel):
 
     action: int
     confidence: float
+    jev_regime_probs: dict[str, float] | None = Field(None, description="JEV regime probabilities if JEV features provided.")
 
 
 class RetrainRequest(BaseModel):
@@ -83,19 +85,33 @@ def load_model_bundle(current_settings: Settings = settings) -> bool:
     return True
 
 
-def _predict_action_and_confidence(observation: list[float]) -> tuple[int, float]:
+def _predict_action_and_confidence(observation: list[float]) -> tuple[int, float, dict[str, float] | None]:
     """Run a forward pass through the PPO policy and expose action probabilities."""
     if bridge_state.model is None:
         raise HTTPException(status_code=503, detail="No trained model is loaded.")
 
-    expected_size = len(bridge_state.feature_columns)
-    if expected_size and len(observation) != expected_size:
+    # Base feature size (without JEV features)
+    base_feature_size = len(bridge_state.feature_columns) - 8  # 30 - 8 = 22
+    
+    if len(observation) == expected_size + 8:
+        # Full observation with JEV features
+        base_observation = observation[:base_feature_size]
+        jev_features = observation[base_feature_size:]
+    elif len(observation) == expected_size:
+        # Full observation without JEV features (backward compatible)
+        base_observation = observation
+        jev_features = None
+    elif len(observation) == base_feature_size:
+        # Base observation only
+        base_observation = observation
+        jev_features = None
+    else:
         raise HTTPException(
             status_code=400,
-            detail=f"Observation length mismatch. Expected {expected_size} features, received {len(observation)}.",
+            detail=f"Observation length mismatch. Expected {base_feature_size} (base) or {expected_size} (with JEV), received {len(observation)}.",
         )
 
-    observation_array = np.asarray(observation, dtype=np.float32).reshape(1, -1)
+    observation_array = np.asarray(base_observation, dtype=np.float32).reshape(1, -1)
     obs_tensor, _ = bridge_state.model.policy.obs_to_tensor(observation_array)
 
     with torch.no_grad():
@@ -104,7 +120,18 @@ def _predict_action_and_confidence(observation: list[float]) -> tuple[int, float
 
     action = int(np.argmax(probabilities))
     confidence = float(probabilities[action])
-    return action, confidence
+    
+    # Return JEV regime probabilities if available
+    jev_regime_probs = None
+    if jev_features is not None and len(jev_features) >= 4:
+        jev_regime_probs = {
+            "bullish": float(jev_features[0]),
+            "bearish": float(jev_features[1]),
+            "choppy": float(jev_features[2]),
+            "crisis": float(jev_features[3]),
+        }
+    
+    return action, confidence, jev_regime_probs
 
 
 def _retrain_worker(
@@ -151,12 +178,13 @@ def _startup_load_model() -> None:
 @app.post("/predict", response_model=PredictionResponse)
 def predict(request: PredictionRequest) -> PredictionResponse:
     """Accept a normalized observation vector and return the PPO action."""
-    action, confidence = _predict_action_and_confidence(request.observation)
+    action, confidence, jev_regime_probs = _predict_action_and_confidence(request.observation)
     bridge_state.last_prediction = {
         "action": action,
         "confidence": confidence,
+        "jev_regime_probs": jev_regime_probs,
     }
-    return PredictionResponse(action=action, confidence=confidence)
+    return PredictionResponse(action=action, confidence=confidence, jev_regime_probs=jev_regime_probs)
 
 
 @app.get("/status")
@@ -170,6 +198,11 @@ def status() -> dict[str, Any]:
         "last_prediction": bridge_state.last_prediction,
         "retraining": bridge_state.retraining,
         "last_retrain": bridge_state.last_retrain,
+        "jev_version": "1.0",
+        "jev_feature_columns": [
+            "jev_regime_bullish", "jev_regime_bearish", "jev_regime_choppy", "jev_regime_crisis",
+            "jev_trend_strength", "jev_news_bullishness", "jev_portfolio_stress", "jev_halt_noul"
+        ],
     }
 
 
