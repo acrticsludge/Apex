@@ -37,9 +37,12 @@ joblib==1.5.2
 pandas-ta==0.4.71b0
 scikit-learn==1.7.2
 stable-baselines3==2.9.0
-torch==2.8.0
+torch==2.14.0
 vaderSentiment==3.3.2
 
 # ── Standalone RL bridge service (not started by the dashboard) ────────────
-fastapi==0.118.3
+# fastapi 0.118.x caps starlette<0.49.0, which forces a starlette carrying nine
+# advisories. 0.141.1 lifts the cap, so starlette can reach a patched 1.x.
+fastapi==0.141.1
+starlette==1.7.0
 uvicorn==0.37.0

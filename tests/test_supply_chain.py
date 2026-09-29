@@ -159,3 +159,34 @@ def test_the_file_has_no_obviously_conflicting_floor_and_ceiling():
     for name, entry in pins.items():
         assert not entry.rstrip().endswith(".*"), f"{entry} is a wildcard pin"
     assert pins, "expected exact pins to validate"
+
+
+def test_pins_are_not_known_vulnerable():
+    """The first CI run reported 20 advisories in versions pinned in the previous
+    commit. This pins the floors those advisories were fixed at, so a future
+    pin edit that reintroduces one is caught here rather than in an audit log
+    nobody reads.
+    """
+    floors = {
+        "torch": (2, 14, 0),        # PYSEC-2025-193/194/195/203/204/206, -2026-2286
+        "starlette": (1, 3, 1),     # PYSEC-2026-161/248/249/1942/2280/2281
+    }
+    for name, floor in floors.items():
+        pin = _pinned(name)
+        assert pin is not None, f"{name} must be exactly pinned so it can be checked"
+        assert _tuple(pin) >= floor, (
+            f"{name}=={pin} is below {floor[0]}.{floor[1]}.{floor[2]}, which carries "
+            f"known advisories"
+        )
+
+
+def test_fastapi_does_not_cap_starlette_below_its_fix():
+    """fastapi 0.118.x pins starlette<0.49.0, which is what forced the
+    vulnerable starlette into the tree. Holding the cap below 1.x reintroduces
+    every starlette advisory regardless of the explicit pin."""
+    pin = _pinned("fastapi")
+    assert pin is not None, "fastapi must be exactly pinned"
+    ver = _tuple(pin)
+    assert not (ver[0] == 0 and ver[1] < 141), (
+        f"fastapi {pin} caps starlette below the patched 1.x line"
+    )

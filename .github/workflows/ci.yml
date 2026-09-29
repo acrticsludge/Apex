@@ -88,11 +88,27 @@ jobs:
           cache-dependency-path: requirements.txt
 
       - name: Known-vulnerability check
+        # PYSEC-2026-139 has no fixed release on any torch version, so it cannot
+        # be cleared by a bump and must not mask the rest. Every other advisory
+        # fails the job; this one is reported and allowed.
         run: |
           pip install -r requirements.txt
           pip install pip-audit
-          pip-audit --requirement requirements.txt --strict || \
-            echo "::warning::pip-audit reported advisories (see log)"
+          set +e
+          pip-audit --requirement requirements.txt --strict --format columns > /tmp/audit.txt 2>&1
+          code=$?
+          set -e
+          cat /tmp/audit.txt
+          unfixed=$(grep -c 'PYSEC-2026-139' /tmp/audit.txt || true)
+          if [ "$code" -ne 0 ]; then
+            remaining=$(grep -E '^[a-zA-Z0-9_-]+ +[0-9]' /tmp/audit.txt | grep -v 'PYSEC-2026-139' || true)
+            if [ -n "$remaining" ]; then
+              echo "::error::fixable advisories remain:"
+              echo "$remaining"
+              exit 1
+            fi
+            echo "::warning::only PYSEC-2026-139 (torch) remains; it has no fixed release. Occurrences: $unfixed"
+          fi
 
   docker:
     name: image builds
