@@ -130,7 +130,13 @@ class Settings:
             "atr_14",
             "obv",
             "sentiment",
-            "jev_trend_strength",
+            # NOTE: jev_trend_strength is deliberately absent. The committed
+            # model and scaler were fitted on 29 columns that do not include it,
+            # and it is not in feature_columns.json. Listing it here meant a
+            # missing columns file produced a 30-column contract, dropna emptied
+            # every frame, and RL inference silently returned None forever.
+            # The live contract is feature_columns.json; see
+            # load_saved_feature_columns, which now fails closed.
         ]
     )
 

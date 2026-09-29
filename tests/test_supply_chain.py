@@ -136,6 +136,19 @@ def test_pandas_ta_pin_is_preserved():
     assert "pandas-ta==0.4.71b0" in REQ.read_text(encoding="utf-8")
 
 
+def test_the_interpreter_floor_matches_pandas_ta():
+    """pandas-ta 0.4.71b0 requires Python >= 3.12, so the whole project does.
+
+    Nothing said so: the Dockerfile and CI both use 3.12, and installing on
+    3.11 fails with an error that points at numpy rather than the real cause.
+    """
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    assert "python:3.12" in dockerfile, "the deploy image must match the floor"
+    ci = CI.read_text(encoding="utf-8")
+    assert 'python-version: "3.12"' in ci, "CI must test the same interpreter the image runs"
+    assert (ROOT / "setup.py").exists()
+
+
 def _pinned(name: str) -> str | None:
     for entry in _requirements():
         if entry.split("==")[0].strip().lower() == name:

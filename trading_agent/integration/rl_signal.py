@@ -66,10 +66,39 @@ def _ensure_loaded() -> bool:
 
         _model = PPO.load(str(settings.best_model_path))
         _feature_columns = load_saved_feature_columns(settings)
+        if not _feature_columns:
+            # The column contract is unknown. Refuse to load rather than infer
+            # against a guessed feature order: a wrong order feeds the policy
+            # plausible-looking nonsense, which is worse than no signal.
+            logger.error(
+                "Refusing to load the RL model: its feature-column contract is "
+                "unreadable, so observations cannot be built in the right order"
+            )
+            _model = None
+            return False
         bind(_model)
 
         if settings.scaler_path.exists():
             _scaler = joblib.load(str(settings.scaler_path))
+
+        expected = _model.observation_space.shape[0]
+        if len(_feature_columns) != expected:
+            logger.error(
+                "Feature-column contract has %d entries but the model takes %d — "
+                "refusing to load", len(_feature_columns), expected,
+            )
+            _model = None
+            return False
+
+        if _scaler is not None:
+            n_scaler = getattr(_scaler, "n_features_in_", len(_feature_columns))
+            if n_scaler != expected:
+                logger.error(
+                    "Scaler was fitted on %d features but the model takes %d — "
+                    "refusing to load", n_scaler, expected,
+                )
+                _model = None
+                return False
 
         logger.info("RL model loaded — %d features", len(_feature_columns))
         return True

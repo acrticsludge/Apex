@@ -136,10 +136,40 @@ def save_preprocessing_artifacts(bundle: PreparedDataBundle, current_settings: S
 
 
 def load_saved_feature_columns(current_settings: Settings = settings) -> list[str]:
-    """Load the saved feature ordering expected by the model bridge."""
-    if current_settings.feature_columns_path.exists():
-        return json.loads(current_settings.feature_columns_path.read_text(encoding="utf-8"))
-    return list(current_settings.feature_columns)
+    """Load the saved feature ordering expected by the model bridge.
+
+    Fails closed. The previous behaviour was to fall back to
+    ``Settings.feature_columns`` when the file was missing, but that default
+    carried ``jev_trend_strength`` — a column the committed model was never
+    fitted on and that no feature function creates. The caller then does
+    ``frame.dropna(subset=columns)``, which empties every row, so
+    ``get_rl_signal`` returned None for every symbol forever and the bot quietly
+    fell back to rule-based trading with nothing but a debug log to show.
+
+    Returning None makes the caller skip the RL path explicitly instead.
+    """
+    path = current_settings.feature_columns_path
+    if path.exists():
+        try:
+            columns = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.error(
+                "feature_columns.json at %s is unreadable (%s) — RL inference "
+                "disabled rather than run against a guessed column order", path, exc,
+            )
+            return None
+        if isinstance(columns, list) and columns:
+            return columns
+        logger.error("feature_columns.json at %s is empty or malformed", path)
+        return None
+
+    logger.error(
+        "No feature_columns.json at %s — the trained model's column order is "
+        "unknown. RL inference is disabled; retraining regenerates this file. "
+        "Falling back to the dataclass default would run the model against a "
+        "different feature set.", path,
+    )
+    return None
 
 
 def prepare_datasets(
