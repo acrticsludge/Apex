@@ -87,15 +87,25 @@ The review's remaining HIGH items, none of which are cosmetic.
 Recorded here so it is not rediscovered as a surprise. None of it is a
 correctness risk; all of it slows the next change.
 
-- [ ] **Decompose `apply_cycle` (322 lines).** The exit side is already split
-      into `eod_exit_pass` / `stop_pass` / `hold_review_pass`. The entry side
-      and the risk gates are still inline. Target: an ordered list of policies,
-      as the exit side now is.
+- [x] ~~**Decompose `apply_cycle` (322 lines).**~~ **Deliberately not done —
+      the plan was wrong.** The exit side was genuinely a list of independent
+      triggers (SL / TP / trailing / EOD), so `run_exit_policies` removed a real
+      duplication and made the ordering explicit. The entry side is one
+      interlocking decision, not a list of policies: the index gate deliberately
+      does *not* short-circuit so a bearish signal can still reach the short
+      branch, the JEV action gate is computed once and consumed by both
+      branches, and the cooldown check carries a state mutation in its `elif`.
+      Extracting a policy layer would thread a dozen locals through a new
+      interface to preserve behaviour exactly — more indirection at the same
+      risk. `apply_cycle`'s remaining problem was never length, it was that the
+      entry decision was untested; that is now fixed, so the refactor is no
+      longer worth its risk. Revisit only if a second caller needs the decision.
 - [ ] **Decompose `apex_dashboard.py` (2,587 lines).** The natural next
       extraction is the trade-execution layer (`execute_buy` / `execute_short` /
       `execute_sell` / `execute_cover`, ~250 lines) and the state layer
       (`load_state` / `save_state` / `_normalize_state`, ~200). Both are already
-      boundary-clean.
+      boundary-clean. Higher value than the `apply_cycle` split, because these
+      boundaries are real rather than notional.
 - [ ] **Split `agent_loop`.** Session rotation, JEV gate application and
       persistence could each be a unit. The resilience wrapper is already
       separate.
@@ -108,12 +118,25 @@ correctness risk; all of it slows the next change.
 
 ## Phase 4 — Test and process depth (engineering, ongoing)
 
-- [ ] **Add a real Supabase integration test.** Every persistence test today
-      runs against the JSON fallback. The Supabase path is only exercised in
-      production, which is why the lock/I/O defect could hide there.
-- [ ] **Add coverage for the JEV halt path's entry side.** The exit side has
-      parity tests proving both paths behave identically; the entry side does
-      not.
+- [x] **Add a real Supabase integration test.** Done in
+      `tests/test_supabase_persistence.py` (13 tests). Drives `save_state` /
+      `load_state` / `save_cfg` / `load_cfg` / `_save_rl_decision` against a
+      stub with postgrest's real chainable surface and its real `APIError`, so
+      the `except` clauses are exercised as they would be in production. Covers
+      the round trip, JSON-safety of the payload, `APEX_ENV` row namespacing, the
+      config whitelist, and four failure modes (failed write falls back to JSON
+      and logs; failed read falls back; missing table survivable; malformed row
+      still yields both markets). The lock is asserted twice — once that
+      Supabase is not called under it, once that the probe would notice if it
+      were. One test is opt-in against a real project via
+      `APEX_TEST_SUPABASE_URL` / `APEX_TEST_SUPABASE_KEY`.
+- [x] **Add coverage for the JEV halt path's entry side.** Done in
+      `tests/test_entry_policies.py` (26 tests), which covers the whole entry
+      decision rather than only halt-path parity: both branches, the index
+      gate's opposite polarity per direction, the RL long bypass, the ADX floor,
+      the re-entry cooldown, and the daily-loss and drawdown kill-switches.
+      The halt path itself returns before any entry work, which the tests
+      confirm — under a halt nothing is entered at all.
 - [ ] **Adopt a lockfile** (`uv.lock` or `pip-compile`) so the transitive graph
       is hash-verified rather than inferred from exact pins. See ADR-005.
 - [ ] **Add mutation testing** on the risk gates. A test that asserts a gate is

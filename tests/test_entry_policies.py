@@ -90,7 +90,7 @@ def entries(dash, monkeypatch):
 
 
 def _cycle(dash, analyses, mstate, prices=None, market="india",
-           max_pos=10, index_pct=0.0, cfg_over=None):
+           max_pos=10, index_pct=0.0, cfg_over=None, decisions=None):
     """Run one cycle and return the state it produced."""
     prices = prices if prices is not None else {a["symbol"]: a["price"] for a in analyses}
     base = dict(dash.cfg)
@@ -100,8 +100,9 @@ def _cycle(dash, analyses, mstate, prices=None, market="india",
             dash.cfg.update(cfg_over)
         with dash._lock:
             dash._state[market] = mstate
+        payload = {market: decisions} if decisions is not None else {}
         with dash._lock:
-            dash.apply_cycle(market, analyses, prices, max_pos, {})
+            dash.apply_cycle(market, analyses, prices, max_pos, payload)
         return dash._state[market]
     finally:
         dash._index_trend[market] = 0.0
@@ -364,3 +365,74 @@ def test_eod_harvest_blocks_new_entries(entries, monkeypatch):
     monkeypatch.setattr(entries, "minutes_to_close", lambda k: 20)
     _cycle(entries, [_a(score=40)], _mstate())
     assert calls == [], f"EOD harvest must block new entries, got {calls}"
+
+
+# ── The JEV halt gate, which sits above the entry decision ───────────────────
+
+# The shape an actual gate publishes. should_halt is stubbed below, but the
+# exit path still reads trend_strength from the same object, so a partial dict
+# raises KeyError before the halt branch is ever reached.
+_GATE = {
+    "regime": {"choice": "normal", "probabilities": {}, "confidence": 0.9},
+    "trend_strength": {"score": 0.0, "probabilities": {}, "confidence": 0.9, "legend": {}},
+    "news_bullishness": {"score": 0, "probabilities": {}, "confidence": 0.9, "legend": {}},
+    "portfolio_stress": {"score": 0, "probabilities": {}, "confidence": 0.9, "legend": {}},
+    "halt_new_buys": {"noul": 0.0, "confidence": 0.9},
+    "position_action": {"choice": "hold", "probabilities": {}, "confidence": 0.9},
+}
+
+
+def _gate(noul, action="buy"):
+    """A published gate. `action` matters independently of `noul`: when JEV is
+    active and a gate is present, the long branch additionally requires
+    position_action to be buy or add, so a "hold" action suppresses entries by
+    a different route than the halt does."""
+    d = copy.deepcopy(_GATE)
+    d["halt_new_buys"] = {"noul": noul, "confidence": 0.9}
+    d["position_action"] = {"choice": action, "probabilities": {}, "confidence": 0.9}
+    return d
+
+
+def test_a_jev_halt_blocks_every_new_entry(entries, monkeypatch):
+    """should_halt is the only gate that returns before the entry loop runs, so
+    it is the one place where a single decision suppresses all entries at once.
+    """
+    monkeypatch.setattr(entries, "_JEV_AVAILABLE", True)
+    monkeypatch.setattr(entries._jev, "should_halt", lambda d: True)
+
+    calls = _recorded(entries, monkeypatch)
+    _cycle(entries, [_long(), _short(symbol="B.NS")], _mstate(),
+           decisions=_gate(1.0), cfg_over={"jev_risk_enabled": True})
+
+    assert calls == [], f"a JEV halt must suppress all entries, got {calls}"
+
+
+def test_without_a_halt_entries_proceed_under_the_same_jev_settings(entries, monkeypatch):
+    """The control for the test above: with should_halt returning False under
+    identical config, entries must flow, so the halt assertion is not passing
+    because some unrelated gate is also blocking."""
+    monkeypatch.setattr(entries, "_JEV_AVAILABLE", True)
+    monkeypatch.setattr(entries._jev, "should_halt", lambda d: False)
+
+    calls = _recorded(entries, monkeypatch)
+    _cycle(entries, [_long()], _mstate(),
+           decisions=_gate(0.0), cfg_over={"jev_risk_enabled": True})
+
+    assert calls == [("long", "A.NS")], f"the control should trade, got {calls}"
+
+
+def test_a_hold_position_action_suppresses_entries_without_a_halt(entries, monkeypatch):
+    """A second, independent way a JEV gate blocks entries.
+
+    should_halt is False, so the cycle proceeds normally, but position_action is
+    "hold", which the long branch rejects. This is separate from the halt gate
+    and would be missed by a test that only checked should_halt.
+    """
+    monkeypatch.setattr(entries, "_JEV_AVAILABLE", True)
+    monkeypatch.setattr(entries._jev, "should_halt", lambda d: False)
+
+    calls = _recorded(entries, monkeypatch)
+    _cycle(entries, [_long()], _mstate(),
+           decisions=_gate(0.0, action="hold"), cfg_over={"jev_risk_enabled": True})
+
+    assert calls == [], f"a hold action must suppress entries, got {calls}"
