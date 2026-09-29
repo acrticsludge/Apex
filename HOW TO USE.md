@@ -19,34 +19,50 @@ Apex is a **paper trading bot** with a web dashboard you can open in your browse
 
 You only need to do this once, ever.
 
-### Step 1 — Install Python
+### Step 1 — Install Python 3.12
 
 1. Go to [https://www.python.org/downloads/](https://www.python.org/downloads/)
-2. Click the big yellow **Download Python** button
+2. Download **Python 3.12** (3.13+ may work, but 3.12 is what the deploy image and CI use)
 3. Run the installer
 4. **Important:** On the first screen of the installer, tick the box that says **"Add Python to PATH"** before clicking Install
+
+> **Why 3.12 specifically?** The `pandas-ta` library that builds the AI's
+> technical indicators requires Python 3.12 or newer. On an older version the
+> install fails with a confusing error about `numpy` versions that has nothing
+> to do with the real cause.
 
 ### Step 2 — Open the Apex folder in VSCode
 
 1. Open **VSCode**
 2. Click **File → Open Folder**
-3. Navigate to `c:\Anubhav\C Programming\Apex` and click **Select Folder**
+3. Navigate to your Apex folder and click **Select Folder**
 
 ### Step 3 — Open the Terminal inside VSCode
 
 Press **Ctrl + `** (the backtick key, top-left of your keyboard, same key as `~`)
 
-A panel will appear at the bottom of VSCode. This is your terminal — you type commands here.
+A panel will appear at the bottom of VSCode. That is your terminal — you type commands here.
 
 ### Step 4 — Install the required packages
 
-Click inside the terminal panel, paste this line, and press **Enter**:
+In the terminal, from inside the Apex folder:
 
 ```
-pip install flask yfinance pandas numpy
+pip install -r requirements.txt
 ```
 
-Wait for it to finish. You'll see a lot of text scrolling — that's normal. When the blinking cursor comes back, it's done.
+This pulls ~22 packages. The AI's training libraries (PyTorch and friends) are
+large — expect several minutes and roughly 4 GB of disk on the first run.
+
+If you only want the dashboard and do not care about the AI learning from your
+trades, you can install just the serving side:
+
+```
+pip install flask gunicorn python-dotenv requests supabase yfinance pandas numpy curl_cffi pydantic
+```
+
+The dashboard runs without the AI stack — it just falls back to rule-based
+trading instead of the learned model, and says so in the logs.
 
 ---
 
@@ -65,6 +81,44 @@ Every time you want to use Apex:
 To **stop** the bot, click inside the terminal and press **Ctrl + C**.
 
 > **Tip:** Don't close VSCode while the bot is running — that will stop it.
+
+### Logging in
+
+The dashboard asks for a username and password. These come from your `.env`
+file (see `.env.example` for the format):
+
+| Variable | What it is |
+|---|---|
+| `APEX_USER` | your login name |
+| `APEX_PASS` | your password |
+| `APEX_SECRET` | random string that keeps your session secure |
+
+Generate `APEX_SECRET` with:
+
+```
+python -c "import secrets; print(secrets.token_hex(32))"
+```
+
+> **If you cannot log in:** Apex refuses to fall back to a default password. If
+> `APEX_PASS` is missing from your `.env`, a random one is generated that nobody
+> knows. Add your `APEX_USER` and `APEX_PASS` to `.env` and restart.
+>
+> After five wrong attempts you are locked out for five minutes. That is
+> deliberate — it stops anyone guessing.
+
+### Running the tests
+
+From the Apex folder:
+
+```
+pip install -r requirements-dev.txt
+pytest
+```
+
+293 tests. They also guard against the specific problems that have bitten this
+project: the AI risk layer silently switching off, a background thread dying
+without telling anyone, and someone loosening a dependency pin. Run them before
+committing anything.
 
 ---
 
@@ -146,10 +200,20 @@ Two sections:
 
 | File | What it is |
 |---|---|
-| `apex_dashboard.py` | The main program — run this |
+| `apex_dashboard.py` | The main program - run this |
+| `apex_jev.py` | The AI judgment layer - market regime and risk decisions |
+| `apex_market.py` | Market opening hours and time zones |
+| `apex_config.py` | Safety rules for what values the dashboard will accept |
+| `apex_universe.py` | The list of stocks the bot watches |
 | `apex_dual_state.json` | Your portfolio's saved state (created automatically on first run) |
-| `apex.log` | A permanent text log of everything the bot has ever done — open it in VSCode anytime |
+| `apex.log` | A permanent text log of everything the bot has ever done - open it in VSCode anytime. Rotates at 5 MB, keeping 3 older copies |
+| `tests/` | The test suite - run it with `pytest` before making changes |
+| `docs/` | Architecture notes, decision records, and the deployment runbook |
 | `HOW TO USE.md` | This guide |
+
+Where things are saved: if `SUPABASE_URL` and `SUPABASE_SERVICE_KEY` are set in
+your `.env`, your portfolio lives in Supabase and survives anything. Without
+them it falls back to `apex_dual_state.json` in this folder.
 
 ---
 

@@ -7,6 +7,41 @@
 
 ---
 
+> ## Resolution status — read this first
+>
+> This audit is preserved as the historical record it is. **The document
+> below describes the code as it stood on 2026-09-22 and has deliberately not
+> been rewritten.** It is no longer an accurate description of the system.
+>
+> A separate review on 2026-09-29 audited the *implemented* JEV integration
+> rather than the proposed one, and found defects that this document could not
+> have — they were introduced by the implementation. All are now fixed.
+>
+> | Defect | Severity | Status |
+> |---|---|---|
+> | Circular import silently disabled every JEV gate in production | Critical | Fixed — [ADR-001](../decisions/0001-break-jev-dashboard-import-cycle.md) |
+> | `apply_jev_gates()` return value discarded; no gate ever applied | Critical | Fixed |
+> | `/api/edit/position` accepted negative `qty`, corrupting cash and P&L | Critical | Fixed |
+> | `bot_bridge` raised `NameError` on every `/predict` | Critical | Fixed |
+> | `_signals["jev_decisions"]` never written; RL-side JEV features dormant | High | Fixed |
+> | `jev_*` flags read from non-existent `cfg` keys; features unkillable | High | Fixed |
+> | Duplicated exit blocks diverged; JEV trail multiplier only on the halt path | High | Fixed — `stop_pass` unified |
+> | `EDT` frozen at UTC-4; US market hours wrong ~5 months/yr | High | Fixed — `apex_market.EDT` |
+> | Agent thread could die on `KeyError` — silent trading outage | High | Fixed — [runbook §5](../operations/deployment-runbook.md) |
+> | Supabase I/O inside the state lock at 11 sites | High | Fixed — [ADR-003](../decisions/0003-snapshot-then-persist.md) |
+> | Online learner stepped the live policy while inference read it | High | Fixed — [ADR-002](../decisions/0002-train-clone-publish-via-registry.md) |
+> | Default `apex`/`admin` credentials, no throttle, `==` compare | Critical | Fixed — [ADR-004](../decisions/0004-fail-closed-authentication.md) |
+> | `/api/config` accepted unbounded risk parameters | High | Fixed |
+> | `settings_enabled=false` disabled every filter in one call | High | Fixed — now needs confirmation |
+>
+> **Current state of the system:** `docs/architecture/architecture-overview.md`.
+> **What is still outstanding:** `docs/reasonix/plans/remaining-work.md`.
+>
+> The one thing this cycle could not verify: the JEV overlay has never run
+> against a live market. See the canary procedure in the runbook.
+
+---
+
 ## Executive Summary
 
 This audit identifies **47 distinct integration points** across **18 files** where TypeSafe JEV's structured judgment primitives (Choice, Score, Noul) can enhance the Apex trading system. Each point is categorized by impact, implementation effort, and risk.

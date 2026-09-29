@@ -352,30 +352,56 @@ def test_small_buffer_is_skipped_without_touching_anything(fake_torch):
 
 
 def test_only_one_update_thread_can_claim_the_slot(fake_torch):
-    """The old check-then-set let several update threads run on one batch."""
+    """The old check-then-set let several update threads run on one batch.
+
+    Ordering is made explicit rather than left to a sleep: the first claimant is
+    held inside the clone step until the other three have started, so they are
+    guaranteed to arrive while the slot is genuinely occupied. A bare sleep made
+    this fail intermittently whenever the scheduler did not run them in time.
+    """
     import trading_agent.integration.online_learner as ol
     _reset_learner(ol)
     _seed(ol, n=8)
 
     claims = []
-    started = threading.Event()
+    inside = threading.Event()
+    release = threading.Event()
     original = ol._make_training_model
 
     def slow_clone(model, registry):
-        claims.append(1)
-        started.set()
-        time.sleep(0.15)
+        claims.append(threading.current_thread().name)
+        inside.set()
+        release.wait(10)
         return original(model, registry)
+
+    def worker():
+        ol._run_update()
 
     ol._make_training_model = slow_clone
     try:
-        threads = [threading.Thread(target=ol._run_update, daemon=True) for _ in range(4)]
-        for t in threads:
+        # 1. Start the winner and wait until it is inside the clone step, which
+        #    is the point at which the update slot is provably held.
+        first = threading.Thread(target=worker, name="claim-0", daemon=True)
+        first.start()
+        assert inside.wait(10), "the first thread never reached the clone step"
+
+        # 2. Now the contenders start. They must find the slot taken.
+        others = [
+            threading.Thread(target=worker, name=f"claim-{i}", daemon=True)
+            for i in range(1, 4)
+        ]
+        for t in others:
             t.start()
-        started.wait(5)
-        for t in threads:
+
+        # 3. Let them finish their claim check, then release the winner.
+        for t in others:
             t.join(timeout=10)
+        release.set()
+        first.join(timeout=10)
     finally:
+        release.set()
         ol._make_training_model = original
 
-    assert len(claims) == 1, f"{len(claims)} update threads ran concurrently"
+    assert len(claims) == 1, (
+        f"{len(claims)} update threads claimed the slot concurrently: {claims}"
+    )
