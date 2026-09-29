@@ -35,7 +35,11 @@ yfinance==1.7.0
 gymnasium==1.2.2
 joblib==1.5.2
 pandas-ta==0.4.71b0
-scikit-learn==1.7.2
+# 1.6.1, not 1.7.2: the committed scaler.joblib was pickled by 1.6.1, and
+# sklearn explicitly warns that loading a scaler across majors "might lead to
+# breaking code or invalid results". The artifact defines the required version,
+# the same way pandas-ta defines the numpy window below.
+scikit-learn==1.6.1
 stable-baselines3==2.9.0
 torch==2.14.0
 vaderSentiment==3.3.2

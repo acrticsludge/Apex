@@ -190,3 +190,19 @@ def test_fastapi_does_not_cap_starlette_below_its_fix():
     assert not (ver[0] == 0 and ver[1] < 141), (
         f"fastapi {pin} caps starlette below the patched 1.x line"
     )
+
+
+def test_sklearn_matches_the_committed_scaler_artifact():
+    """scaler.joblib is a pickled estimator checked into the repo. scikit-learn
+    refuses to load one across majors without warning that it "might lead to
+    breaking code or invalid results", so the pin has to match the artifact.
+    The build surfaces this as an InconsistentVersionWarning.
+    """
+    scaler = ROOT / "trading_agent" / "agent" / "model" / "scaler.joblib"
+    assert scaler.exists(), "the pinned sklearn cannot be checked without the artifact"
+    pin = _pinned("scikit-learn")
+    assert pin is not None, "scikit-learn must be exactly pinned"
+    assert _tuple(pin) == (1, 6, 1), (
+        f"scikit-learn {pin} does not match the 1.6.1 that pickled scaler.joblib; "
+        f"cross-major loading risks silently wrong features"
+    )

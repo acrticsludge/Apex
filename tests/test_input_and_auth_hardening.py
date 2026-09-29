@@ -1,12 +1,14 @@
-"""Regression tests for the unvalidated-write and auth defects found in review.
+﻿"""Regression tests for the unvalidated-write and auth defects found in review.
 
 The edit endpoints wrote client-supplied values straight into the live trading
 ledger. A negative qty made execute_sell subtract cash and inflate realised_pnl.
 """
+from pathlib import Path
+
 import pytest
 
 
-# ── C3: /api/edit/position accepted negative and zero values ─────────────────
+# â”€â”€ C3: /api/edit/position accepted negative and zero values â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @pytest.fixture
 def seeded(dash):
@@ -79,7 +81,7 @@ def test_edit_state_rejects_non_finite_cash(client, seeded):
     assert r.status_code == 400
 
 
-# ── H1: /api/config accepted arbitrary risk parameters ──────────────────────
+# â”€â”€ H1: /api/config accepted arbitrary risk parameters â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @pytest.mark.parametrize(
     "payload",
@@ -128,7 +130,7 @@ def test_config_accepts_sane_values(client, dash):
     dash.cfg["confidence_threshold"] = 62
 
 
-# ── H2: settings_enabled disabled every filter with one call ────────────────
+# â”€â”€ H2: settings_enabled disabled every filter with one call â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def test_disabling_settings_requires_explicit_confirmation(client, dash):
     """settings_enabled=false drops conf_thr to 50, raises max_pos to 999 and
@@ -139,7 +141,7 @@ def test_disabling_settings_requires_explicit_confirmation(client, dash):
     assert dash.cfg["settings_enabled"] == before
 
 
-# ── C1/H4 security posture on the auth boundary ─────────────────────────────
+# â”€â”€ C1/H4 security posture on the auth boundary â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def test_login_throttles_after_repeated_failures(anon_client, dash):
     """The password was the only defence, with no lockout, on a public host."""
@@ -179,7 +181,9 @@ def test_default_credentials_are_not_accepted(dash, monkeypatch):
 
 def test_password_comparison_is_constant_time():
     """Plain == leaks the password byte-by-byte."""
-    src = open("apex_dashboard.py", encoding="utf-8", errors="replace").read()
+    src = (Path(__file__).resolve().parent.parent / "apex_dashboard.py").read_text(
+        encoding="utf-8", errors="replace"
+    )
     login_body = src.split("def login():", 1)[1].split("\n@app.route", 1)[0]
     assert 'request.form.get("p", "") == _AUTH_PASS' not in login_body, (
         "login still uses == for the password"
@@ -191,7 +195,7 @@ def test_session_cookie_is_secure(dash):
     assert dash.app.config.get("SESSION_COOKIE_SECURE") is True
 
 
-# ── Hashed password support ──────────────────────────────────────────────────
+# â”€â”€ Hashed password support â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def test_hashed_password_verifies(dash):
     """APEX_PASS_HASH lets the plaintext password leave the environment."""
