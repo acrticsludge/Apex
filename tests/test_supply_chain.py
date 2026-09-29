@@ -117,3 +117,45 @@ def test_pandas_ta_pin_is_preserved():
     """The trained feature columns were built against 0.4.71b0; silently
     upgrading it changes every indicator the model relies on."""
     assert "pandas-ta==0.4.71b0" in REQ.read_text(encoding="utf-8")
+
+
+def _pinned(name: str) -> str | None:
+    for entry in _requirements():
+        if entry.split("==")[0].strip().lower() == name:
+            return entry.split("==", 1)[1].strip() if "==" in entry else None
+    return None
+
+
+def _tuple(v: str) -> tuple:
+    return tuple(int(x) for x in v.split("."))
+
+
+def test_numpy_pin_sits_inside_pandas_ta_window():
+    """The exact conflict CI caught on the first run of the pins.
+
+    pandas-ta 0.4.71b0 -> numba 0.61.2 -> numpy<2.3, and pandas-ta itself
+    requires numpy>=2.2.6. A numpy outside [2.2.6, 2.3) makes the whole file
+    unresolvable, so the dashboard image cannot build.
+    """
+    np = _pinned("numpy")
+    assert np is not None, "numpy must be exactly pinned: it bounds the pandas-ta window"
+    ver = _tuple(np)
+    assert ver >= (2, 2, 6), f"numpy {np} is below pandas-ta's floor of 2.2.6"
+    assert ver < (2, 3, 0), f"numpy {np} is above numba 0.61.2's ceiling of 2.3"
+
+
+def test_pandas_stays_on_the_2x_line():
+    """pandas-ta 0.4.71b0 predates pandas 3; pandas 3 silently breaks its
+    indicator functions rather than failing to install."""
+    pd = _pinned("pandas")
+    assert pd is not None, "pandas must be exactly pinned"
+    assert _tuple(pd) >= (2, 3, 2), f"pandas {pd} is below pandas-ta's floor of 2.3.2"
+    assert _tuple(pd)[0] == 2, f"pandas {pd} is on a major line pandas-ta 0.4.71b0 predates"
+
+
+def test_the_file_has_no_obviously_conflicting_floor_and_ceiling():
+    """Sanity sweep: no two pins should demand mutually exclusive majors."""
+    pins = {e.split("==")[0].strip().lower(): e for e in _requirements() if "==" in e}
+    for name, entry in pins.items():
+        assert not entry.rstrip().endswith(".*"), f"{entry} is a wildcard pin"
+    assert pins, "expected exact pins to validate"

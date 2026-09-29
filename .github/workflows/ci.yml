@@ -36,6 +36,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Record the resolved versions
+        # The numpy/pandas window is constrained by pandas-ta -> numba. Print what
+        # actually resolved so a future failure is diagnosable from the log alone.
+        run: pip list --format=freeze | grep -Ei '^(numpy|pandas|numba|pandas-ta|torch|stable-baselines3|scikit-learn|flask|yfinance)='
+
       - name: Install dev dependencies
         run: pip install -r requirements-dev.txt
 
