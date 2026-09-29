@@ -1,0 +1,6 @@
+# Development and CI dependencies. Kept separate from requirements.txt so the
+# deploy image never installs test tooling.
+-r requirements.txt
+
+pytest>=8.0,<9
+pip-audit>=2.7,<3

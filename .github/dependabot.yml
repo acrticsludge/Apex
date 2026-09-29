@@ -1,0 +1,42 @@
+version: 2
+updates:
+  # Runtime + dev requirements. Keeping one ecosystem means a single PR can
+  # surface a conflicting transitive bump across the whole tree.
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "07:00"
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+    commit-message:
+      prefix: "deps"
+    groups:
+      # One PR for the routine patch churn, so the review surface stays small.
+      patch-and-minor:
+        update-types:
+          - minor
+          - patch
+      torch-stack:
+        patterns:
+          - "torch"
+          - "stable-baselines3"
+          - "gymnasium"
+      data-stack:
+        patterns:
+          - "pandas"
+          - "numpy"
+          - "yfinance"
+          - "pandas-ta"
+          - "scikit-learn"
+          - "joblib"
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    labels:
+      - dependencies
+      - ci

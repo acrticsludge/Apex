@@ -23,6 +23,11 @@ from trading_agent.data.data_fetcher import load_saved_feature_columns
 logger = logging.getLogger(__name__)
 app = FastAPI(title="RL Trading Agent Bridge", version="1.0.0")
 
+# Number of trailing JEV dims appended to a base observation. Must match
+# apex_jev.JEV_FEATURE_COLUMNS; kept local so this service has no apex_dashboard
+# dependency.
+JEV_FEATURE_COUNT = 8
+
 
 class PredictionRequest(BaseModel):
     """Schema for external trading bots that want an action from the PPO model."""
@@ -90,10 +95,13 @@ def _predict_action_and_confidence(observation: list[float]) -> tuple[int, float
     if bridge_state.model is None:
         raise HTTPException(status_code=503, detail="No trained model is loaded.")
 
-    # Base feature size (without JEV features)
-    base_feature_size = len(bridge_state.feature_columns) - 8  # 30 - 8 = 22
-    
-    if len(observation) == expected_size + 8:
+    # Base feature size (without JEV features). `expected_size` is the base size:
+    # callers may send the base observation alone, or base + JEV_FEATURE_COUNT.
+    # This was previously never assigned, so every /predict raised NameError.
+    base_feature_size = len(bridge_state.feature_columns) - JEV_FEATURE_COUNT
+    expected_size = base_feature_size
+
+    if len(observation) == expected_size + JEV_FEATURE_COUNT:
         # Full observation with JEV features
         base_observation = observation[:base_feature_size]
         jev_features = observation[base_feature_size:]

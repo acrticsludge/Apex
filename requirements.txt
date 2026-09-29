@@ -1,19 +1,41 @@
-flask>=3.0.0
-yfinance>=0.2.40
-pandas>=2.0.0
-numpy>=1.26.0
-supabase>=2.4.0
-gunicorn>=21.2.0
+# Runtime dependencies.
+#
+# Pinned exactly. Previously 17 of 19 entries used a bare `>=`, so every Railway
+# rebuild resolved fresh and a yanked or compromised transitive release landed in
+# production with no review gate. Dependabot (.github/dependabot.yml) now opens
+# the bump PRs, grouped so a routine patch wave is one reviewable diff.
+#
+# The serving stack below is pinned to versions this suite has actually run
+# against. The RL/training stack could not be installed on the machine this was
+# verified on (no disk for torch), so those carry a bounded range instead of an
+# exact pin: wide enough to resolve on a clean runner, narrow enough that a
+# breaking major cannot arrive unannounced. Pin them exactly once CI has run
+# green on the resolved set.
+
+# ── Serving (verified against this suite) ──────────────────────────────────
+curl_cffi==0.16.3
+flask==3.1.3
+gunicorn==23.0.0
+numpy==2.4.6
+pandas==3.0.6
+pydantic==2.13.5
+python-dotenv==1.2.3
+requests==2.34.2
+supabase==2.31.0
+yfinance==1.7.0
+
+# ── RL / training (range-pinned; see note above) ───────────────────────────
+# torch is CPU-only in CI; Railway pulls the default wheel.
+gymnasium>=0.29,<2
+joblib>=1.3,<2
+# pandas-ta is unmaintained on PyPI (0.4.71b0 is a pre-release) and has no
+# 1.x; the version must match what the trained feature columns were built with.
 pandas-ta==0.4.71b0
-scikit-learn>=1.4.0
-joblib>=1.3.2
-python-dotenv>=1.0.1
-requests>=2.31.0
-curl_cffi>=0.7.0
-vaderSentiment>=3.3.2
-gymnasium>=0.29.1
-stable-baselines3>=2.3.2
-torch>=2.2.0
-fastapi>=0.110.0
-uvicorn>=0.29.0
-pydantic>=2.6.0
+scikit-learn>=1.4,<2
+stable-baselines3>=2.3,<3
+torch>=2.2,<3
+vaderSentiment>=3.3,<4
+
+# ── Standalone RL bridge service (not started by the dashboard) ────────────
+fastapi>=0.110,<1
+uvicorn>=0.29,<1

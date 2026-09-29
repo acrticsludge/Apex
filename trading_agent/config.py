@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 import json
 import os
 from dataclasses import asdict, dataclass, field
@@ -11,57 +10,19 @@ from typing import Any, Sequence
 
 from dotenv import load_dotenv
 
+# Canonical universe. A leaf module, so this import has no side effects — the
+# previous AST scrape of apex_dashboard.py returned {} on any parse failure,
+# silently swapping in a drifting hand-maintained copy of the watchlists.
+from apex_universe import INDIA_WATCHLIST as CANONICAL_INDIA_WATCHLIST
+from apex_universe import US_WATCHLIST as CANONICAL_US_WATCHLIST
+
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = PACKAGE_ROOT.parent
-DASHBOARD_PATH = REPO_ROOT / "apex_dashboard.py"
 
 # Load both the repo-level .env and an optional package-local .env.
 load_dotenv(REPO_ROOT / ".env")
 load_dotenv(PACKAGE_ROOT / ".env", override=False)
-
-
-def _extract_dashboard_objects(dashboard_path: Path) -> tuple[dict[str, Any], list[str], list[str]]:
-    """
-    Read literal config objects from the dashboard source without importing it.
-
-    Importing ``apex_dashboard.py`` would execute the Flask app and side effects,
-    so we parse only the literal assignments we care about.
-    """
-    if not dashboard_path.exists():
-        return {}, [], []
-
-    try:
-        parsed = ast.parse(dashboard_path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}, [], []
-
-    cfg: dict[str, Any] = {}
-    india_watchlist: list[str] = []
-    us_watchlist: list[str] = []
-
-    for node in parsed.body:
-        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
-            continue
-        target = node.targets[0]
-        if not isinstance(target, ast.Name):
-            continue
-        if target.id not in {"cfg", "INDIA_WATCHLIST", "US_WATCHLIST"}:
-            continue
-
-        try:
-            value = ast.literal_eval(node.value)
-        except Exception:
-            continue
-
-        if target.id == "cfg" and isinstance(value, dict):
-            cfg = value
-        elif target.id == "INDIA_WATCHLIST" and isinstance(value, list):
-            india_watchlist = [str(item).strip() for item in value if str(item).strip()]
-        elif target.id == "US_WATCHLIST" and isinstance(value, list):
-            us_watchlist = [str(item).strip() for item in value if str(item).strip()]
-
-    return cfg, india_watchlist, us_watchlist
 
 
 def _deduplicate(values: Sequence[str]) -> list[str]:
@@ -86,44 +47,6 @@ def _resolve_storage_root() -> Path:
     return PACKAGE_ROOT
 
 
-FALLBACK_INDIA_WATCHLIST = [
-    "RELIANCE.NS",
-    "TCS.NS",
-    "HDFCBANK.NS",
-    "INFY.NS",
-    "ICICIBANK.NS",
-    "HINDUNILVR.NS",
-    "ITC.NS",
-    "SBIN.NS",
-    "BHARTIARTL.NS",
-    "KOTAKBANK.NS",
-    "LT.NS",
-    "AXISBANK.NS",
-    "MARUTI.NS",
-    "TITAN.NS",
-    "WIPRO.NS",
-    "SUNPHARMA.NS",
-]
-FALLBACK_US_WATCHLIST = [
-    "AAPL",
-    "MSFT",
-    "NVDA",
-    "GOOGL",
-    "AMZN",
-    "META",
-    "TSLA",
-    "AMD",
-    "NFLX",
-    "ORCL",
-    "INTC",
-    "CRM",
-    "UBER",
-    "SHOP",
-    "PYPL",
-    "PLTR",
-]
-
-
 def _resolve_default_tickers() -> list[str]:
     """
     Build the default training universe from environment, dashboard, or fallback lists.
@@ -135,8 +58,8 @@ def _resolve_default_tickers() -> list[str]:
     if env_tickers:
         return env_tickers
 
-    india_watchlist = DEFAULT_INDIA_WATCHLIST or list(FALLBACK_INDIA_WATCHLIST)
-    us_watchlist = DEFAULT_US_WATCHLIST or list(FALLBACK_US_WATCHLIST)
+    india_watchlist = list(CANONICAL_INDIA_WATCHLIST)
+    us_watchlist = list(CANONICAL_US_WATCHLIST)
     market_universe = os.getenv("RL_MARKET_UNIVERSE", "all").strip().lower()
 
     if market_universe == "india":
@@ -146,9 +69,6 @@ def _resolve_default_tickers() -> list[str]:
     return _deduplicate(india_watchlist + us_watchlist)
 
 
-DEFAULT_DASHBOARD_CFG, DEFAULT_INDIA_WATCHLIST, DEFAULT_US_WATCHLIST = _extract_dashboard_objects(
-    DASHBOARD_PATH
-)
 DEFAULT_ACTIVE_TICKERS = _resolve_default_tickers()
 
 
@@ -184,12 +104,11 @@ class Settings:
     minimum_rows_after_features: int = 252
     active_tickers: list[str] = field(default_factory=lambda: list(DEFAULT_ACTIVE_TICKERS))
     dashboard_india_watchlist: list[str] = field(
-        default_factory=lambda: list(DEFAULT_INDIA_WATCHLIST or FALLBACK_INDIA_WATCHLIST)
+        default_factory=lambda: list(CANONICAL_INDIA_WATCHLIST)
     )
     dashboard_us_watchlist: list[str] = field(
-        default_factory=lambda: list(DEFAULT_US_WATCHLIST or FALLBACK_US_WATCHLIST)
+        default_factory=lambda: list(CANONICAL_US_WATCHLIST)
     )
-    dashboard_reference_cfg: dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_DASHBOARD_CFG))
 
     # Feature settings
     feature_columns: list[str] = field(

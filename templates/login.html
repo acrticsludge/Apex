@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Apex — Sign In</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+     background:#0d1117;color:#e6edf3;display:flex;align-items:center;
+     justify-content:center;min-height:100vh}
+.box{background:#161b22;border:1px solid #30363d;border-radius:10px;
+     padding:36px 40px;width:340px}
+.logo{font-size:20px;font-weight:700;letter-spacing:2px;color:#58a6ff;
+      text-align:center;margin-bottom:28px}
+.logo b{color:#f0883e}
+label{font-size:10px;color:#8b949e;text-transform:uppercase;
+      letter-spacing:.5px;display:block;margin-bottom:5px}
+input[type=text],input[type=password]{background:#1c2128;border:1px solid #30363d;
+      border-radius:6px;color:#e6edf3;padding:9px 12px;font-size:14px;width:100%;
+      margin-bottom:16px;transition:border-color .2s}
+input:focus{outline:none;border-color:#58a6ff}
+.err{color:#f85149;font-size:11px;text-align:center;margin-bottom:14px;
+     background:#200a0a;border:1px solid #5a1a1a;border-radius:5px;padding:7px 10px}
+.btn{width:100%;padding:10px;border-radius:6px;cursor:pointer;font-size:13px;
+     font-weight:700;letter-spacing:.4px;background:#0d1e3a;color:#58a6ff;
+     border:1px solid #1a3a6a;transition:filter .15s}
+.btn:hover{filter:brightness(1.2)}
+.sub{font-size:10px;color:#444c56;text-align:center;margin-top:18px}
+</style>
+</head>
+<body>
+<div class="box">
+  <div class="logo">APEX <b>▲</b></div>
+  {% if err %}<div class="err">{{ err }}</div>{% endif %}
+  <form method="POST" autocomplete="off">
+    <label>Username</label>
+    <input type="text" name="u" autofocus autocomplete="username">
+    <label>Password</label>
+    <input type="password" name="p" autocomplete="current-password">
+    <button class="btn" type="submit">Sign In</button>
+  </form>
+  <div class="sub">Apex Paper Trading — restricted access</div>
+</div>
+</body>
+</html>

@@ -17,6 +17,12 @@ import threading
 import json
 import os
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 # ── RL mode: agent drives all buy/sell decisions; user only sets capital ──────
 RL_MODE = os.getenv("RL_MODE", "true").lower() == "true"
 
@@ -34,22 +40,44 @@ except Exception as _rl_import_err:  # noqa: BLE001
     _get_rl_signal = None  # type: ignore[assignment]
 
 # ── JEV (TypeSafe) integration ──────────────────────────────────────────────────
+def _env_flag(name: str, default: bool = True) -> bool:
+    raw = os.getenv(name)
+    return default if raw is None else raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+_JEV_ENABLED = _env_flag("JEV_ENABLED")
+
+# apex_jev must never import this module (it did, and that back-edge raised
+# ImportError under the production import order). configure() pushes the flags
+# in instead, so a failure here is a genuine subsystem fault, not a cycle.
 try:
     import apex_jev as _jev
     _JEV_AVAILABLE = True
 except Exception as _jev_import_err:  # noqa: BLE001
     _JEV_AVAILABLE = False
     _jev = None  # type: ignore[assignment]
+    # Surfaced in /api/jev/status: a silently disabled risk layer is worse than
+    # an absent one, so the reason is never swallowed.
+    _JEV_IMPORT_ERROR = repr(_jev_import_err)
+else:
+    _JEV_IMPORT_ERROR = None
 
 import time
 import warnings
 import logging
 from collections import deque
+from logging.handlers import RotatingFileHandler
 from datetime import datetime, timezone, timedelta
-from flask import Flask, jsonify, request, render_template_string, session, redirect, Response, stream_with_context
+from zoneinfo import ZoneInfo
+from flask import (
+    Flask, jsonify, request, render_template, session, redirect, Response,
+    stream_with_context,
+)
+from werkzeug.exceptions import HTTPException
 import yfinance as yf
 import pandas as pd
 import numpy as np
+import requests
 
 warnings.filterwarnings("ignore")
 
@@ -106,23 +134,35 @@ cfg = {
     "short_confidence_threshold":    75,  # bearish confidence needed to short (0–100)
     "index_max_pct_for_short":      0.5,  # block shorts if index UP more than +0.5%
     "settings_enabled":            True,  # False = full liberty: bypass threshold/ADX/index/cap filters
+    # ── JEV (TypeSafe) feature flags ──────────────────────────────────────────
+    # These were previously read as cfg.get("jev_*", True), but no such key ever
+    # existed, so every JEV feature was hardwired on and impossible to disable.
+    "jev_enabled":            _JEV_ENABLED,
+    "jev_risk_enabled":       _JEV_ENABLED,
+    "jev_action_enabled":     _JEV_ENABLED,
+    "jev_trend_enabled":      _JEV_ENABLED,
+    "jev_news_enabled":       _JEV_ENABLED,
+    "jev_regime_enabled":     _JEV_ENABLED,
 }
 
-INDIA_WATCHLIST = [
-    "RELIANCE.NS",   "TCS.NS",        "HDFCBANK.NS",   "INFY.NS",
-    "ICICIBANK.NS",  "HINDUNILVR.NS", "ITC.NS",        "SBIN.NS",
-    "BHARTIARTL.NS", "KOTAKBANK.NS",  "LT.NS",         "AXISBANK.NS",
-    "MARUTI.NS",     "TITAN.NS",      "WIPRO.NS",      "SUNPHARMA.NS",
-]
-US_WATCHLIST = [
-    "AAPL",  "MSFT",  "NVDA",  "GOOGL",
-    "AMZN",  "META",  "TSLA",  "AMD",
-    "NFLX",  "ORCL",  "INTC",  "CRM",
-    "UBER",  "SHOP",  "PYPL",  "PLTR",
-]
+# Hand the flag set to apex_jev now that cfg exists. Done here rather than at the
+# import site so the import check can stay early without needing cfg.
+if _JEV_AVAILABLE:
+    _jev.configure(cfg)
 
-IST = timezone(timedelta(hours=5,  minutes=30))
-EDT = timezone(timedelta(hours=-4))
+from apex_universe import INDIA_WATCHLIST, US_WATCHLIST  # canonical, shared with trading_agent
+from apex_market import EDT, IST  # canonical calendar; see MARKET HOURS below
+from apex_config import (  # ledger/config guards live in a leaf module
+    CONFIG_BOUNDS,
+    POSITION_EDIT_SPEC,
+    STATE_EDIT_SPEC,
+    clean_numeric,
+    validate_config_payload,
+)
+
+# Time zones come from apex_market (imported above). They must not be redefined
+# here: a frozen -4 offset for US Eastern made the app believe the close was
+# 21:00 UTC year round, firing EOD exits an hour late for ~5 months a year.
 
 # ─── AGENT LOGGER ─────────────────────────────────────────────────────────────
 
@@ -139,10 +179,23 @@ class _BufHandler(logging.Handler):
 apex_log = logging.getLogger("apex")
 apex_log.setLevel(logging.DEBUG)
 if not apex_log.handlers:
-    _fh = logging.FileHandler("apex.log", encoding="utf-8")
+    # Rotating, not a plain FileHandler: the price updater ticks every 5 s and the
+    # cycle logs per position, which is ~17k lines/day growing without bound on a
+    # Railway volume.
+    _fh = RotatingFileHandler(
+        "apex.log", maxBytes=int(os.getenv("LOG_MAX_BYTES", 5_000_000)),
+        backupCount=int(os.getenv("LOG_BACKUP_COUNT", 3)), encoding="utf-8",
+    )
     _fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
     apex_log.addHandler(_fh)
     apex_log.addHandler(_BufHandler())
+
+if not _JEV_AVAILABLE:
+    apex_log.error(
+        "JEV subsystem unavailable — every JEV risk gate is DISABLED. Cause: %s", _JEV_IMPORT_ERROR
+    )
+else:
+    apex_log.info("JEV subsystem loaded — risk gates active")
 
 # ─── DECISION / THINKING LOG ──────────────────────────────────────────────────
 # Separate from apex_log — plain-language narration of every bot decision.
@@ -166,6 +219,7 @@ _state   = {}                       # trading state (loaded from Supabase on sta
 _signals = {                        # latest scan results
     "india": [], "us": [],
     "india_prices": {}, "us_prices": {},
+    "jev_decisions": {},            # per-market JEV decisions, read by rl_signal
 }
 _agent   = {
     "running": False, "paused": False,
@@ -173,41 +227,125 @@ _agent   = {
     "india_open": False, "us_open": False,
 }
 
+# ── Per-cycle JEV risk-gate overrides ─────────────────────────────────────────
+# apply_jev_gates() is a pure function: it returns a modified copy of the base
+# config. Its return value used to be discarded, so no gate was ever applied.
+# Gating writes here instead, per market, and is cleared at the top of every
+# cycle — writing into `cfg` would compound the multipliers every cycle until
+# risk_per_trade decayed to zero.
+_jev_gates: dict = {}
+
+JEV_GATED_KEYS = (
+    "risk_per_trade",
+    "stop_loss_pct",
+    "india_max_positions",
+    "us_max_positions",
+    "daily_loss_limit_pct",
+    "max_drawdown_pct",
+    "open_filter_min",
+)
+
+
+def effective_cfg(market_key: str) -> dict:
+    """Base config overlaid with this cycle's JEV gates for one market."""
+    overrides = _jev_gates.get(market_key)
+    if not overrides:
+        return cfg
+    merged = dict(cfg)
+    merged.update(overrides)
+    return merged
+
+
+def apply_jev_cycle_gates(jev_decisions_per_market: dict) -> None:
+    """Fold each market's JEV decisions into the per-cycle gate overrides."""
+    _jev_gates.clear()
+    if not _JEV_AVAILABLE:
+        return
+    for market_key, decisions in (jev_decisions_per_market or {}).items():
+        if not decisions:
+            continue
+        try:
+            gated = _jev.apply_jev_gates(cfg, decisions)
+        except Exception as e:  # noqa: BLE001
+            apex_log.warning("[JEV] gate application failed for %s: %s", market_key, e)
+            continue
+        overrides = {k: gated[k] for k in JEV_GATED_KEYS if k in gated and gated[k] != cfg.get(k)}
+        if overrides:
+            _jev_gates[market_key] = overrides
+            apex_log.info(
+                "[JEV] %s gates applied: %s",
+                market_key.upper(),
+                ", ".join(f"{k}={v}" for k, v in overrides.items()),
+            )
+
+
+def publish_jev_decisions(jev_decisions_per_market: dict) -> None:
+    """Expose decisions to the RL path, which reads _signals['jev_decisions'].
+
+    Nothing wrote this key before, so jev_trend_strength was always None,
+    jev_regime always 'bullish' and jev_score_delta always 0 inside rl_signal.
+    """
+    with _lock:
+        _signals["jev_decisions"] = dict(jev_decisions_per_market or {})
+
 # ── Shared price store (Thread 1 writes, Thread 2 snapshots) ──────────────────
 _latest_prices: dict = {}
-_price_lock = threading.Lock()
+# Wall-clock of the last successful quote per symbol. Without this a symbol
+# whose feed dies kept trading on its last good price indefinitely, because a
+# failed fetch and "no quote" looked identical.
+_price_ts: dict = {}
+# RLock, not Lock: _record_prices() and price_is_fresh() take the lock themselves,
+# so a caller already holding it would deadlock the price thread and every
+# request thread. Re-entrancy is the safer contract here.
+_price_lock = threading.RLock()
+
+# A quote older than this is not trusted for entries, exits or SL/TP checks.
+PRICE_MAX_AGE_SECONDS = int(os.getenv("PRICE_MAX_AGE_SECONDS", "120"))
+
+
+def _record_prices(fresh: dict) -> None:
+    """Merge fresh quotes into the shared store, stamping their arrival time.
+
+    Caller must not hold _price_lock.
+    """
+    if not fresh:
+        return
+    now = time.time()
+    with _price_lock:
+        _latest_prices.update(fresh)
+        for sym in fresh:
+            _price_ts[sym] = now
+
+
+def price_is_fresh(sym: str, max_age: float | None = None) -> bool:
+    """True when we hold a quote for sym that is recent enough to trade on."""
+    limit = PRICE_MAX_AGE_SECONDS if max_age is None else max_age
+    with _price_lock:
+        if sym not in _latest_prices:
+            return False
+        ts = _price_ts.get(sym)
+    return ts is not None and (time.time() - ts) <= limit
+
+
+def stale_price_symbols(max_age: float | None = None) -> list:
+    """Symbols we hold a quote for that are now too old to act on."""
+    limit = PRICE_MAX_AGE_SECONDS if max_age is None else max_age
+    now = time.time()
+    with _price_lock:
+        return [s for s in _latest_prices if (now - _price_ts.get(s, 0.0)) > limit]
 
 # ─── MARKET HOURS ─────────────────────────────────────────────────────────────
-
-def is_india_open() -> bool:
-    n = datetime.now(IST)
-    if n.weekday() >= 5:
-        return False
-    return (n.replace(hour=9,  minute=15, second=0, microsecond=0)
-            <= n <=
-            n.replace(hour=15, minute=30, second=0, microsecond=0))
-
-def is_us_open() -> bool:
-    n = datetime.now(EDT)
-    if n.weekday() >= 5:
-        return False
-    return (n.replace(hour=9,  minute=30, second=0, microsecond=0)
-            <= n <=
-            n.replace(hour=16, minute=0,  second=0, microsecond=0))
-
-def minutes_to_close(market_key: str):
-    """Returns minutes remaining until market close, or None if market is not currently open."""
-    if market_key == "india":
-        n       = datetime.now(IST)
-        open_t  = n.replace(hour=9,  minute=15, second=0, microsecond=0)
-        close_t = n.replace(hour=15, minute=30, second=0, microsecond=0)
-    else:
-        n       = datetime.now(EDT)
-        open_t  = n.replace(hour=9,  minute=30, second=0, microsecond=0)
-        close_t = n.replace(hour=16, minute=0,  second=0, microsecond=0)
-    if n.weekday() >= 5 or n < open_t or n > close_t:
-        return None
-    return (close_t - n).total_seconds() / 60
+# The calendar lives in apex_market (a leaf module, unit-tested in isolation).
+# Re-exported here so every existing call site keeps working unchanged.
+from apex_market import (  # noqa: E402
+    EDT,
+    IST,
+    is_india_open,
+    is_us_open,
+    minutes_since_open,
+    minutes_to_close,
+    session_date,
+)
 
 # ─── DATA FETCHING ────────────────────────────────────────────────────────────
 
@@ -240,8 +378,8 @@ def fetch_prices(symbols: list) -> dict:
                     result[sym] = float(data[sym]["Close"].dropna().iloc[-1])
                 else:
                     result[sym] = float(data["Close"].dropna().iloc[-1])
-            except Exception:
-                pass
+            except Exception as e:
+                apex_log.debug("[PRICE] batch extract failed for %s: %s", sym, e)
         return result
     except Exception:
         return {}
@@ -297,8 +435,8 @@ def _fetch_nse_price(sym: str) -> tuple[str, float | None]:
         fb = yf.Ticker(sym).fast_info.last_price
         if fb and fb > 0:
             return sym, float(fb)
-    except Exception:
-        pass
+    except Exception as e:
+        apex_log.debug("[PRICE] yfinance fallback failed for %s: %s", sym, e)
     return sym, None
 
 def _fetch_us_price(sym: str) -> tuple[str, float | None]:
@@ -306,8 +444,8 @@ def _fetch_us_price(sym: str) -> tuple[str, float | None]:
         p = yf.Ticker(sym).fast_info.last_price
         if p and p > 0:
             return sym, float(p)
-    except Exception:
-        pass
+    except Exception as e:
+        apex_log.debug("[PRICE] yfinance fetch failed for %s: %s", sym, e)
     return sym, None
 
 def _price_updater():
@@ -325,8 +463,7 @@ def _price_updater():
             if price:
                 fresh[sym] = price
         if fresh:
-            with _price_lock:
-                _latest_prices.update(fresh)
+            _record_prices(fresh)
             # push to SSE subscribers
             with _price_sub_lock:
                 dead = []
@@ -340,6 +477,12 @@ def _price_updater():
             apex_log.info(
                 f"[PRICE] tick — {len(fresh)}/{len(INDIA_WATCHLIST + US_WATCHLIST)} symbols refreshed"
             )
+            aged = stale_price_symbols()
+            if aged:
+                apex_log.warning(
+                    f"[PRICE] {len(aged)} symbols are holding quotes older than "
+                    f"{PRICE_MAX_AGE_SECONDS}s and will not be traded: {', '.join(sorted(aged)[:8])}"
+                )
         time.sleep(5)
 
 # ─── INDEX TREND FILTER ───────────────────────────────────────────────────────
@@ -694,6 +837,21 @@ def save_state(st: dict):
 def _settings_active() -> bool:
     return cfg.get("settings_enabled", True)
 
+
+def snapshot_state() -> dict:
+    """Deep-copy the trading state for a writer thread.
+
+    Callers hold _lock. The copy is what gets handed to the blocking Supabase
+    upsert, so the I/O never runs under the lock and never observes a torn
+    mutation.
+    """
+    return json.loads(json.dumps(_state, default=str))
+
+
+def persist_state(snap: dict) -> None:
+    """Write a snapshot to Supabase/JSON. MUST be called with _lock released."""
+    save_state(snap)
+
 # ── Keys the user can change via the Settings panel ───────────────────────────
 _CFG_PERSIST_KEYS = (
     "risk_per_trade", "confidence_threshold", "stop_loss_pct", "target_pct",
@@ -823,17 +981,27 @@ def _close_session(market_key: str, prices: dict):
 
 def _check_session_rotation(prices: dict):
     """If the calendar date has changed since the active session was started,
-    archive the old session and open a fresh one. Call with _lock held."""
+    archive the old session and open a fresh one. Call with _lock held.
+
+    Tolerates a market that has not been loaded: this runs on the agent thread,
+    where a KeyError would kill the thread and stop trading silently.
+    """
     for market_key in ("india", "us"):
+        mstate = _state.get(market_key)
+        if mstate is None:
+            apex_log.warning(
+                "[SESSION] No %s state loaded — cannot check session rollover", market_key
+            )
+            continue
         tz        = IST if market_key == "india" else EDT
         today     = datetime.now(tz).strftime("%Y-%m-%d")
-        sess_date = _state[market_key].get("session_date", today)
+        sess_date = mstate.get("session_date", today)
         if sess_date == today:
             continue
         # Date rolled over
         has_activity = (
-            _state[market_key]["wins"] + _state[market_key]["losses"] > 0
-            or len(_state[market_key]["trade_log"]) > 0
+            mstate.get("wins", 0) + mstate.get("losses", 0) > 0
+            or len(mstate.get("trade_log", [])) > 0
         )
         if has_activity:
             apex_log.info(
@@ -859,18 +1027,21 @@ def log_trade(mstate: dict, msg: str, kind: str):
     if len(mstate["trade_log"]) > 200:
         mstate["trade_log"] = mstate["trade_log"][-200:]
 
-def execute_buy(symbol: str, price: float, mstate: dict, atr: float = None):
+def execute_buy(symbol: str, price: float, mstate: dict, atr: float = None, rcfg: dict | None = None):
+    # rcfg is the effective config (base + this cycle's JEV gates). Defaulting to
+    # cfg keeps ad-hoc/manual calls working.
+    rcfg = rcfg if rcfg is not None else cfg
     # ── Position sizing: ATR-normalised risk, capped at max_position_pct ─────
     start_cash   = mstate.get("session_start_cash", price * 10)
-    risk_dollars = start_cash * cfg["risk_per_trade"]
+    risk_dollars = start_cash * rcfg["risk_per_trade"]
     atr_sl_mult  = cfg["atr_sl_mult"]
 
     if atr and atr > 0 and cfg.get("use_atr_exits", True):
         sl_dist  = atr * atr_sl_mult
         tp_dist  = atr * cfg["atr_tp_mult"]
         # Floor/cap: keep SL/TP within 0.5×–2× of the fixed-pct fallback
-        sl_floor = price * cfg["stop_loss_pct"] * 0.5
-        sl_cap   = price * cfg["stop_loss_pct"] * 2.0
+        sl_floor = price * rcfg["stop_loss_pct"] * 0.5
+        sl_cap   = price * rcfg["stop_loss_pct"] * 2.0
         tp_floor = price * cfg["target_pct"]    * 0.5
         tp_cap   = price * cfg["target_pct"]    * 2.0
         if cfg.get("settings_enabled", True):
@@ -879,9 +1050,9 @@ def execute_buy(symbol: str, price: float, mstate: dict, atr: float = None):
         # Risk-adjusted qty: how many shares until 1 SL hit = risk_dollars
         qty = max(1, int(risk_dollars / sl_dist)) if sl_dist > 0 else 1
     else:
-        sl_dist = price * cfg["stop_loss_pct"]
+        sl_dist = price * rcfg["stop_loss_pct"]
         tp_dist = price * cfg["target_pct"]
-        qty     = max(1, int((mstate["cash"] * cfg["risk_per_trade"]) / price))
+        qty     = max(1, int((mstate["cash"] * rcfg["risk_per_trade"]) / price))
 
     # Hard cap: single position may not exceed max_position_pct of available cash
     max_qty = max(1, int(mstate["cash"] * cfg["max_position_pct"] / price))
@@ -922,17 +1093,18 @@ def execute_buy(symbol: str, price: float, mstate: dict, atr: float = None):
     )
     return qty
 
-def execute_short(symbol: str, price: float, mstate: dict, atr: float = None):
+def execute_short(symbol: str, price: float, mstate: dict, atr: float = None, rcfg: dict | None = None):
     """Open a short position: sell-to-open, profit when price falls."""
+    rcfg = rcfg if rcfg is not None else cfg
     start_cash   = mstate.get("session_start_cash", price * 10)
-    risk_dollars = start_cash * cfg["risk_per_trade"]
+    risk_dollars = start_cash * rcfg["risk_per_trade"]
     atr_sl_mult  = cfg["atr_sl_mult"]
 
     if atr and atr > 0 and cfg.get("use_atr_exits", True):
         sl_dist = atr * atr_sl_mult
         tp_dist = atr * cfg["atr_tp_mult"]
-        sl_floor = price * cfg["stop_loss_pct"] * 0.5
-        sl_cap   = price * cfg["stop_loss_pct"] * 2.0
+        sl_floor = price * rcfg["stop_loss_pct"] * 0.5
+        sl_cap   = price * rcfg["stop_loss_pct"] * 2.0
         tp_floor = price * cfg["target_pct"]    * 0.5
         tp_cap   = price * cfg["target_pct"]    * 2.0
         if cfg.get("settings_enabled", True):
@@ -940,9 +1112,9 @@ def execute_short(symbol: str, price: float, mstate: dict, atr: float = None):
             tp_dist = max(tp_floor, min(tp_cap, tp_dist))
         qty = max(1, int(risk_dollars / sl_dist)) if sl_dist > 0 else 1
     else:
-        sl_dist = price * cfg["stop_loss_pct"]
+        sl_dist = price * rcfg["stop_loss_pct"]
         tp_dist = price * cfg["target_pct"]
-        qty     = max(1, int((start_cash * cfg["risk_per_trade"]) / price))
+        qty     = max(1, int((start_cash * rcfg["risk_per_trade"]) / price))
 
     max_qty = max(1, int(mstate["cash"] * cfg["max_position_pct"] / price))
     qty     = min(qty, max_qty)
@@ -977,6 +1149,37 @@ def execute_short(symbol: str, price: float, mstate: dict, atr: float = None):
     )
     return qty
 
+# ─── ONLINE-LEARNER FEEDBACK ─────────────────────────────────────────────────
+# These used to be inline `try/except: pass` blocks in the trade paths. A failure
+# left the learner's _pending buffer empty, so record_exit became a no-op and the
+# online learner never trained — with nothing logged anywhere. Failures are now
+# visible, and never propagate into the trade path.
+
+
+def rl_feedback_entry(sym: str, action: int, price: float, atr: float = 0.0) -> None:
+    """Feed an opened trade to the online learner. Never raises."""
+    try:
+        from trading_agent.integration.rl_signal import get_cached_obs as _get_obs
+        from trading_agent.integration.online_learner import record_entry as _rl_entry
+        obs = _get_obs(sym)
+        if obs is None:
+            return
+        _rl_entry(sym, obs, action, price, atr)
+    except Exception as e:  # noqa: BLE001
+        apex_log.warning("RL record_entry failed for %s: %s — learner will not see this entry", sym, e)
+        think_log("RL", f"WARNING: learner entry feedback failed for {sym}: {e}", sym)
+
+
+def rl_feedback_exit(symbol: str, price: float, pnl: float, atr: float = 0.0, side: str = "long") -> None:
+    """Feed a closed trade to the online learner. Never raises."""
+    try:
+        from trading_agent.integration.online_learner import record_exit as _rl_exit
+        _rl_exit(symbol, price, pnl, atr, side=side)
+    except Exception as e:  # noqa: BLE001
+        apex_log.warning("RL record_exit failed for %s: %s — learner will not see this exit", symbol, e)
+        think_log("RL", f"WARNING: learner exit feedback failed for {symbol}: {e}", symbol)
+
+
 def execute_sell(symbol: str, price: float, reason: str, mstate: dict):
     pos = mstate["positions"].get(symbol)
     if not pos:
@@ -999,11 +1202,7 @@ def execute_sell(symbol: str, price: float, reason: str, mstate: dict):
     del mstate["positions"][symbol]
 
     # Online learning: feed closed long trade back to PPO
-    try:
-        from trading_agent.integration.online_learner import record_exit as _rl_exit
-        _rl_exit(symbol, price, pnl, pos.get("atr", 0.0), side="long")
-    except Exception:
-        pass
+    rl_feedback_exit(symbol, price, pnl, pos.get("atr", 0.0), side="long")
 
     # Set re-entry cooldown after a stop-loss
     if reason == "STOP LOSS":
@@ -1036,11 +1235,7 @@ def execute_cover(symbol: str, price: float, reason: str, mstate: dict):
     del mstate["positions"][symbol]
 
     # Online learning: feed closed short trade back to PPO
-    try:
-        from trading_agent.integration.online_learner import record_exit as _rl_exit
-        _rl_exit(symbol, price, net_pnl, pos.get("atr", 0.0), side="short")
-    except Exception:
-        pass
+    rl_feedback_exit(symbol, price, net_pnl, pos.get("atr", 0.0), side="short")
 
     if reason == "STOP LOSS":
         cooldown_min = cfg.get("cooldown_after_sl_min", 60)
@@ -1052,10 +1247,26 @@ def execute_cover(symbol: str, price: float, reason: str, mstate: dict):
 
 # ─── MARKET CYCLE ─────────────────────────────────────────────────────────────
 
+# ── Per-symbol JEV cache + budget (v2) ─────────────────────────────────────
+# {(symbol): (fetched_at, decisions)} — avoids 32 API calls per cycle.
+_jev_sym_cache: dict = {}
+_JEV_SYM_TTL = 300
+_JEV_SYM_MAX_PER_CYCLE = 10
+
+
 def fetch_cycle_data(watchlist: list, prices: dict, market_key: str = "india") -> tuple:
     """Phase 1: fetch signals (slow, no lock needed).
     In RL mode uses PPO inference on daily bars; falls back to rule-based on failure."""
     analyses = []
+    _pending_fb: list = []  # rule-fallback bars for budgeted two-pass JEV
+    # Shared per-cycle market context for JEV (v2): computed once, reused per symbol.
+    _vix_v2 = _jev.fetch_vix(market_key) if _JEV_AVAILABLE else 20.0
+    try:
+        with _lock:
+            _prev_scores = [a.get("score", 0) for a in (_signals.get(market_key, []) or [])]
+    except Exception:
+        _prev_scores = []
+    _breadth_v2 = _jev.calc_breadth(_prev_scores) if _JEV_AVAILABLE else 0.5
     for symbol in watchlist:
         if not _agent["running"]:
             break
@@ -1089,66 +1300,354 @@ def fetch_cycle_data(watchlist: list, prices: dict, market_key: str = "india") -
                         continue
                 except Exception as exc:
                     apex_log.warning("RL signal error for %s: %s — falling back", symbol, exc)
-        # Rule-based fallback
+        # Rule-based fallback (pass 1: collect bars; JEV budgeted in pass 2)
         df = fetch_data(symbol)
         if df is None:
             continue
         live = live or float(df["close"].iloc[-1])
-        
-        # Task 17-18: Fetch per-symbol JEV decisions (news_bullishness, position_action)
-        jev_symbol_decisions = None
-        if _JEV_AVAILABLE and cfg.get("jev_enabled", True) and cfg.get("jev_news_enabled", True):
-            try:
-                # Build symbol-specific state for JEV
-                indicators = {
-                    "price": live,
-                    "rsi": calc_rsi(df["close"].astype(float)) if len(df) > 14 else 50.0,
-                    "macd_hist": calc_macd(df["close"].astype(float))[2] if len(df) > 26 else 0.0,
-                    "adx": calc_adx(df) if len(df) > 14 else 20.0,
-                    "atr": calc_atr(df) if len(df) > 14 else 0.0,
-                    "vol_ratio": calc_vol_ratio(df["volume"].astype(float)) if len(df) > 20 else 1.0,
-                }
-                # Fetch news for this symbol
-                news = []
-                try:
-                    yf_news = yf.Ticker(symbol).news or []
-                    recent = [n for n in yf_news if time.time() - float(n.get("providerPublishTime", 0)) < 86400]
-                    for item in recent[:5]:
-                        news.append({"title": item.get("title", ""), "recency_h": (time.time() - float(item.get("providerPublishTime", 0))) / 3600})
-                except Exception:
-                    pass
-                
-                with _lock:
-                    mstate = _state.get(market_key, {})
-                    portfolio_ctx = {
-                        "cash": mstate.get("cash", 0.0),
-                        "drawdown_pct": mstate.get("max_drawdown", 0.0),
-                        "open_positions": len(mstate.get("positions", {})),
-                        "daily_pnl_pct": mstate.get("realised_pnl", 0.0) / max(mstate.get("session_start_cash", 1.0), 1.0),
-                    }
-                
-                market_context = {
-                    "spy_trend_pct": _index_trend.get(market_key, 0.0),
-                    "vix": 20.0,
-                    "breadth": 0.5,
-                }
-                
-                # Get per-symbol JEV decisions (news_bullishness, position_action)
-                symbol_state = _jev.build_market_state(symbol, indicators, news, portfolio_ctx, market_context)
-                symbol_questions = {
-                    "news_bullishness": _jev.JEV_QUESTIONS["news_bullishness"],
-                    "position_action": _jev.JEV_QUESTIONS["position_action"],
-                }
-                symbol_result = _jev._call_jev_api(symbol_state, symbol_questions)
-                if symbol_result:
-                    jev_symbol_decisions = symbol_result
-            except (requests.RequestException, ValueError, KeyError) as e:
-                apex_log.debug(f"[JEV] Per-symbol decisions failed for {symbol}: {e}")
-        
-        analyses.append(analyse(symbol, df, live, jev_symbol_decisions))
+        _pending_fb.append((symbol, df, live))
         time.sleep(0.2)
+
+    # Pass 1: rule-only analyse for ranking (fast, local, no API).
+    _scored_fb: dict = {}
+    _order_fb: list = []
+    for _sym, _df, _live in _pending_fb:
+        try:
+            _scored_fb[_sym] = {"df": _df, "live": _live,
+                                "base": analyse(_sym, _df, _live, None)}
+            _order_fb.append(_sym)
+        except Exception:
+            continue
+
+    # Pass 2: budgeted per-symbol JEV — held positions first, then top-3
+    # non-held by confidence. Hard cap keeps us within MAX_CALLS_PER_CYCLE.
+    try:
+        with _lock:
+            _held_fb = set(_state.get(market_key, {}).get("positions", {}).keys())
+    except Exception:
+        _held_fb = set()
+    _held_sel = [s for s in _order_fb if s in _held_fb][:_JEV_SYM_MAX_PER_CYCLE]
+    _room = max(_JEV_SYM_MAX_PER_CYCLE - len(_held_sel), 0)
+    _top3 = sorted(
+        (s for s in _order_fb if s not in _held_fb),
+        key=lambda s: _scored_fb[s]["base"].get("confidence", 0),
+        reverse=True,
+    )[:min(3, _room)]
+    _jev_selected = set(_held_sel + _top3)
+
+    for _sym in _order_fb:
+        _e = _scored_fb[_sym]
+        if _sym in _jev_selected:
+            _jd = _get_jev_symbol_decisions(
+                _sym, _e["df"], _e["live"], market_key, prices,
+                _vix_v2, _breadth_v2)
+            if _jd is not None:
+                try:
+                    _a2 = analyse(_sym, _e["df"], _e["live"], _jd)
+                    _a2["jev_decisions"] = _jd  # T5: per-symbol action routing
+                    analyses.append(_a2)
+                    continue
+                except Exception as e:
+                    apex_log.debug("[JEV] symbol enrichment failed for %s: %s", _sym, e)
+        analyses.append(_e["base"])
+
     wl_prices = {s: prices[s] for s in watchlist if s in prices}
     return analyses, wl_prices
+        
+# ── Per-symbol JEV cache + budget (v2) ─────────────────────────────────────
+def _get_jev_symbol_decisions(symbol: str, df, live: float,
+                              market_key: str, prices: dict,
+                              vix: float = 20.0, breadth: float = 0.5) -> dict | None:
+    """Budgeted per-symbol JEV (news_bullishness + position_action).
+
+    Returns cached decisions when fresh, else calls the API once and
+    think_logs both choices. Never raises — None on any failure/disabled.
+    """
+    if not (_JEV_AVAILABLE and cfg.get("jev_enabled", True)
+            and cfg.get("jev_news_enabled", True)):
+        return None
+    now = time.time()
+    try:
+        cached = _jev_sym_cache.get(symbol)
+        if cached and (now - cached[0]) < _JEV_SYM_TTL:
+            return cached[1]
+    except Exception as e:
+        apex_log.debug("[JEV] symbol cache read failed for %s: %s", symbol, e)
+    try:
+        # Build symbol-specific state for JEV (v2: full indicator + news context)
+        close_s = df["close"].astype(float)
+        _rsi_v = calc_rsi(close_s) if len(df) > 14 else 50.0
+        _mh_v = calc_macd(close_s)[2] if len(df) > 26 else 0.0
+        _bb_u, _bb_m, _bb_l = calc_bb(close_s) if len(df) >= 20 else (live, live, live)
+        _e9_v = calc_ema(close_s, 9) if len(df) > 9 else live
+        _e21_v = calc_ema(close_s, 21) if len(df) > 21 else live
+        _atr_v = calc_atr(df) if len(df) > 14 else 0.0
+        indicators = {
+            "price": live,
+            "rsi": _rsi_v,
+            "macd_hist": _mh_v,
+            "bb_pos": round((live - _bb_l) / max(_bb_u - _bb_l, 1e-9), 4),
+            "ema_gap_pct": round((_e9_v - _e21_v) / max(abs(_e21_v), 1e-9) * 100, 4),
+            "adx": calc_adx(df) if len(df) > 14 else 20.0,
+            "atr": _atr_v,
+            "atr_pct": round(_atr_v / max(live, 1e-9), 6),
+            "vol_ratio": calc_vol_ratio(df["volume"].astype(float)) if len(df) > 20 else 1.0,
+        }
+        # Fetch news for this symbol
+        news = []
+        try:
+            yf_news = yf.Ticker(symbol).news or []
+            recent = [n for n in yf_news if time.time() - float(n.get("providerPublishTime", 0)) < 86400]
+            for item in recent[:5]:
+                news.append({
+                    "title": item.get("title", ""),
+                    "publisher": item.get("publisher", ""),
+                    "type": item.get("type", ""),
+                    "recency_h": (time.time() - float(item.get("providerPublishTime", 0))) / 3600,
+                })
+        except Exception as e:
+            apex_log.debug("[NEWS] item parse failed: %s", e)
+
+        with _lock:
+            mstate = _state.get(market_key, {})
+            _pv_v2 = portfolio_value(mstate, prices)
+            _peak_v2 = mstate.get("peak_portfolio", _pv_v2)
+            _unrl_v2 = unrealised_pnl(mstate, prices)
+            _start_v2 = max(mstate.get("session_start_cash", 1.0), 1.0)
+            _w_v2, _l_v2 = mstate.get("wins", 0), mstate.get("losses", 0)
+            portfolio_ctx = {
+                "cash": mstate.get("cash", 0.0),
+                "cash_pct": round(mstate.get("cash", 0.0) / max(_pv_v2, 1e-9), 4),
+                "drawdown_pct": round((_peak_v2 - _pv_v2) / _peak_v2 * 100, 3) if _peak_v2 > 0 else 0.0,
+                "open_positions": len(mstate.get("positions", {})),
+                "exposure_pct": round((_pv_v2 - mstate.get("cash", 0.0)) / max(_pv_v2, 1e-9), 4),
+                "daily_pnl_pct": (mstate.get("realised_pnl", 0.0) + _unrl_v2) / _start_v2,
+                "session_wr": round(_w_v2 / max(_w_v2 + _l_v2, 1), 4),
+            }
+
+        market_context = {
+            "spy_trend_pct": _index_trend.get(market_key, 0.0),
+            "vix": vix,
+            "breadth": breadth,
+        }
+
+        # Get per-symbol JEV decisions (news_bullishness, position_action)
+        symbol_state = _jev.build_market_state(symbol, indicators, news, portfolio_ctx, market_context)
+        symbol_questions = {
+            "news_bullishness": _jev.JEV_QUESTIONS["news_bullishness"],
+            "position_action": _jev.JEV_QUESTIONS["position_action"],
+        }
+        symbol_result = _jev._call_jev_api(symbol_state, symbol_questions)
+        if symbol_result:
+            _jev_sym_cache[symbol] = (now, symbol_result)
+            try:
+                _nb = symbol_result.get("news_bullishness", {})
+                _pa = symbol_result.get("position_action", {})
+                think_log("JEV",
+                          f"news={_nb.get('score', '?')} conf={_nb.get('confidence', 0):.2f}  "
+                          f"action={_pa.get('choice', '?')} conf={_pa.get('confidence', 0):.2f}",
+                          symbol)
+            except Exception as e:
+                apex_log.debug("[JEV] narration failed for %s: %s", symbol, e)
+            return symbol_result
+    except (requests.RequestException, ValueError, KeyError) as e:
+        apex_log.debug(f"[JEV] Per-symbol decisions failed for {symbol}: {e}")
+    return None
+
+# ─── EXIT POLICIES ───────────────────────────────────────────────────────────
+# These were duplicated inside apply_cycle: once in the JEV-halt early return and
+# again on the normal path. The copies had already drifted — only the halt path
+# applied the JEV trailing multiplier, only the main path counted sells — so the
+# same position was managed two different ways depending on whether a risk gate
+# happened to be open. One implementation, one behaviour, both paths.
+#
+# All three mutate mstate in place and are called with _lock held.
+
+
+def eod_exit_pass(mstate: dict, prices: dict, mtc) -> int:
+    """End-of-day liquidation: harvest winners in the harvest window, then force
+    everything out inside the force-exit window. Returns the count closed."""
+    closed = 0
+    if mtc is None:
+        return closed
+    harvest_min = cfg["eod_harvest_min"]
+    exit_min    = cfg["eod_exit_min"]
+    for sym in list(mstate["positions"].keys()):
+        pos = mstate["positions"].get(sym)
+        if not pos:
+            continue
+        price = prices.get(sym) or get_price(sym)
+        if price is None:
+            continue
+        is_short = pos.get("side", "long") == "short"
+        pnl = ((pos["entry"] - price) * pos["qty"] if is_short
+               else (price - pos["entry"]) * pos["qty"])
+
+        if exit_min < mtc <= harvest_min and pnl > 0:
+            think_log("EXIT", f"{sym} EOD HARVEST: {mtc:.0f}m to close  P&L={pnl:+.0f}", sym)
+            if is_short:
+                paper_cover(sym, pos["qty"], prices, mstate, f"EOD PROFIT ({mtc:.0f}m to close)")
+            else:
+                paper_sell(sym, pos["qty"], prices, mstate, f"EOD PROFIT ({mtc:.0f}m to close)")
+            apex_log.info(f"EOD profit harvest: {sym}  P&L={pnl:+.0f}  {mtc:.0f}m left")
+            closed += 1
+
+        elif mtc <= exit_min:
+            tag = "EOD EXIT" if pnl >= 0 else "EOD CUT LOSS"
+            think_log("EXIT", f"{sym} EOD FORCE EXIT ({tag}): {mtc:.0f}m to close  P&L={pnl:+.0f}", sym)
+            if is_short:
+                paper_cover(sym, pos["qty"], prices, mstate, f"{tag} ({mtc:.0f}m to close)")
+            else:
+                paper_sell(sym, pos["qty"], prices, mstate, f"{tag} ({mtc:.0f}m to close)")
+            apex_log.info(f"EOD force exit: {sym}  P&L={pnl:+.0f}  {mtc:.0f}m left")
+            closed += 1
+    return closed
+
+
+def _trailing_dist(jev_decisions) -> float:
+    """Trailing distance multiplier, widened by a confident low-trend JEV read."""
+    base = cfg.get("trailing_dist_mult", 1.5)
+    if jev_decisions and _JEV_AVAILABLE and cfg.get("jev_trend_enabled", True):
+        return _jev.get_trailing_dist_mult(base, jev_decisions)
+    return base
+
+
+def stop_pass(mstate: dict, prices: dict, jev_decisions=None) -> int:
+    """Ratchet trailing stops, then close on stop-loss or target. Count closed.
+
+    Trailing runs before the SL/TP check for each symbol so a freshly ratcheted
+    stop is honoured in the same cycle.
+    """
+    closed = 0
+    trailing_on = cfg.get("trailing_stop_enabled", True)
+    act_mult = cfg.get("trailing_activation_mult", 1.0)
+    dist_mult = _trailing_dist(jev_decisions)
+
+    for sym in list(mstate["positions"].keys()):
+        pos = mstate["positions"].get(sym)
+        if pos is None or prices.get(sym) is None:
+            continue
+        price = prices[sym]
+        is_short = pos.get("side", "long") == "short"
+
+        # ── Trailing stop — mirrored for longs vs shorts ──────────────────────
+        if trailing_on and pos.get("atr", 0) > 0:
+            if not is_short:
+                # LONG: activate 1×ATR above entry, SL trails up
+                activation = pos["entry"] + pos["atr"] * act_mult
+                if price >= activation:
+                    pos["running_high"] = max(pos.get("running_high", price), price)
+                    new_sl = pos["running_high"] - pos["atr"] * dist_mult
+                    if new_sl > pos["stop_loss"]:        # only ever tightens
+                        old_sl = pos["stop_loss"]
+                        pos["stop_loss"] = round(new_sl, 2)
+                        think_log("EXIT",
+                                  f"{sym} TRAIL ↑ SL {old_sl:.2f}→{pos['stop_loss']:.2f}  "
+                                  f"running_high={pos['running_high']:.2f}", sym)
+                        apex_log.debug(
+                            f"[TRAIL] {sym}  SL {old_sl:.2f}→{pos['stop_loss']:.2f}  "
+                            f"high={pos['running_high']:.2f}"
+                        )
+            else:
+                # SHORT: activate 1×ATR below entry, SL trails down
+                activation = pos["entry"] - pos["atr"] * act_mult
+                if price <= activation:
+                    pos["running_low"] = min(pos.get("running_low", price), price)
+                    new_sl = pos["running_low"] + pos["atr"] * dist_mult
+                    if new_sl < pos["stop_loss"]:        # only ever tightens
+                        old_sl = pos["stop_loss"]
+                        pos["stop_loss"] = round(new_sl, 2)
+                        think_log("EXIT",
+                                  f"{sym} TRAIL ↓ SL {old_sl:.2f}→{pos['stop_loss']:.2f}  "
+                                  f"running_low={pos['running_low']:.2f}", sym)
+                        apex_log.debug(
+                            f"[TRAIL-SHORT] {sym}  SL {old_sl:.2f}→{pos['stop_loss']:.2f}  "
+                            f"low={pos['running_low']:.2f}"
+                        )
+
+        # ── SL / target — inverted for shorts ─────────────────────────────────
+        if not is_short:
+            sl_hit = price <= pos["stop_loss"]
+            tp_hit = price >= pos["target"]
+        else:
+            sl_hit = price >= pos["stop_loss"]   # short: price rising = loss
+            tp_hit = price <= pos["target"]       # short: price falling = profit
+
+        if sl_hit:
+            think_log("EXIT", f"{sym} STOP LOSS hit @ {price:.2f}  SL was {pos['stop_loss']:.2f}", sym)
+            if is_short:
+                paper_cover(sym, pos["qty"], prices, mstate, "STOP LOSS")
+            else:
+                paper_sell(sym, pos["qty"], prices, mstate, "STOP LOSS")
+            closed += 1
+        elif tp_hit:
+            think_log("EXIT", f"{sym} TARGET HIT @ {price:.2f}  T was {pos['target']:.2f}", sym)
+            if is_short:
+                paper_cover(sym, pos["qty"], prices, mstate, "TARGET HIT")
+            else:
+                paper_sell(sym, pos["qty"], prices, mstate, "TARGET HIT")
+            closed += 1
+    return closed
+
+
+def hold_review_pass(mstate: dict, prices: dict, market_key: str, _dc: dict) -> int:
+    """Let the RL agent vote an early exit on positions that survived stop/target.
+
+    Split out of the stop pass so the exit side of a cycle reads as an ordered
+    list of policies rather than one 500-line function. Returns the count closed.
+    """
+    closed = 0
+    for sym in list(mstate["positions"].keys()):
+        pos = mstate["positions"].get(sym)
+        if pos is None or prices.get(sym) is None:
+            continue
+        price = prices[sym]
+        is_short = pos.get("side", "long") == "short"
+        pnl_pct = ((pos["entry"] - price) / pos["entry"] * 100 if is_short
+                   else (price - pos["entry"]) / pos["entry"] * 100)
+
+        rl_exited = False
+        if cfg.get("rl_mode") and _RL_AVAILABLE:
+            try:
+                rl_result = _get_rl_signal(sym, price)
+                if rl_result is not None:
+                    rl_action = rl_result.get("rl_action", 0)
+                    rl_conf = rl_result.get("confidence", 0)
+                    rl_exit_thr = cfg.get("rl_exit_confidence", 55)
+                    should_exit = (
+                        (not is_short and rl_action == 2 and rl_conf >= rl_exit_thr) or
+                        (is_short and rl_action == 1 and rl_conf >= rl_exit_thr)
+                    )
+                    if should_exit:
+                        think_log("EXIT",
+                                  f"{sym} RL EXIT  conf={rl_conf:.0f}%  "
+                                  f"P&L={pnl_pct:+.1f}%  "
+                                  f"action={'SELL' if rl_action == 2 else 'BUY-TO-COVER'}", sym)
+                        if is_short:
+                            paper_cover(sym, pos["qty"], prices, mstate, "RL EXIT")
+                        else:
+                            paper_sell(sym, pos["qty"], prices, mstate, "RL EXIT")
+                        _dc["sell"] += 1
+                        closed += 1
+                        rl_exited = True
+            except Exception as e:
+                # Falling through here leaves the position open, so this must be
+                # visible rather than silently ignored.
+                apex_log.warning("RL early-exit check failed for %s: %s", sym, e)
+
+        if not rl_exited:
+            apex_log.debug(
+                f"[{market_key.upper()}] SL-CHECK HOLD  {sym}  "
+                f"price={price:.2f}  P&L={pnl_pct:+.1f}%  "
+                f"SL={pos['stop_loss']:.2f}  T={pos['target']:.2f}"
+            )
+    return closed
+
+
+def run_exit_policies(mstate: dict, prices: dict, mtc, jev_decisions=None) -> int:
+    """The whole exit side of a cycle. Identical whether or not JEV halted entries."""
+    return eod_exit_pass(mstate, prices, mtc) + stop_pass(mstate, prices, jev_decisions)
+
 
 def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int, jev_decisions_per_market: dict | None = None):
     """Phase 2: apply decisions to state (must be called with _lock held)."""
@@ -1160,6 +1659,10 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int, jev
     _strict      = _settings_active()
     conf_thr     = cfg["confidence_threshold"] if _strict else 50
     max_pos_eff  = max_pos if _strict else 999
+    # Base config overlaid with this cycle's JEV risk gates. The gated keys
+    # (risk_per_trade, stop_loss_pct, daily/max loss limits, open window) must
+    # read from here, not from cfg, or the gates have no effect on execution.
+    rcfg         = effective_cfg(market_key)
     apex_log.info(
         f"[{market_key.upper()}] think loop ▶  "
         f"{len(analyses)} symbols scanned  "
@@ -1182,90 +1685,7 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int, jev
             pv = portfolio_value(mstate, prices)
             if pv > mstate.get("peak_portfolio", pv):
                 mstate["peak_portfolio"] = pv
-            
-            # EOD exit logic still runs
-            if mtc is not None:
-                for sym in list(mstate["positions"].keys()):
-                    pos = mstate["positions"].get(sym)
-                    if not pos:
-                        continue
-                    price = prices.get(sym) or get_price(sym)
-                    if price is None:
-                        continue
-                    is_short = pos.get("side", "long") == "short"
-                    pnl = ((pos["entry"] - price) * pos["qty"] if is_short
-                           else (price - pos["entry"]) * pos["qty"])
-                    if exit_min < mtc <= harvest_min and pnl > 0:
-                        think_log("EXIT", f"{sym} EOD HARVEST: {mtc:.0f}m to close  P&L={pnl:+.0f}", sym)
-                        if is_short:
-                            paper_cover(sym, pos["qty"], prices, mstate, f"EOD PROFIT ({mtc:.0f}m to close)")
-                        else:
-                            paper_sell(sym, pos["qty"], prices, mstate, f"EOD PROFIT ({mtc:.0f}m to close)")
-                        apex_log.info(f"EOD profit harvest: {sym}  P&L={pnl:+.0f}  {mtc:.0f}m left")
-                    elif mtc <= exit_min:
-                        tag = "EOD EXIT" if pnl >= 0 else "EOD CUT LOSS"
-                        think_log("EXIT", f"{sym} EOD FORCE EXIT ({tag}): {mtc:.0f}m to close  P&L={pnl:+.0f}", sym)
-                        if is_short:
-                            paper_cover(sym, pos["qty"], prices, mstate, f"{tag} ({mtc:.0f}m to close)")
-                        else:
-                            paper_sell(sym, pos["qty"], prices, mstate, f"{tag} ({mtc:.0f}m to close)")
-                        apex_log.info(f"EOD force exit: {sym}  P&L={pnl:+.0f}  {mtc:.0f}m left")
-            
-            # Trailing stop updates
-            for sym in list(mstate["positions"].keys()):
-                pos = mstate["positions"].get(sym)
-                if pos is None or prices.get(sym) is None:
-                    continue
-                price = prices[sym]
-                is_short = pos.get("side", "long") == "short"
-                if cfg.get("trailing_stop_enabled", True) and pos.get("atr", 0) > 0:
-                    act_mult = cfg.get("trailing_activation_mult", 1.0)
-                    dist_mult = _jev.get_trailing_dist_mult(cfg.get("trailing_dist_mult", 1.5), jev_decisions)
-                    if not is_short:
-                        activation = pos["entry"] + pos["atr"] * act_mult
-                        if price >= activation:
-                            pos["running_high"] = max(pos.get("running_high", price), price)
-                            new_sl = pos["running_high"] - pos["atr"] * dist_mult
-                            if new_sl > pos["stop_loss"]:
-                                old_sl = pos["stop_loss"]
-                                pos["stop_loss"] = round(new_sl, 2)
-                                think_log("EXIT", f"{sym} TRAIL ↑ SL {old_sl:.2f}→{pos['stop_loss']:.2f} running_high={pos['running_high']:.2f}", sym)
-                    else:
-                        activation = pos["entry"] - pos["atr"] * act_mult
-                        if price <= activation:
-                            pos["running_low"] = min(pos.get("running_low", price), price)
-                            new_sl = pos["running_low"] + pos["atr"] * dist_mult
-                            if new_sl < pos["stop_loss"]:
-                                old_sl = pos["stop_loss"]
-                                pos["stop_loss"] = round(new_sl, 2)
-                                think_log("EXIT", f"{sym} TRAIL ↓ SL {old_sl:.2f}→{pos['stop_loss']:.2f} running_low={pos['running_low']:.2f}", sym)
-                
-                # SL/TP checks
-                for sym in list(mstate["positions"].keys()):
-                    pos = mstate["positions"].get(sym)
-                    if pos is None or prices.get(sym) is None:
-                        continue
-                    price = prices[sym]
-                    is_short = pos.get("side", "long") == "short"
-                    if not is_short:
-                        sl_hit = price <= pos["stop_loss"]
-                        tp_hit = price >= pos["target"]
-                    else:
-                        sl_hit = price >= pos["stop_loss"]
-                        tp_hit = price <= pos["target"]
-                    if sl_hit:
-                        think_log("EXIT", f"{sym} STOP LOSS hit @ {price:.2f}  SL was {pos['stop_loss']:.2f}", sym)
-                        if is_short:
-                            paper_cover(sym, pos["qty"], prices, mstate, "STOP LOSS")
-                        else:
-                            paper_sell(sym, pos["qty"], prices, mstate, "STOP LOSS")
-                    elif tp_hit:
-                        think_log("EXIT", f"{sym} TARGET HIT @ {price:.2f}  T was {pos['target']:.2f}", sym)
-                        if is_short:
-                            paper_cover(sym, pos["qty"], prices, mstate, "TARGET HIT")
-                        else:
-                            paper_sell(sym, pos["qty"], prices, mstate, "TARGET HIT")
-            
+            _dc["sell"] += run_exit_policies(mstate, prices, mtc, jev_decisions)
             return
 
     # ── 1. Update peak portfolio (prerequisite for drawdown kill-switch) ──────
@@ -1273,141 +1693,12 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int, jev
     if pv > mstate.get("peak_portfolio", pv):
         mstate["peak_portfolio"] = pv
 
-    # ── 2. EOD exit: runs before normal SL/target checks ─────────────────────
-    if mtc is not None:
-        for sym in list(mstate["positions"].keys()):
-            pos   = mstate["positions"].get(sym)
-            if not pos:
-                continue
-            price = prices.get(sym) or get_price(sym)
-            if price is None:
-                continue
-            is_short = pos.get("side", "long") == "short"
-            pnl = ((pos["entry"] - price) * pos["qty"] if is_short
-                   else (price - pos["entry"]) * pos["qty"])
-
-            if exit_min < mtc <= harvest_min and pnl > 0:
-                think_log("EXIT", f"{sym} EOD HARVEST: {mtc:.0f}m to close  P&L={pnl:+.0f}", sym)
-                if is_short:
-                    paper_cover(sym, pos["qty"], prices, mstate, f"EOD PROFIT ({mtc:.0f}m to close)")
-                else:
-                    paper_sell(sym, pos["qty"], prices, mstate, f"EOD PROFIT ({mtc:.0f}m to close)")
-                apex_log.info(f"EOD profit harvest: {sym}  P&L={pnl:+.0f}  {mtc:.0f}m left")
-
-            elif mtc <= exit_min:
-                tag = "EOD EXIT" if pnl >= 0 else "EOD CUT LOSS"
-                think_log("EXIT", f"{sym} EOD FORCE EXIT ({tag}): {mtc:.0f}m to close  P&L={pnl:+.0f}", sym)
-                if is_short:
-                    paper_cover(sym, pos["qty"], prices, mstate, f"{tag} ({mtc:.0f}m to close)")
-                else:
-                    paper_sell(sym, pos["qty"], prices, mstate, f"{tag} ({mtc:.0f}m to close)")
-                apex_log.info(f"EOD force exit: {sym}  P&L={pnl:+.0f}  {mtc:.0f}m left")
-
-    # ── 3. Trailing stop update + normal SL / target checks ──────────────────
-    for sym in list(mstate["positions"].keys()):
-        pos   = mstate["positions"].get(sym)
-        if pos is None or prices.get(sym) is None:
-            continue
-        price = prices[sym]
-
-        is_short = pos.get("side", "long") == "short"
-
-        # Trailing stop — mirror logic for longs vs shorts
-        if cfg.get("trailing_stop_enabled", True) and pos.get("atr", 0) > 0:
-            act_mult = cfg.get("trailing_activation_mult", 1.0)
-            dist_mult = cfg.get("trailing_dist_mult", 1.5)
-            if not is_short:
-                # LONG: activate when price rises 1×ATR above entry, SL trails up
-                activation = pos["entry"] + pos["atr"] * act_mult
-                if price >= activation:
-                    pos["running_high"] = max(pos.get("running_high", price), price)
-                    new_sl = pos["running_high"] - pos["atr"] * dist_mult
-                    if new_sl > pos["stop_loss"]:
-                        old_sl = pos["stop_loss"]
-                        pos["stop_loss"] = round(new_sl, 2)
-                        think_log("EXIT",
-                                  f"{sym} TRAIL ↑ SL {old_sl:.2f}→{pos['stop_loss']:.2f}  "
-                                  f"running_high={pos['running_high']:.2f}", sym)
-                        apex_log.debug(
-                            f"[TRAIL] {sym}  SL {old_sl:.2f}→{pos['stop_loss']:.2f}  "
-                            f"high={pos['running_high']:.2f}"
-                        )
-            else:
-                # SHORT: activate when price falls 1×ATR below entry, SL trails down
-                activation = pos["entry"] - pos["atr"] * act_mult
-                if price <= activation:
-                    pos["running_low"] = min(pos.get("running_low", price), price)
-                    new_sl = pos["running_low"] + pos["atr"] * dist_mult
-                    if new_sl < pos["stop_loss"]:   # tighten SL downward
-                        old_sl = pos["stop_loss"]
-                        pos["stop_loss"] = round(new_sl, 2)
-                        think_log("EXIT",
-                                  f"{sym} TRAIL ↓ SL {old_sl:.2f}→{pos['stop_loss']:.2f}  "
-                                  f"running_low={pos['running_low']:.2f}", sym)
-                        apex_log.debug(
-                            f"[TRAIL-SHORT] {sym}  SL {old_sl:.2f}→{pos['stop_loss']:.2f}  "
-                            f"low={pos['running_low']:.2f}"
-                        )
-
-        # SL / target checks — inverted for shorts
-        if not is_short:
-            sl_hit = price <= pos["stop_loss"]
-            tp_hit = price >= pos["target"]
-        else:
-            sl_hit = price >= pos["stop_loss"]   # short: price rising = loss
-            tp_hit = price <= pos["target"]       # short: price falling = profit
-
-        if sl_hit:
-            think_log("EXIT", f"{sym} STOP LOSS hit @ {price:.2f}  SL was {pos['stop_loss']:.2f}", sym)
-            if is_short:
-                paper_cover(sym, pos["qty"], prices, mstate, "STOP LOSS")
-            else:
-                paper_sell(sym, pos["qty"], prices, mstate, "STOP LOSS")
-            _dc["sell"] += 1
-        elif tp_hit:
-            think_log("EXIT", f"{sym} TARGET HIT @ {price:.2f}  T was {pos['target']:.2f}", sym)
-            if is_short:
-                paper_cover(sym, pos["qty"], prices, mstate, "TARGET HIT")
-            else:
-                paper_sell(sym, pos["qty"], prices, mstate, "TARGET HIT")
-            _dc["sell"] += 1
-        else:
-            pnl_pct = ((pos["entry"] - price) / pos["entry"] * 100 if is_short
-                       else (price - pos["entry"]) / pos["entry"] * 100)
-
-            # RL agent gets to vote on early exit while SL/TP not yet hit
-            rl_exited = False
-            if cfg.get("rl_mode") and _RL_AVAILABLE:
-                try:
-                    rl_result = _get_rl_signal(sym, price)
-                    if rl_result is not None:
-                        rl_action = rl_result.get("rl_action", 0)
-                        rl_conf   = rl_result.get("confidence", 0)
-                        rl_exit_thr = cfg.get("rl_exit_confidence", 55)
-                        should_exit = (
-                            (not is_short and rl_action == 2 and rl_conf >= rl_exit_thr) or
-                            (is_short     and rl_action == 1 and rl_conf >= rl_exit_thr)
-                        )
-                        if should_exit:
-                            think_log("EXIT",
-                                      f"{sym} RL EXIT  conf={rl_conf:.0f}%  "
-                                      f"P&L={pnl_pct:+.1f}%  "
-                                      f"action={'SELL' if rl_action == 2 else 'BUY-TO-COVER'}", sym)
-                            if is_short:
-                                paper_cover(sym, pos["qty"], prices, mstate, "RL EXIT")
-                            else:
-                                paper_sell(sym, pos["qty"], prices, mstate, "RL EXIT")
-                            _dc["sell"] += 1
-                            rl_exited = True
-                except Exception:
-                    pass
-
-            if not rl_exited:
-                apex_log.debug(
-                    f"[{market_key.upper()}] SL-CHECK HOLD  {sym}  "
-                    f"price={price:.2f}  P&L={pnl_pct:+.1f}%  "
-                    f"SL={pos['stop_loss']:.2f}  T={pos['target']:.2f}"
-                )
+    # ── 2. Exits: EOD schedule, then trailing / stop / target ──────────────
+    _dc["sell"] += run_exit_policies(
+        mstate, prices, mtc, (jev_decisions_per_market or {}).get(market_key)
+    )
+    # ── 3. Surviving positions: let the RL agent vote an early exit ───────────
+    _dc["sell"] += hold_review_pass(mstate, prices, market_key, _dc)
 
     # ── 4. Block new buys when EOD exit mode is active ───────────────────────
     if mtc is not None and mtc <= harvest_min:
@@ -1422,8 +1713,8 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int, jev
     daily_loss_pct = mstate["realised_pnl"] / session_start if session_start > 0 else 0
     peak           = mstate.get("peak_portfolio", pv)
     drawdown_pct   = (peak - pv) / peak if peak > 0 else 0
-    if (daily_loss_pct < -cfg.get("daily_loss_limit_pct", 0.05)
-            or drawdown_pct > cfg.get("max_drawdown_pct", 0.08)):
+    if (daily_loss_pct < -rcfg.get("daily_loss_limit_pct", 0.05)
+            or drawdown_pct > rcfg.get("max_drawdown_pct", 0.08)):
         mstate["trading_halted"] = True
         think_log("RISK",
                   f"TRADING HALTED — daily_loss={daily_loss_pct:.1%}  "
@@ -1441,7 +1732,7 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int, jev
     open_h, open_m = (9, 15) if market_key == "india" else (9, 30)
     open_time = now_local.replace(hour=open_h, minute=open_m, second=0, microsecond=0)
     mins_since_open = (now_local - open_time).total_seconds() / 60
-    in_open_window  = 0 <= mins_since_open < cfg.get("open_filter_min", 15)
+    in_open_window  = 0 <= mins_since_open < rcfg.get("open_filter_min", 15)
     open_conf_gate  = cfg.get("open_filter_confidence", 85)
 
     # ── 7. Index trend gate ───────────────────────────────────────────────────
@@ -1486,10 +1777,11 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int, jev
             pos = mstate["positions"][sym]
             pos_side = pos.get("side", "long")
             
-            # JEV Exit Override (Task 24): Check JEV position_action for exit/trim
+            # JEV Exit Override (Task 24, v2): per-symbol position_action first,
+            # system-level fallback (which lacks position_action).
             jev_exit_triggered = False
             if _JEV_AVAILABLE and cfg.get("jev_action_enabled", True):
-                jev_decisions = jev_decisions_per_market.get(market_key)
+                jev_decisions = a.get("jev_decisions") or jev_decisions_per_market.get(market_key)
                 if jev_decisions:
                     action, action_conf = _jev.get_position_action(jev_decisions)
                     if action == "exit" and action_conf >= cfg.get("jev_action_confidence_threshold", 0.65):
@@ -1588,11 +1880,11 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int, jev
         elif cooldown_until and now_utc >= cooldown_until:
             mstate["cooldown_until"].pop(sym, None)
 
-        # ── JEV Position Action Gate (Tasks 22-27) ────────────────────────────────
+        # ── JEV Position Action Gate (Tasks 22-27, v2: per-symbol first) ─────────
         jev_action = None
         jev_action_conf = 0.0
         if _JEV_AVAILABLE and cfg.get("jev_action_enabled", True):
-            jev_decisions = jev_decisions_per_market.get(market_key)
+            jev_decisions = a.get("jev_decisions") or jev_decisions_per_market.get(market_key)
             if jev_decisions:
                 jev_action, jev_action_conf = _jev.get_position_action(jev_decisions)
 
@@ -1612,21 +1904,14 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int, jev
             think_log("ENTRY",
                       f"{sym} ENTRY: conf={conf:.0f}%  score={a['score']:+d}  "
                       f"@ {a['price']:.2f}  ADX={adx_val:.1f}  ATR={a.get('atr', 0):.3f}", sym)
-            if paper_buy(sym, 0, prices, mstate, atr=a.get("atr")):
+            if paper_buy(sym, 0, prices, mstate, atr=a.get("atr"), rcfg=rcfg):
                 open_pos += 1
                 _dc["buy"] += 1
                 # Online learning: record obs+action for any trade where RL built
                 # an observation (RL mode runs _build_observation for all symbols
                 # even when the entropy gate rejects the signal). For rule-based
                 # fallback trades we use action=1 (BUY) to teach the model the outcome.
-                try:
-                    from trading_agent.integration.rl_signal import get_cached_obs as _get_obs
-                    from trading_agent.integration.online_learner import record_entry as _rl_entry
-                    _obs = _get_obs(sym)
-                    if _obs is not None:
-                        _rl_entry(sym, _obs, a.get("rl_action", 1), a["price"], a.get("atr", 0.0))
-                except Exception:
-                    pass
+                rl_feedback_entry(sym, a.get("rl_action", 1), a["price"], a.get("atr", 0.0))
 
         # ── SHORT entry ──────────────────────────────────────────────────────
         elif (short_enabled
@@ -1642,17 +1927,10 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int, jev
             think_log("ENTRY",
                       f"{sym} SHORT ENTRY: bearish_conf={bearish_conf:.0f}%  score={a['score']:+d}  "
                       f"@ {a['price']:.2f}  ADX={adx_val:.1f}  ATR={a.get('atr', 0):.3f}", sym)
-            if paper_short(sym, 0, prices, mstate, atr=a.get("atr")):
+            if paper_short(sym, 0, prices, mstate, atr=a.get("atr"), rcfg=rcfg):
                 open_pos += 1
                 _dc["buy"] += 1
-                try:
-                    from trading_agent.integration.rl_signal import get_cached_obs as _get_obs
-                    from trading_agent.integration.online_learner import record_entry as _rl_entry
-                    _obs = _get_obs(sym)
-                    if _obs is not None:
-                        _rl_entry(sym, _obs, 2, a["price"], a.get("atr", 0.0))  # 2=SELL
-                except Exception:
-                    pass
+                rl_feedback_entry(sym, 2, a["price"], a.get("atr", 0.0))  # 2=SELL
 
         else:
             # Diagnose which condition failed
@@ -1690,7 +1968,7 @@ def apply_cycle(market_key: str, analyses: list, prices: dict, max_pos: int, jev
         f"HOLD:{_dc['hold']}  WATCH:{_dc['watch']}  "
         f"cash={mstate['cash']:.0f}  pos={len(mstate['positions'])}  "
         f"index={index_pct:+.2f}%"
-        + (f"  [OPEN WINDOW {mins_since_open:.0f}m/{cfg['open_filter_min']}m]"
+        + (f"  [OPEN WINDOW {mins_since_open:.0f}m/{rcfg['open_filter_min']}m]"
            if in_open_window else "")
     )
 
@@ -1716,14 +1994,14 @@ def unrealised_pnl(mstate: dict, prices: dict) -> float:
 
 # ─── PAPER TRADING LAYER ──────────────────────────────────────────────────────
 
-def paper_buy(symbol: str, qty: int, latest_prices: dict, mstate: dict, atr: float = None):
+def paper_buy(symbol: str, qty: int, latest_prices: dict, mstate: dict, atr: float = None, rcfg: dict | None = None):
     """Paper-trade a buy using the price from the snapshot.
     qty is advisory; actual qty is computed from risk settings inside execute_buy."""
     price = latest_prices.get(symbol)
     if price is None:
         apex_log.warning(f"paper_buy: no price for {symbol} in snapshot — skipping")
         return None
-    return execute_buy(symbol, price, mstate, atr=atr)
+    return execute_buy(symbol, price, mstate, atr=atr, rcfg=rcfg)
 
 def paper_sell(symbol: str, qty: int, latest_prices: dict, mstate: dict, reason: str = "SIGNAL"):
     """Paper-trade a sell using the price from the snapshot (falls back to live fetch)."""
@@ -1733,13 +2011,13 @@ def paper_sell(symbol: str, qty: int, latest_prices: dict, mstate: dict, reason:
         return
     execute_sell(symbol, price, reason, mstate)
 
-def paper_short(symbol: str, qty: int, latest_prices: dict, mstate: dict, atr: float = None):
+def paper_short(symbol: str, qty: int, latest_prices: dict, mstate: dict, atr: float = None, rcfg: dict | None = None):
     """Paper-trade a short: sell-to-open at snapshot price."""
     price = latest_prices.get(symbol)
     if price is None:
         apex_log.warning(f"paper_short: no price for {symbol} — skipping")
         return None
-    return execute_short(symbol, price, mstate, atr=atr)
+    return execute_short(symbol, price, mstate, atr=atr, rcfg=rcfg)
 
 def paper_cover(symbol: str, qty: int, latest_prices: dict, mstate: dict, reason: str = "SIGNAL"):
     """Paper-trade a short cover: buy-to-close at snapshot price (falls back to live)."""
@@ -1752,28 +2030,32 @@ def paper_cover(symbol: str, qty: int, latest_prices: dict, mstate: dict, reason
 def get_summary(latest_prices: dict) -> dict:
     """Return a snapshot summary of both paper portfolios at current prices."""
     with _lock:
-        india_pv   = portfolio_value(_state["india"], latest_prices)
-        us_pv      = portfolio_value(_state["us"],    latest_prices)
-        india_upnl = unrealised_pnl(_state["india"],  latest_prices)
-        us_upnl    = unrealised_pnl(_state["us"],     latest_prices)
+        # Tolerate a market that has not been loaded yet; this is called on the
+        # /api/state poll and must not raise.
+        im = _state.get("india") or _empty_mstate(cfg["india_capital"], "")
+        um = _state.get("us")    or _empty_mstate(cfg["us_capital"], "")
+        india_pv   = portfolio_value(im, latest_prices)
+        us_pv      = portfolio_value(um, latest_prices)
+        india_upnl = unrealised_pnl(im, latest_prices)
+        us_upnl    = unrealised_pnl(um, latest_prices)
         return {
             "india": {
-                "cash":            round(_state["india"]["cash"], 2),
+                "cash":            round(im["cash"], 2),
                 "portfolio_value": round(india_pv, 2),
                 "unrealised_pnl":  round(india_upnl, 2),
-                "realised_pnl":    round(_state["india"]["realised_pnl"], 2),
-                "open_positions":  len(_state["india"]["positions"]),
-                "wins":            _state["india"]["wins"],
-                "losses":          _state["india"]["losses"],
+                "realised_pnl":    round(im["realised_pnl"], 2),
+                "open_positions":  len(im["positions"]),
+                "wins":            im["wins"],
+                "losses":          im["losses"],
             },
             "us": {
-                "cash":            round(_state["us"]["cash"], 2),
+                "cash":            round(um["cash"], 2),
                 "portfolio_value": round(us_pv, 2),
                 "unrealised_pnl":  round(us_upnl, 2),
-                "realised_pnl":    round(_state["us"]["realised_pnl"], 2),
-                "open_positions":  len(_state["us"]["positions"]),
-                "wins":            _state["us"]["wins"],
-                "losses":          _state["us"]["losses"],
+                "realised_pnl":    round(um["realised_pnl"], 2),
+                "open_positions":  len(um["positions"]),
+                "wins":            um["wins"],
+                "losses":          um["losses"],
             },
         }
 
@@ -1793,9 +2075,9 @@ def start_price_updater():
 
 def agent_loop():
     global _state
-    with _lock:
-        load_cfg()
-        _state = load_state()
+    # Loading is blocking I/O — done before taking the lock.
+    load_cfg()
+    _state = load_state()
     _agent["status"] = "running"
     apex_log.info("Agent started — dual-market cycle active")
     if RL_MODE and _RL_AVAILABLE:
@@ -1808,6 +2090,7 @@ def agent_loop():
     # Track previous open state to detect market-close transitions
     _prev_india_open = False
     _prev_us_open    = False
+    consecutive_failures = 0
 
     while _agent["running"]:
         if _agent["paused"]:
@@ -1815,6 +2098,55 @@ def agent_loop():
             time.sleep(5)
             continue
 
+        # Everything from here to the sleep is one cycle. It is wrapped because an
+        # exception used to escape this thread and stop trading permanently —
+        # silently, since nothing logs a background-thread death.
+        try:
+            _cycle_failures = _run_one_cycle(
+                _prev_india_open, _prev_us_open
+            )
+            _prev_india_open, _prev_us_open, sleep_min = _cycle_failures
+            if consecutive_failures:
+                apex_log.info(
+                    "Agent cycle recovered after %d failure(s)", consecutive_failures
+                )
+                think_log(
+                    "CYCLE", f"Cycle recovered after {consecutive_failures} failure(s).", "SYSTEM"
+                )
+            consecutive_failures = 0
+        except Exception as e:  # noqa: BLE001
+            consecutive_failures += 1
+            _agent["status"] = "error"
+            apex_log.exception("Agent cycle failed (%d in a row): %s", consecutive_failures, e)
+            think_log("CYCLE", f"ERROR: cycle failed ({consecutive_failures}): {e}", "SYSTEM")
+            if consecutive_failures == 1 or consecutive_failures % 10 == 0:
+                apex_log.error(
+                    "Agent has failed %d consecutive cycles — trading may be stalled",
+                    consecutive_failures,
+                )
+            time.sleep(30)   # back off rather than hot-looping on the failure
+            continue
+
+        # Sleep in 5-second ticks so stop/pause respond quickly
+        for _ in range(sleep_min * 12):
+            if not _agent["running"]:
+                break
+            time.sleep(5)
+
+    _agent["status"]  = "stopped"
+    _agent["running"] = False
+    apex_log.info("Agent stopped")
+
+
+def _run_one_cycle(prev_india_open: bool, prev_us_open: bool) -> tuple:
+    """Execute exactly one scan/apply/save cycle and return
+    (prev_india_open, prev_us_open, sleep_min).
+
+    Split out of agent_loop purely so the caller can wrap it; the body is the
+    original loop body verbatim.
+    """
+    global _state
+    if True:
         india_open = is_india_open()
         us_open    = is_us_open()
         _agent["india_open"] = india_open
@@ -1840,15 +2172,19 @@ def agent_loop():
             _check_session_rotation(prices_snapshot)
 
         # ── Auto end session when a market transitions open → closed ──────────
+        _session_closed = False
         with _lock:
             if _prev_india_open and not india_open:
                 apex_log.info("[SESSION] India market just closed — auto-archiving session")
                 _close_session("india", prices_snapshot)
-                save_state(_state)
+                _session_closed = True
             if _prev_us_open and not us_open:
                 apex_log.info("[SESSION] US market just closed — auto-archiving session")
                 _close_session("us", prices_snapshot)
-                save_state(_state)
+                _session_closed = True
+            _session_snap = snapshot_state() if _session_closed else None
+        if _session_snap is not None:
+            persist_state(_session_snap)
 
         _prev_india_open = india_open
         _prev_us_open    = us_open
@@ -1858,34 +2194,56 @@ def agent_loop():
 
         # ── JEV Risk Gates: Apply per-market config overrides ──────────────────────
         jev_decisions_per_market = {}
+        _jev_gates.clear()
         if _JEV_AVAILABLE and cfg.get("jev_enabled", True):
+            _vix_by_mkt = {m: (_jev.fetch_vix(m) if _JEV_AVAILABLE else 20.0)
+                           for m in ("india", "us")}
+            try:
+                with _lock:
+                    _br_by_mkt = {
+                        m: _jev.calc_breadth(
+                            [a.get("score", 0) for a in (_signals.get(m, []) or [])])
+                        for m in ("india", "us")
+                    }
+            except Exception:
+                _br_by_mkt = {"india": 0.5, "us": 0.5}
             market_context = {
                 "spy_trend_pct": _index_trend.get("india", 0.0) if india_open else _index_trend.get("us", 0.0),
-                "vix": 20.0,
-                "breadth": 0.5,
+                "vix": _vix_by_mkt["india"] if india_open else _vix_by_mkt["us"],
+                "breadth": _br_by_mkt["india"] if india_open else _br_by_mkt["us"],
             }
-            
+
             for market_key, is_open in [("india", india_open), ("us", us_open)]:
                 if not is_open:
                     continue
                 try:
                     with _lock:
                         mstate = _state.get(market_key, {})
+                        _pv = portfolio_value(mstate, prices_snapshot)
+                        _peak = mstate.get("peak_portfolio", _pv)
+                        _unrl = unrealised_pnl(mstate, prices_snapshot)
+                        _start = max(mstate.get("session_start_cash", 1.0), 1.0)
+                        _w, _l = mstate.get("wins", 0), mstate.get("losses", 0)
                         portfolio_ctx = {
                             "cash": mstate.get("cash", 0.0),
-                            "drawdown_pct": mstate.get("max_drawdown", 0.0),
+                            "cash_pct": round(mstate.get("cash", 0.0) / max(_pv, 1e-9), 4),
+                            "drawdown_pct": round((_peak - _pv) / _peak * 100, 3) if _peak > 0 else 0.0,
                             "open_positions": len(mstate.get("positions", {})),
-                            "daily_pnl_pct": mstate.get("realised_pnl", 0.0) / max(mstate.get("session_start_cash", 1.0), 1.0),
+                            "exposure_pct": round((_pv - mstate.get("cash", 0.0)) / max(_pv, 1e-9), 4),
+                            "daily_pnl_pct": (mstate.get("realised_pnl", 0.0) + _unrl) / _start,
+                            "session_wr": round(_w / max(_w + _l, 1), 4),
+                        }
+                        market_context = {
+                            "spy_trend_pct": _index_trend.get(market_key, 0.0),
+                            "vix": _vix_by_mkt.get(market_key, 20.0),
+                            "breadth": _br_by_mkt.get(market_key, 0.5),
                         }
                     
                     jev_decisions = _jev.get_system_decisions(market_key, portfolio_ctx, market_context)
                     
                     if jev_decisions:
                         jev_decisions_per_market[market_key] = jev_decisions
-                        
-                        # Apply JEV gates to config for this market
-                        _jev.apply_jev_gates(cfg, jev_decisions)
-                        
+
                         # Log each JEV decision to think buffer
                         regime = jev_decisions["regime"]
                         think_log("JEV", 
@@ -1913,14 +2271,20 @@ def agent_loop():
                             f"trend={trend['score']:.2f} stress={stress['score']:.2f} "
                             f"halt={halt['noul']:.2f} → risk_per_trade={cfg['risk_per_trade']:.4f} "
                             f"max_pos={cfg.get(f'{market_key}_max_positions', 4)} "
-                            f"open_window={cfg.get('open_filter_min', 15)}m"
+                            f"open_window={cfg.get('open_filter_min', 15)}m "
+                            f"(base values — per-cycle gates applied below)"
                         )
                 except (requests.RequestException, ValueError, KeyError) as e:
                     apex_log.warning(f"[JEV] Risk gates failed for {market_key}: {e}")
 
+            # Fold the decisions into per-cycle risk overrides. This is what
+            # actually applies the gates; the log line above only reports them.
+            apply_jev_cycle_gates(jev_decisions_per_market)
+            publish_jev_decisions(jev_decisions_per_market)
+
         if india_open:
             if not _agent["running"]:
-                break
+                return prev_india_open, prev_us_open, cfg["check_interval_min"]
             _agent["status"] = "Scanning India"
             apex_log.info("Scanning India watchlist…")
             india_analyses, india_prices = fetch_cycle_data(INDIA_WATCHLIST, prices_snapshot, "india")
@@ -1929,7 +2293,8 @@ def agent_loop():
                 f"prices={len(india_prices)}"
             )
             with _lock:
-                apply_cycle("india", india_analyses, india_prices, cfg["india_max_positions"], jev_decisions_per_market)
+                apply_cycle("india", india_analyses, india_prices,
+                            effective_cfg("india")["india_max_positions"], jev_decisions_per_market)
                 _signals["india"]        = india_analyses
                 _signals["india_prices"] = india_prices
         else:
@@ -1937,7 +2302,7 @@ def agent_loop():
 
         if us_open:
             if not _agent["running"]:
-                break
+                return prev_india_open, prev_us_open, cfg["check_interval_min"]
             _agent["status"] = "Scanning US"
             apex_log.info("Scanning US watchlist…")
             us_analyses, us_prices = fetch_cycle_data(US_WATCHLIST, prices_snapshot, "us")
@@ -1946,14 +2311,16 @@ def agent_loop():
                 f"prices={len(us_prices)}"
             )
             with _lock:
-                apply_cycle("us", us_analyses, us_prices, cfg["us_max_positions"], jev_decisions_per_market)
+                apply_cycle("us", us_analyses, us_prices,
+                            effective_cfg("us")["us_max_positions"], jev_decisions_per_market)
                 _signals["us"]        = us_analyses
                 _signals["us_prices"] = us_prices
         else:
             apex_log.debug("US market closed — skipping")
 
         with _lock:
-            save_state(_state)
+            _cycle_snap = snapshot_state()
+        persist_state(_cycle_snap)
         apex_log.info("State saved")
 
         _agent["last_update"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -1964,26 +2331,140 @@ def agent_loop():
         _agent["next_check"] = next_t
         apex_log.info(f"Waiting {sleep_min} min — next check at {next_t}")
 
-        # Sleep in 5-second ticks so stop/pause respond quickly
-        for _ in range(sleep_min * 12):
-            if not _agent["running"]:
-                break
-            time.sleep(5)
-
-    _agent["status"]  = "stopped"
-    _agent["running"] = False
-    apex_log.info("Agent stopped")
+        return india_open, us_open, sleep_min
 
 # ─── FLASK APP ────────────────────────────────────────────────────────────────
 
 app = Flask(__name__)
 
 # ─── AUTH ────────────────────────────────────────────────────────────────────
+import hmac as _hmac
 import secrets as _secrets
-app.secret_key        = os.environ.get("APEX_SECRET", _secrets.token_hex(32))
+
+# Credentials must never fall back to a guessable value. These are the defaults
+# that used to be live whenever APEX_PASS was unset, and that .env.example still
+# documents.
+_DEFAULT_AUTH_USER = "apex"
+_DEFAULT_AUTH_PASS = "admin"
+
+app.secret_key = os.environ.get("APEX_SECRET") or _secrets.token_hex(32)
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
-_AUTH_USER = os.environ.get("APEX_USER", "apex")
-_AUTH_PASS = os.environ.get("APEX_PASS", "admin")
+app.config["SESSION_COOKIE_SECURE"] = True
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["MAX_CONTENT_LENGTH"] = 256 * 1024   # 256 KB; JSON bodies are tiny
+
+_AUTH_USER = os.environ.get("APEX_USER", "")
+_AUTH_PASS = os.environ.get("APEX_PASS", "")
+# Optional stored hash so the plaintext password need not sit in the env.
+# Format: "<salt_hex>$<scrypt_digest_hex>" with N=2**14, r=8, p=1, dklen=32.
+_AUTH_PASS_HASH = os.environ.get("APEX_PASS_HASH", "")
+_CREDENTIALS_DEFAULT = (
+    _AUTH_USER == _DEFAULT_AUTH_USER and _AUTH_PASS == _DEFAULT_AUTH_PASS
+)
+if (not _AUTH_PASS or _CREDENTIALS_DEFAULT) and not _AUTH_PASS_HASH:
+    # Fail closed: mint an unguessable password rather than serve the dashboard
+    # behind a documented default. The documented defaults are also rejected at
+    # login, so an explicit APEX_PASS=admin cannot re-enable them.
+    _AUTH_PASS = _secrets.token_urlsafe(32)
+
+_SCRYPT_N = 2 ** 14
+_SCRYPT_R = 8
+_SCRYPT_P = 1
+_SCRYPT_DKLEN = 32
+
+
+def verify_password(candidate: str, encoded: str) -> bool:
+    """Check a password against a "<salt_hex>$<digest_hex>" scrypt hash."""
+    if not encoded or "$" not in encoded:
+        return False
+    import hashlib
+
+    try:
+        salt_hex, digest_hex = encoded.split("$", 1)
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(digest_hex)
+        actual = hashlib.scrypt(
+            candidate.encode(), salt=salt, n=_SCRYPT_N, r=_SCRYPT_R,
+            p=_SCRYPT_P, dklen=len(expected),
+        )
+    except (ValueError, TypeError):
+        return False
+    return _hmac.compare_digest(actual, expected)
+
+
+def _password_ok(candidate: str) -> bool:
+    if _AUTH_PASS_HASH:
+        return verify_password(candidate, _AUTH_PASS_HASH)
+    return _hmac.compare_digest(candidate.encode(), _AUTH_PASS.encode())
+
+# Per-IP failed-login counter. The password is the only thing protecting a live
+# trading control panel, so guessing it must be expensive.
+LOGIN_MAX_ATTEMPTS = 5
+LOGIN_LOCKOUT_SECONDS = 300
+_login_failures: dict = {}          # ip -> [count, first_attempt_monotonic]
+_login_lock = threading.Lock()
+
+
+def _login_throttled(ip: str) -> tuple[bool, int]:
+    """True when ip has exhausted its attempts. Returns (throttled, seconds_left)."""
+    now = time.monotonic()
+    with _login_lock:
+        entry = _login_failures.get(ip)
+        if not entry:
+            return False, 0
+        count, first = entry
+        if now - first > LOGIN_LOCKOUT_SECONDS:
+            _login_failures.pop(ip, None)
+            return False, 0
+        if count >= LOGIN_MAX_ATTEMPTS:
+            return True, int(LOGIN_LOCKOUT_SECONDS - (now - first)) + 1
+    return False, 0
+
+
+def _record_login_failure(ip: str) -> None:
+    now = time.monotonic()
+    with _login_lock:
+        entry = _login_failures.get(ip)
+        if entry and now - entry[1] <= LOGIN_LOCKOUT_SECONDS:
+            _login_failures[ip] = [entry[0] + 1, entry[1]]
+        else:
+            _login_failures[ip] = [1, now]
+
+
+def _clear_login_failures(ip: str) -> None:
+    with _login_lock:
+        _login_failures.pop(ip, None)
+
+
+@app.after_request
+def _security_headers(resp):
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    # The SPA is a single inline document, so style/script need 'unsafe-inline'.
+    # 'self' alone still blocks any externally injected script source.
+    resp.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+        "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; "
+        "form-action 'self'",
+    )
+    return resp
+
+
+@app.errorhandler(Exception)
+def _handle_unexpected(err):
+    """Return JSON, never a stack trace or Flask's HTML error page.
+
+    The SPA calls r.json() unconditionally; an HTML 500 body turned a single
+    server-side slip into a broken dashboard.
+    """
+    if isinstance(err, HTTPException):
+        return jsonify({"ok": False, "msg": err.description}), err.code
+    apex_log.exception("Unhandled error on %s %s", request.method, request.path)
+    return jsonify({"ok": False, "msg": "internal_error"}), 500
+
 
 @app.before_request
 def _require_login():
@@ -1994,18 +2475,36 @@ def _require_login():
             return jsonify({"ok": False, "msg": "Not authenticated"}), 401
         return redirect("/login")
 
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
     err = ""
     if request.method == "POST":
-        if (request.form.get("u", "") == _AUTH_USER and
-                request.form.get("p", "") == _AUTH_PASS):
+        ip = request.remote_addr or "?"
+        throttled, retry_after = _login_throttled(ip)
+        if throttled:
+            apex_log.warning("Login throttled for %s (%ds remaining)", ip, retry_after)
+            return render_template("login.html", err="Too many attempts. Try again later."), 429
+        if _AUTH_USER == _DEFAULT_AUTH_USER and _AUTH_PASS == _DEFAULT_AUTH_PASS \
+                and not _AUTH_PASS_HASH:
+            apex_log.error("Login rejected: APEX_USER/APEX_PASS are still the documented defaults")
+            return render_template("login.html", err="Server credentials are not configured."), 503
+        u = request.form.get("u", "")
+        p = request.form.get("p", "")
+        # Constant-time compare on both fields; short-circuiting on the username
+        # would leak it.
+        ok = _hmac.compare_digest(u.encode(), _AUTH_USER.encode()) & _password_ok(p)
+        if ok:
+            session.clear()
             session["logged_in"] = True
-            apex_log.info("Dashboard login from " + (request.remote_addr or "?"))
+            _clear_login_failures(ip)
+            apex_log.info("Dashboard login from " + ip)
             return redirect("/")
+        _record_login_failure(ip)
         err = "Invalid credentials — try again"
-        apex_log.warning("Failed login attempt from " + (request.remote_addr or "?"))
-    return render_template_string(LOGIN_HTML, err=err)
+        apex_log.warning("Failed login attempt from " + ip)
+    return render_template("login.html", err=err)
+
 
 @app.route("/logout")
 def logout():
@@ -2015,7 +2514,9 @@ def logout():
 
 @app.route("/")
 def index():
-    return render_template_string(HTML)
+    # render_template caches the compiled template by filename; the old inline
+    # literal was re-tokenised on every request.
+    return render_template("index.html")
 
 @app.route("/api/state")
 def api_state():
@@ -2027,10 +2528,14 @@ def api_state():
     # Prefer live prices from the 10-s updater; fall back to last decision-cycle prices
     merged_india = {**sigs["india_prices"], **{k: live_prices[k] for k in INDIA_WATCHLIST if k in live_prices}}
     merged_us    = {**sigs["us_prices"],    **{k: live_prices[k] for k in US_WATCHLIST    if k in live_prices}}
-    india_pv   = portfolio_value(st["india"], merged_india)
-    us_pv      = portfolio_value(st["us"],    merged_us)
-    india_upnl = unrealised_pnl(st["india"], merged_india)
-    us_upnl    = unrealised_pnl(st["us"],    merged_us)
+    # A missing market must not blank the whole dashboard: this route is polled
+    # every 30 s and a KeyError here used to take the UI down entirely.
+    india_st = st.get("india") or _empty_mstate(cfg["india_capital"], "")
+    us_st    = st.get("us")    or _empty_mstate(cfg["us_capital"], "")
+    india_pv   = portfolio_value(india_st, merged_india)
+    us_pv      = portfolio_value(us_st,    merged_us)
+    india_upnl = unrealised_pnl(india_st, merged_india)
+    us_upnl    = unrealised_pnl(us_st,    merged_us)
 
     def dd_calc(mstate, pv):
         peak = mstate.get("peak_portfolio", pv)
@@ -2041,18 +2546,29 @@ def api_state():
     if _JEV_AVAILABLE and cfg.get("jev_enabled", True):
         market_context = {
             "spy_trend_pct": _index_trend.get("india", 0.0),
-            "vix": 20.0,
-            "breadth": 0.5,
+            "vix": _jev.fetch_vix("india"),
+            "breadth": _jev.calc_breadth(
+                [a.get("score", 0) for a in (sigs.get("india", []) or [])]),
         }
         for market_key in ("india", "us"):
             try:
                 with _lock:
                     mstate = _state.get(market_key, {})
+                    _pv = portfolio_value(mstate, live_prices)
+                    _peak = mstate.get("peak_portfolio", _pv)
+                    _unrl = unrealised_pnl(mstate, live_prices)
+                    _start = max(mstate.get("session_start_cash", 1.0), 1.0)
                     portfolio_ctx = {
                         "cash": mstate.get("cash", 0.0),
-                        "drawdown_pct": mstate.get("max_drawdown", 0.0),
+                        "drawdown_pct": round((_peak - _pv) / _peak * 100, 3) if _peak > 0 else 0.0,
                         "open_positions": len(mstate.get("positions", {})),
-                        "daily_pnl_pct": mstate.get("realised_pnl", 0.0) / max(mstate.get("session_start_cash", 1.0), 1.0),
+                        "daily_pnl_pct": (mstate.get("realised_pnl", 0.0) + _unrl) / _start,
+                    }
+                    market_context = {
+                        "spy_trend_pct": _index_trend.get(market_key, 0.0),
+                        "vix": _jev.fetch_vix(market_key),
+                        "breadth": _jev.calc_breadth(
+                            [a.get("score", 0) for a in (sigs.get(market_key, []) or [])]),
                     }
                 decisions = _jev.get_system_decisions(market_key, portfolio_ctx, market_context)
                 if decisions:
@@ -2070,19 +2586,19 @@ def api_state():
         "india_mtc":  minutes_to_close("india"),
         "us_mtc":     minutes_to_close("us"),
         "india": {
-            **st["india"],
+            **india_st,
             "portfolio_value": round(india_pv, 2),
             "unrealised_pnl":  round(india_upnl, 2),
-            "total_pnl":       round(st["india"]["realised_pnl"] + india_upnl, 2),
-            "drawdown":        dd_calc(st["india"], india_pv),
+            "total_pnl":       round(india_st["realised_pnl"] + india_upnl, 2),
+            "drawdown":        dd_calc(india_st, india_pv),
             "market_open":     is_india_open(),
         },
         "us": {
-            **st["us"],
+            **us_st,
             "portfolio_value": round(us_pv, 2),
             "unrealised_pnl":  round(us_upnl, 2),
-            "total_pnl":       round(st["us"]["realised_pnl"] + us_upnl, 2),
-            "drawdown":        dd_calc(st["us"], us_pv),
+            "total_pnl":       round(us_st["realised_pnl"] + us_upnl, 2),
+            "drawdown":        dd_calc(us_st, us_pv),
             "market_open":     is_us_open(),
         },
         "signals":        sigs,
@@ -2142,30 +2658,28 @@ def force_sell(market, symbol):
             paper_sell(symbol, 0, snap, mstate, "MANUAL SELL")
         else:
             paper_cover(symbol, 0, snap, mstate, "MANUAL COVER")
-        save_state(_state)
-        apex_log.info(f"Manual close: {symbol} @ {price:.2f}  market={market}  side={pos.get('side','long')}")
+        _snap_to_save = snapshot_state()
+    persist_state(_snap_to_save)
+    apex_log.info(f"Manual close: {symbol} @ {price:.2f}  market={market}  side={pos.get('side','long')}")
     return jsonify({"ok": True, "msg": f"Sold {symbol.replace('.NS', '')}"})
 
 @app.route("/api/config", methods=["POST"])
 def update_config():
-    data = request.json or {}
-    int_keys = {"india_max_positions", "us_max_positions",
-                "check_interval_min",  "idle_interval_min",
-                "confidence_threshold", "eod_harvest_min", "eod_exit_min"}
-    changed = []
-    for k in ("risk_per_trade", "confidence_threshold", "stop_loss_pct", "target_pct",
-              "check_interval_min", "idle_interval_min",
-              "india_max_positions", "us_max_positions",
-              "eod_harvest_min", "eod_exit_min",
-              "rl_exit_confidence"):
-        if k in data:
-            cfg[k] = int(data[k]) if k in int_keys else float(data[k])
-            changed.append(k)
-    if "settings_enabled" in data:
-        cfg["settings_enabled"] = bool(data["settings_enabled"])
-        changed.append("settings_enabled")
+    data = request.get_json(silent=True)
+    clean, err = validate_config_payload(data)
+    if err:
+        return jsonify({"ok": False, "msg": err}), 400
+    if not clean:
+        return jsonify({"ok": False, "msg": "No valid settings supplied"}), 400
+    with _lock:
+        cfg.update(clean)
+        if _JEV_AVAILABLE:
+            _jev.configure(cfg)
     save_cfg()
-    apex_log.info(f"Config updated: {', '.join(changed)}")
+    if clean.get("settings_enabled") is False:
+        apex_log.warning("RISK GATES DISABLED via /api/config by the operator")
+        think_log("RISK", "WARNING: settings_enabled turned off — risk filters bypassed.", "SYSTEM")
+    apex_log.info(f"Config updated: {', '.join(clean)}")
     return jsonify({"ok": True, "config": cfg})
 
 @app.route("/api/logs")
@@ -2264,46 +2778,60 @@ def reset_market(market):
             _state["india"] = _empty_mstate(cfg["india_capital"], datetime.now(IST).strftime("%Y-%m-%d"))
         if market in ("us", "all"):
             _state["us"]    = _empty_mstate(cfg["us_capital"],    datetime.now(EDT).strftime("%Y-%m-%d"))
-        save_state(_state)
+        _snap_to_save = snapshot_state()
+    persist_state(_snap_to_save)
     apex_log.warning(f"State reset: market={market}")
     return jsonify({"ok": True, "msg": f"Reset {market}"})
 
 @app.route("/api/edit/state", methods=["POST"])
 def edit_state():
-    data = request.json or {}
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"ok": False, "msg": "Body must be a JSON object"}), 400
+    clean_by_mkt: dict = {}
+    for mkt in ("india", "us"):
+        if mkt not in data:
+            continue
+        clean, err = clean_numeric(data[mkt], STATE_EDIT_SPEC)
+        if err:
+            return jsonify({"ok": False, "msg": f"{mkt}: {err}"}), 400
+        clean_by_mkt[mkt] = clean
+    if not clean_by_mkt:
+        return jsonify({"ok": False, "msg": "No editable fields supplied"}), 400
     changed = []
     with _lock:
-        for mkt in ("india", "us"):
-            if mkt not in data:
-                continue
-            mstate = _state[mkt]
-            md = data[mkt]
-            for field, cast in [("cash", float), ("realised_pnl", float),
-                                 ("wins", int), ("losses", int),
-                                 ("peak_portfolio", float), ("max_drawdown", float)]:
-                if field in md:
-                    mstate[field] = cast(md[field])
-                    changed.append(f"{mkt}.{field}")
-        save_state(_state)
+        for mkt, clean in clean_by_mkt.items():
+            mstate = _state.get(mkt)
+            if mstate is None:
+                return jsonify({"ok": False, "msg": f"Unknown market: {mkt}"}), 400
+            for field, value in clean.items():
+                mstate[field] = value
+                changed.append(f"{mkt}.{field}")
+        _snap_to_save = snapshot_state()
+    persist_state(_snap_to_save)
     apex_log.info(f"Manual state edit: {', '.join(changed)}")
     return jsonify({"ok": True, "changed": changed})
+
 
 @app.route("/api/edit/position/<market>/<path:symbol>", methods=["POST"])
 def edit_position(market, symbol):
     if market not in ("india", "us"):
-        return jsonify({"ok": False, "msg": "Invalid market"})
-    data = request.json or {}
+        return jsonify({"ok": False, "msg": "Invalid market"}), 400
+    data = request.get_json(silent=True)
+    clean, err = clean_numeric(data, POSITION_EDIT_SPEC)
+    if err:
+        return jsonify({"ok": False, "msg": err}), 400
+    if not clean:
+        return jsonify({"ok": False, "msg": "No editable fields supplied"}), 400
     with _lock:
         pos = _state.get(market, {}).get("positions", {}).get(symbol)
         if pos is None:
-            return jsonify({"ok": False, "msg": "Position not found"})
-        for field, cast in [("qty", int), ("entry", float),
-                             ("stop_loss", float), ("target", float)]:
-            if field in data:
-                pos[field] = cast(data[field])
-        save_state(_state)
-    apex_log.info(f"Manual position edit: {symbol} ({market})")
-    return jsonify({"ok": True})
+            return jsonify({"ok": False, "msg": "Position not found"}), 404
+        pos.update(clean)
+        _snap_to_save = snapshot_state()
+    persist_state(_snap_to_save)
+    apex_log.info(f"Manual position edit: {symbol} ({market}) {clean}")
+    return jsonify({"ok": True, "changed": sorted(clean)})
 
 @app.route("/api/sessions")
 def api_sessions():
@@ -2320,1671 +2848,10 @@ def close_session_api(market):
         snap = dict(_latest_prices)
     with _lock:
         _close_session(market, snap)
-        save_state(_state)
+        _snap_to_save = snapshot_state()
+    persist_state(_snap_to_save)
     apex_log.info(f"Manual session close: {market}")
     return jsonify({"ok": True, "msg": f"{market} session archived and reset"})
-
-# ─── HTML / CSS / JS TEMPLATE ─────────────────────────────────────────────────
-
-LOGIN_HTML = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Apex — Sign In</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
-     background:#0d1117;color:#e6edf3;display:flex;align-items:center;
-     justify-content:center;min-height:100vh}
-.box{background:#161b22;border:1px solid #30363d;border-radius:10px;
-     padding:36px 40px;width:340px}
-.logo{font-size:20px;font-weight:700;letter-spacing:2px;color:#58a6ff;
-      text-align:center;margin-bottom:28px}
-.logo b{color:#f0883e}
-label{font-size:10px;color:#8b949e;text-transform:uppercase;
-      letter-spacing:.5px;display:block;margin-bottom:5px}
-input[type=text],input[type=password]{background:#1c2128;border:1px solid #30363d;
-      border-radius:6px;color:#e6edf3;padding:9px 12px;font-size:14px;width:100%;
-      margin-bottom:16px;transition:border-color .2s}
-input:focus{outline:none;border-color:#58a6ff}
-.err{color:#f85149;font-size:11px;text-align:center;margin-bottom:14px;
-     background:#200a0a;border:1px solid #5a1a1a;border-radius:5px;padding:7px 10px}
-.btn{width:100%;padding:10px;border-radius:6px;cursor:pointer;font-size:13px;
-     font-weight:700;letter-spacing:.4px;background:#0d1e3a;color:#58a6ff;
-     border:1px solid #1a3a6a;transition:filter .15s}
-.btn:hover{filter:brightness(1.2)}
-.sub{font-size:10px;color:#444c56;text-align:center;margin-top:18px}
-</style>
-</head>
-<body>
-<div class="box">
-  <div class="logo">APEX <b>▲</b></div>
-  {% if err %}<div class="err">{{ err }}</div>{% endif %}
-  <form method="POST" autocomplete="off">
-    <label>Username</label>
-    <input type="text" name="u" autofocus autocomplete="username">
-    <label>Password</label>
-    <input type="password" name="p" autocomplete="current-password">
-    <button class="btn" type="submit">Sign In</button>
-  </form>
-  <div class="sub">Apex Paper Trading — restricted access</div>
-</div>
-</body>
-</html>"""
-
-HTML = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Apex Trading Dashboard</title>
-<style>
-:root{
-  --bg:#0d1117;--card:#161b22;--card2:#1c2128;--border:#30363d;
-  --text:#e6edf3;--muted:#8b949e;
-  --green:#3fb950;--red:#f85149;--yellow:#d29922;
-  --blue:#58a6ff;--orange:#f0883e;--purple:#bc8cff;
-}
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
-     background:var(--bg);color:var(--text);font-size:13px;line-height:1.5}
-
-/* ── Header ── */
-.hdr{background:var(--card);border-bottom:1px solid var(--border);
-     padding:10px 20px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;position:sticky;top:0;z-index:100}
-.logo{font-size:15px;font-weight:700;letter-spacing:2px;color:var(--blue)}
-.logo b{color:var(--orange)}
-.hdr-right{margin-left:auto;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-#clock{font-family:monospace;color:var(--muted);font-size:12px}
-
-/* ── Badges ── */
-.badge{padding:2px 10px;border-radius:20px;font-size:10px;font-weight:700;
-       letter-spacing:.6px;white-space:nowrap}
-.b-open  {background:#0d2318;color:var(--green);border:1px solid #1a4a2a}
-.b-closed{background:#1e1a0a;color:var(--yellow);border:1px solid #3a2f10}
-.b-run   {background:#0d1e3a;color:var(--blue);border:1px solid #1a3a6a;animation:pulse 2s infinite}
-.b-pause {background:#2a1800;color:var(--orange);border:1px solid #5a3500}
-.b-idle  {background:var(--card2);color:var(--muted);border:1px solid var(--border)}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.55}}
-
-/* ── Buttons ── */
-.btn{padding:5px 14px;border-radius:6px;border:1px solid;cursor:pointer;
-     font-size:11px;font-weight:700;letter-spacing:.4px;transition:filter .15s}
-.btn:hover{filter:brightness(1.2)}
-.btn-green{background:#0d2318;color:var(--green);border-color:#1a4a2a}
-.btn-red  {background:#2a0d0d;color:var(--red);border-color:#5a1a1a}
-.btn-blue {background:#0d1e3a;color:var(--blue);border-color:#1a3a6a}
-.btn-muted{background:var(--card2);color:var(--muted);border-color:var(--border)}
-.btn-sm{padding:3px 9px;font-size:10px}
-
-/* ── Layout ── */
-.main{padding:14px 18px;max-width:1700px;margin:0 auto}
-.g2{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px}
-.g5{display:grid;grid-template-columns:repeat(6,1fr);gap:8px}
-
-/* ── Cards ── */
-.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:12px}
-.c-title{font-size:10px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);margin-bottom:4px}
-.c-val{font-size:20px;font-weight:700;font-family:monospace}
-.c-sub{font-size:11px;margin-top:1px}
-
-/* ── Market section header ── */
-.mkt-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
-.mkt-name{font-size:13px;font-weight:700}
-
-/* ── Section divider ── */
-.sec{display:flex;align-items:center;gap:8px;margin:14px 0 8px;
-     padding-bottom:5px;border-bottom:1px solid var(--border)}
-.sec-title{font-size:12px;font-weight:600;letter-spacing:.4px}
-.sec-badge{font-size:10px;padding:1px 7px;border-radius:10px;
-           background:var(--card2);color:var(--muted);border:1px solid var(--border)}
-
-/* ── Tabs ── */
-.tabs{display:flex;border-bottom:1px solid var(--border);margin-bottom:14px}
-.tab{padding:7px 16px;cursor:pointer;font-size:12px;font-weight:500;
-     border-bottom:2px solid transparent;color:var(--muted);transition:all .15s}
-.tab:hover{color:var(--text)}
-.tab.on{color:var(--blue);border-bottom-color:var(--blue)}
-.pane{display:none}.pane.on{display:block}
-
-/* ── Tables ── */
-.tbl-wrap{overflow-x:auto;border-radius:6px;border:1px solid var(--border)}
-table{width:100%;border-collapse:collapse;font-size:12px}
-th{padding:6px 10px;text-align:left;color:var(--muted);font-weight:500;
-   font-size:10px;text-transform:uppercase;letter-spacing:.5px;
-   border-bottom:1px solid var(--border);background:var(--card2);white-space:nowrap}
-td{padding:6px 10px;border-bottom:1px solid #21262d;white-space:nowrap}
-tr:last-child td{border-bottom:none}
-tr:hover td{background:#1c2330}
-
-/* ── Badges inside table ── */
-.act-buy {display:inline-block;padding:1px 8px;border-radius:4px;font-size:10px;font-weight:700;
-          background:#0d2318;color:var(--green);border:1px solid #1a4a2a}
-.act-sell{display:inline-block;padding:1px 8px;border-radius:4px;font-size:10px;font-weight:700;
-          background:#2a0d0d;color:var(--red);border:1px solid #5a1a1a}
-.act-hold{display:inline-block;padding:1px 8px;border-radius:4px;font-size:10px;font-weight:700;
-          background:var(--card2);color:var(--muted);border:1px solid var(--border)}
-
-/* ── Confidence bar ── */
-.cbar{display:inline-flex;align-items:center;gap:5px}
-.cbar-bg{width:48px;height:4px;border-radius:2px;background:var(--card2);overflow:hidden}
-.cbar-fg{height:100%;border-radius:2px}
-
-/* ── Trade log ── */
-.log-box{background:var(--card);border:1px solid var(--border);border-radius:6px;
-         max-height:200px;overflow-y:auto}
-.log-row{padding:5px 10px;border-bottom:1px solid #21262d;
-         font-family:monospace;font-size:11px;display:flex;gap:10px}
-.log-row:last-child{border-bottom:none}
-.lt{color:var(--muted);min-width:62px}
-.lb{color:var(--green)}.ls{color:var(--blue)}.ll{color:var(--red)}
-
-/* ── Agent system log ── */
-.alog-box{background:#0a0e14;border:1px solid var(--border);border-radius:6px;
-          max-height:400px;overflow-y:auto}
-.alog-row{padding:4px 10px;border-bottom:1px solid #161b22;
-          font-family:monospace;font-size:11px;display:flex;gap:8px;align-items:baseline}
-.alog-row:last-child{border-bottom:none}
-.al-ts{color:#444c56;min-width:120px;font-size:10px}
-.al-lvl{min-width:52px;font-size:9px;font-weight:700;letter-spacing:.5px;text-transform:uppercase}
-.al-info{color:var(--blue)}.al-debug{color:#444c56}.al-warning{color:var(--yellow)}.al-error{color:var(--red)}
-
-/* ── Decision / thinking log ── */
-.dlog-box{background:#0a0e14;border:1px solid var(--border);border-radius:6px;
-          max-height:420px;overflow-y:auto}
-.drow{padding:3px 10px;border-bottom:1px solid #161b22;
-      font-family:monospace;font-size:11px;display:flex;gap:8px;align-items:baseline;flex-wrap:nowrap}
-.drow:last-child{border-bottom:none}
-.drow:hover{background:#12161f}
-.dcat{min-width:48px;font-size:9px;font-weight:700;letter-spacing:.4px;
-      text-transform:uppercase;padding:1px 5px;border-radius:3px;white-space:nowrap}
-.dcat-CYCLE {background:#1e1e1e;color:#666}
-.dcat-SCAN  {background:#0d2040;color:#4a9eff}
-.dcat-FILTER{background:#2e1800;color:#f0900a}
-.dcat-ENTRY {background:#0a2016;color:#27c46b}
-.dcat-EXIT  {background:#2a0a0a;color:#e05454}
-.dcat-RISK  {background:#3a0000;color:#ff4444;font-weight:900}
-.dcat-INDEX {background:#1a0a30;color:#b47fff}
-.dcat-RL    {background:#1a0040;color:#c060ff;font-weight:900}
-.dsym{color:#bbb;min-width:88px;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.dmsg{color:#ddd;flex:1;white-space:pre-wrap;word-break:break-word}
-/* Position side badges */
-.side-badge{font-size:9px;font-weight:700;padding:1px 5px;border-radius:3px;vertical-align:middle;letter-spacing:.5px}
-.side-long {background:#0a2016;color:#27c46b;border:1px solid #1a4a2a}
-.side-short{background:#2a0a0a;color:#e05454;border:1px solid #4a1a1a}
-
-/* ── Settings form ── */
-.fg{display:flex;flex-direction:column;gap:4px}
-label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
-input[type=number]{background:var(--card2);border:1px solid var(--border);
-  border-radius:5px;color:var(--text);padding:5px 9px;font-size:13px;
-  font-family:monospace;width:100%;transition:border-color .2s}
-input:focus{outline:none;border-color:var(--blue)}
-.fgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-
-/* ── Footer / refresh bar ── */
-.foot{display:flex;align-items:center;gap:10px;padding:8px 0;
-      font-size:10px;color:var(--muted);border-top:1px solid var(--border);margin-top:14px}
-#prog{flex:1;height:3px;background:var(--card2);border-radius:2px;overflow:hidden}
-#prog-f{height:100%;background:var(--blue);width:0;transition:width linear}
-
-/* ── Toast ── */
-.toasts{position:fixed;bottom:18px;right:18px;display:flex;flex-direction:column;gap:7px;z-index:9999}
-.toast{background:var(--card2);border:1px solid var(--border);border-radius:7px;
-       padding:9px 14px;font-size:12px;animation:tin .25s ease;
-       display:flex;align-items:center;gap:8px;max-width:300px}
-.tok{border-left:3px solid var(--green)}.terr{border-left:3px solid var(--red)}
-@keyframes tin{from{transform:translateX(110%);opacity:0}to{transform:translateX(0);opacity:1}}
-
-.green{color:var(--green)}.red{color:var(--red)}.yellow{color:var(--yellow)}
-.blue{color:var(--blue)}.muted{color:var(--muted)}.mono{font-family:monospace}
-
-/* ── EOD ── */
-.b-eod-warn{background:#1a1000;color:var(--orange);border:1px solid #5a3500}
-.b-eod-exit{background:#2a0d0d;color:var(--red);border:1px solid #5a1a1a}
-.eod-banner{border-radius:6px;padding:8px 14px;margin-bottom:8px;font-size:11px;
-            display:flex;align-items:center;gap:10px;border:1px solid}
-.eod-warn{background:#1a1000;border-color:#5a3500}
-.eod-exit{background:#200a0a;border-color:#6a1a1a}
-
-/* ── Log filter ── */
-.log-filter-btn.on{background:#0d1e3a;color:var(--blue);border-color:#1a3a6a}
-
-/* ── Mobile responsive ── */
-@media (max-width:640px){
-  /* Main padding */
-  .main{padding:10px 10px}
-
-  /* Header: hide clock to save room, tighten gaps */
-  .hdr{padding:8px 10px;gap:6px}
-  #clock{display:none}
-  .hdr-right{gap:5px}
-  .logo{font-size:13px}
-
-  /* Market summary: stack India / US vertically */
-  .g2{grid-template-columns:1fr}
-
-  /* Stats row: 3 columns instead of 6 */
-  .g5{grid-template-columns:repeat(3,1fr)}
-
-  /* Smaller stat values so they fit in 3-col */
-  .c-val{font-size:16px}
-
-  /* Tabs: horizontal scroll, no wrapping */
-  .tabs{overflow-x:auto;flex-wrap:nowrap;-webkit-overflow-scrolling:touch;
-        scrollbar-width:none}
-  .tabs::-webkit-scrollbar{display:none}
-  .tab{white-space:nowrap;flex-shrink:0;padding:7px 12px}
-
-  /* Settings: single-column forms */
-  .fgrid{grid-template-columns:1fr}
-  .es-grid{grid-template-columns:1fr}
-
-  /* Modal: full-width on small screens */
-  .modal-box{min-width:unset;width:calc(100vw - 24px);padding:16px}
-
-  /* Agent log timestamp: slightly narrower */
-  .al-ts{min-width:90px}
-
-  /* Toasts: keep inside viewport */
-  .toasts{right:10px;bottom:10px;max-width:calc(100vw - 20px)}
-  .toast{max-width:100%}
-}
-
-/* Extra-narrow phones (< 400px): 2-col stats */
-@media (max-width:400px){
-  .g5{grid-template-columns:repeat(2,1fr)}
-  .btn{padding:4px 8px;font-size:10px}
-}
-
-/* ── Position / state edit modal ── */
-.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);
-               z-index:600;align-items:center;justify-content:center}
-.modal-overlay.open{display:flex}
-.modal-box{background:var(--card);border:1px solid var(--border);border-radius:10px;
-           padding:24px;min-width:340px;max-width:600px;width:100%;max-height:90vh;overflow-y:auto}
-.modal-title{font-size:13px;font-weight:700;margin-bottom:18px;color:var(--text)}
-.modal-title span{color:var(--blue)}
-.es-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}
-.es-col-title{font-size:11px;font-weight:700;color:var(--muted);margin-bottom:10px;
-              text-transform:uppercase;letter-spacing:.5px;padding-bottom:5px;
-              border-bottom:1px solid var(--border)}
-
-/* ── Session cards ── */
-.sess-card{background:var(--card);border:1px solid var(--border);border-radius:8px;
-           margin-bottom:8px;overflow:hidden}
-.sess-hdr{display:flex;align-items:center;gap:12px;padding:10px 14px;
-          cursor:pointer;user-select:none;transition:background .1s}
-.sess-hdr:hover{background:var(--card2)}
-.sess-date{font-size:13px;font-weight:700;font-family:monospace;min-width:90px;color:var(--text)}
-.sess-mkt{font-size:10px;font-weight:700;padding:2px 8px;border-radius:12px;
-          min-width:48px;text-align:center;white-space:nowrap}
-.sess-mkt-india{background:#0d1e3a;color:var(--blue);border:1px solid #1a3a6a}
-.sess-mkt-us{background:#1a0d2a;color:var(--purple);border:1px solid #3a1a5a}
-.sess-body{display:none;border-top:1px solid var(--border);background:#0a0e14}
-.sess-body.open{display:block}
-.sess-metrics{display:flex;gap:24px;padding:10px 14px;flex-wrap:wrap;
-              border-bottom:1px solid var(--border)}
-.sess-m{display:flex;flex-direction:column;gap:2px}
-.sess-m-l{font-size:9px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted)}
-.sess-m-v{font-size:13px;font-weight:600;font-family:monospace}
-.sess-filter.on{background:#0d1e3a;color:var(--blue);border-color:#1a3a6a}
-.sess-label{font-size:10px;color:var(--muted);margin-top:2px}
-</style>
-</head>
-<body>
-
-<div class="hdr">
-  <div class="logo">APEX <b>▲</b></div>
-  <span id="nse-badge"    class="badge b-closed">NSE CLOSED</span>
-  <span id="nyse-badge"   class="badge b-closed">NYSE CLOSED</span>
-  <span id="india-eod"   class="badge" style="display:none">NSE EOD</span>
-  <span id="us-eod"      class="badge" style="display:none">NYSE EOD</span>
-  <span id="agent-badge" class="badge b-idle">IDLE</span>
-  <div class="hdr-right">
-    <span id="clock">—</span>
-    <button class="btn btn-muted btn-sm" onclick="doRefresh()">↻ Refresh</button>
-    <button id="btn-pause"  class="btn btn-muted btn-sm" onclick="pauseAgent()">⏸ Pause</button>
-    <button id="btn-toggle" class="btn btn-green"         onclick="toggleAgent()">▶ Start Agent</button>
-    <button class="btn btn-muted btn-sm" onclick="location.href='/logout'" title="Sign out">⎋ Logout</button>
-  </div>
-</div>
-
-<div class="main">
-
-  <!-- ── Market summary cards ── -->
-  <div class="g2">
-    <!-- India -->
-    <div class="card">
-      <div class="mkt-hdr">
-        <div>
-          <span class="mkt-name">India — NSE / NIFTY 50</span>
-          <div class="sess-label" id="india-sess-lbl">Session —</div>
-        </div>
-        <div style="display:flex;align-items:center;gap:8px">
-          <button class="btn btn-muted btn-sm" title="Archive current session and reset"
-            onclick="closeSessionNow('india')">End Session</button>
-          <span id="india-mkt" class="badge b-closed">CLOSED</span>
-        </div>
-      </div>
-      <div class="g5">
-        <div><div class="c-title">Portfolio</div>
-          <div class="c-val mono" id="india-pv">₹0</div>
-          <div class="c-sub" id="india-diff">—</div></div>
-        <div><div class="c-title">Cash</div>
-          <div class="c-val mono" id="india-cash">₹0</div>
-          <div class="c-sub muted" id="india-npos">0 positions</div></div>
-        <div><div class="c-title">Realised P&amp;L</div>
-          <div class="c-val mono" id="india-pnl">₹0</div>
-          <div class="c-sub muted" id="india-ntrades">0 trades</div></div>
-        <div><div class="c-title">Win Rate</div>
-          <div class="c-val mono" id="india-wr">0%</div>
-          <div class="c-sub muted" id="india-wl">0W 0L</div></div>
-        <div><div class="c-title">Drawdown</div>
-          <div class="c-val mono" id="india-dd">0.0%</div>
-          <div class="c-sub muted">from peak</div></div>
-        <div style="background:var(--card2);border:1px solid var(--border);border-radius:6px;padding:10px">
-          <div class="c-title">Total Profit</div>
-          <div class="c-val mono" id="india-tpnl">₹0</div>
-          <div class="c-sub" id="india-upnl" style="font-size:10px">Float: ₹0</div></div>
-      </div>
-    </div>
-    <!-- US -->
-    <div class="card">
-      <div class="mkt-hdr">
-        <div>
-          <span class="mkt-name">US — NYSE / NASDAQ</span>
-          <div class="sess-label" id="us-sess-lbl">Session —</div>
-        </div>
-        <div style="display:flex;align-items:center;gap:8px">
-          <button class="btn btn-muted btn-sm" title="Archive current session and reset"
-            onclick="closeSessionNow('us')">End Session</button>
-          <span id="us-mkt" class="badge b-closed">CLOSED</span>
-        </div>
-      </div>
-      <div class="g5">
-        <div><div class="c-title">Portfolio</div>
-          <div class="c-val mono" id="us-pv">$0</div>
-          <div class="c-sub" id="us-diff">—</div></div>
-        <div><div class="c-title">Cash</div>
-          <div class="c-val mono" id="us-cash">$0</div>
-          <div class="c-sub muted" id="us-npos">0 positions</div></div>
-        <div><div class="c-title">Realised P&amp;L</div>
-          <div class="c-val mono" id="us-pnl">$0</div>
-          <div class="c-sub muted" id="us-ntrades">0 trades</div></div>
-        <div><div class="c-title">Win Rate</div>
-          <div class="c-val mono" id="us-wr">0%</div>
-          <div class="c-sub muted" id="us-wl">0W 0L</div></div>
-        <div><div class="c-title">Drawdown</div>
-          <div class="c-val mono" id="us-dd">0.0%</div>
-          <div class="c-sub muted">from peak</div></div>
-        <div style="background:var(--card2);border:1px solid var(--border);border-radius:6px;padding:10px">
-          <div class="c-title">Total Profit</div>
-          <div class="c-val mono" id="us-tpnl">$0</div>
-          <div class="c-sub" id="us-upnl" style="font-size:10px">Float: $0</div></div>
-      </div>
-    </div>
-  </div>
-
-  <!-- ── Tabs ── -->
-  <div class="tabs">
-    <div class="tab on"  onclick="tab('india',this)">India (NSE)</div>
-    <div class="tab"     onclick="tab('us',this)">US (NYSE)</div>
-    <div class="tab"     onclick="tab('sessions',this)">Sessions <span id="sess-tab-cnt" style="font-size:9px;color:var(--muted)"></span></div>
-    <div class="tab"     onclick="tab('settings',this)">Settings</div>
-    <div class="tab"     onclick="tab('logs',this)">All Logs</div>
-    <div class="tab"     onclick="tab('agent',this)" style="color:#c060ff">Agent Terminal</div>
-    <div class="tab"     onclick="tab('retrain',this)" style="color:#f0883e">Retraining</div>
-  </div>
-
-  <!-- India pane -->
-  <div class="pane on" id="pane-india">
-    <div class="sec"><span class="sec-title">Open Positions</span><span class="sec-badge" id="india-pc">0</span></div>
-    <div id="india-eod-banner" style="display:none" class="eod-banner eod-warn">
-      <span id="india-eod-phase" style="font-weight:700;color:var(--orange)">EOD</span>
-      <span id="india-eod-detail" style="color:var(--muted)"></span>
-    </div>
-    <div class="tbl-wrap"><table>
-      <thead><tr>
-        <th>Symbol</th><th>Qty</th><th>Entry ₹</th><th>Current ₹</th>
-        <th>P&amp;L</th><th>Stop ₹</th><th>Target ₹</th><th>Since</th><th>EOD</th><th></th>
-      </tr></thead>
-      <tbody id="india-pos"><tr><td colspan="10" style="text-align:center;padding:18px;color:var(--muted)">No open positions</td></tr></tbody>
-    </table></div>
-
-    <div class="sec" style="margin-top:18px"><span class="sec-title">Signal Board</span><span class="sec-badge">NIFTY 50 Top 16</span></div>
-    <div class="tbl-wrap"><table>
-      <thead><tr>
-        <th>Symbol</th><th>Price ₹</th><th>RSI</th><th>MACD</th>
-        <th>Bollinger</th><th>EMA</th><th>Volume</th><th>4d Trend</th><th>News</th><th>Confidence</th><th>Action</th>
-      </tr></thead>
-      <tbody id="india-sig"><tr><td colspan="11" style="text-align:center;padding:18px;color:var(--muted)">No scan data yet — start the agent</td></tr></tbody>
-    </table></div>
-
-    <div class="sec" style="margin-top:18px"><span class="sec-title">Recent Trades</span></div>
-    <div class="log-box" id="india-log">
-      <div class="log-row"><span class="lt">—</span><span class="muted">No trades yet</span></div>
-    </div>
-  </div>
-
-  <!-- US pane -->
-  <div class="pane" id="pane-us">
-    <div class="sec"><span class="sec-title">Open Positions</span><span class="sec-badge" id="us-pc">0</span></div>
-    <div id="us-eod-banner" style="display:none" class="eod-banner eod-warn">
-      <span id="us-eod-phase" style="font-weight:700;color:var(--orange)">EOD</span>
-      <span id="us-eod-detail" style="color:var(--muted)"></span>
-    </div>
-    <div class="tbl-wrap"><table>
-      <thead><tr>
-        <th>Symbol</th><th>Qty</th><th>Entry $</th><th>Current $</th>
-        <th>P&amp;L</th><th>Stop $</th><th>Target $</th><th>Since</th><th>EOD</th><th></th>
-      </tr></thead>
-      <tbody id="us-pos"><tr><td colspan="10" style="text-align:center;padding:18px;color:var(--muted)">No open positions</td></tr></tbody>
-    </table></div>
-
-    <div class="sec" style="margin-top:18px"><span class="sec-title">Signal Board</span><span class="sec-badge">Top 16 Tech</span></div>
-    <div class="tbl-wrap"><table>
-      <thead><tr>
-        <th>Symbol</th><th>Price $</th><th>RSI</th><th>MACD</th>
-        <th>Bollinger</th><th>EMA</th><th>Volume</th><th>4d Trend</th><th>News</th><th>Confidence</th><th>Action</th>
-      </tr></thead>
-      <tbody id="us-sig"><tr><td colspan="11" style="text-align:center;padding:18px;color:var(--muted)">No scan data yet — start the agent</td></tr></tbody>
-    </table></div>
-
-    <div class="sec" style="margin-top:18px"><span class="sec-title">Recent Trades</span></div>
-    <div class="log-box" id="us-log">
-      <div class="log-row"><span class="lt">—</span><span class="muted">No trades yet</span></div>
-    </div>
-  </div>
-
-  <!-- Sessions pane -->
-  <div class="pane" id="pane-sessions">
-    <div class="sec" style="flex-wrap:wrap;gap:8px">
-      <span class="sec-title">Past Sessions</span>
-      <span class="sec-badge" id="sess-count">0 sessions</span>
-      <div style="margin-left:auto;display:flex;gap:5px;flex-wrap:wrap">
-        <button class="btn btn-muted btn-sm sess-filter on" onclick="setSessFilter('all',this)">All</button>
-        <button class="btn btn-muted btn-sm sess-filter" onclick="setSessFilter('india',this)">India (NSE)</button>
-        <button class="btn btn-muted btn-sm sess-filter" onclick="setSessFilter('us',this)">US (NYSE)</button>
-      </div>
-    </div>
-    <div id="sess-list">
-      <div style="text-align:center;padding:36px;color:var(--muted)">No past sessions yet — sessions are archived automatically when the calendar date changes</div>
-    </div>
-  </div>
-
-  <!-- Settings pane -->
-  <div class="pane" id="pane-settings">
-    <div style="max-width:580px">
-      <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;padding:12px 14px;background:#161b22;border:1px solid #30363d;border-radius:6px">
-        <input type="checkbox" id="settings-toggle" onchange="toggleSettings(this)" checked
-               style="width:18px;height:18px;cursor:pointer;accent-color:#3fb950">
-        <span style="font-weight:600;font-size:13px">Settings Constraints</span>
-        <span id="settings-toggle-label" style="color:#3fb950;font-size:11px;margin-left:4px">● ACTIVE</span>
-        <span style="color:#484f58;font-size:11px;margin-left:auto">Unchecked = full liberty (no filters)</span>
-      </div>
-      <div class="sec"><span class="sec-title">Risk Parameters</span></div>
-      <div class="fgrid">
-        <div class="fg"><label>Risk per Trade (0.01–1.0)</label><input class="settings-input" type="number" id="s-risk" step="0.01" min="0.01" max="1"></div>
-        <div class="fg"><label>Confidence Threshold (%)</label><input class="settings-input" type="number" id="s-conf" step="1"    min="50"   max="95"></div>
-        <div class="fg"><label>Stop Loss (0.005–0.2)</label>   <input class="settings-input" type="number" id="s-sl"   step="0.005" min="0.005" max="0.2"></div>
-        <div class="fg"><label>Target (0.01–0.5)</label>       <input class="settings-input" type="number" id="s-tgt"  step="0.005" min="0.01"  max="0.5"></div>
-        <div class="fg"><label>Check Interval (min)</label>    <input class="settings-input" type="number" id="s-chk"  step="1"    min="1"    max="60"></div>
-        <div class="fg"><label>Idle Interval (min)</label>     <input class="settings-input" type="number" id="s-idle" step="1"    min="5"    max="120"></div>
-        <div class="fg"><label>India Max Positions</label>     <input class="settings-input" type="number" id="s-ip"   step="1"    min="1"    max="16"></div>
-        <div class="fg"><label>US Max Positions</label>        <input class="settings-input" type="number" id="s-up"   step="1"    min="1"    max="16"></div>
-        <div class="fg"><label>EOD Profit Harvest (min before close)</label><input class="settings-input" type="number" id="s-eod-h" step="1" min="10" max="60"></div>
-        <div class="fg"><label>EOD Force Exit (min before close)</label>    <input class="settings-input" type="number" id="s-eod-e" step="1" min="3"  max="30"></div>
-        <div class="fg"><label>RL Exit Confidence (%)</label>               <input class="settings-input" type="number" id="s-rl-exit" step="1" min="50" max="95" title="Min RL confidence to trigger early exit from a held position"></div>
-      </div>
-      <div style="margin-top:14px;display:flex;gap:10px">
-        <button class="btn btn-blue" onclick="saveConfig()">Save Settings</button>
-      </div>
-
-      <div class="sec" style="margin-top:24px"><span class="sec-title">Edit Portfolio State</span>
-        <span class="sec-badge">raw values</span></div>
-      <div class="es-grid">
-        <div>
-          <div class="es-col-title">India (₹)</div>
-          <div class="fg"><label>Cash</label><input type="number" id="es-india-cash" step="0.01"></div>
-          <div class="fg" style="margin-top:8px"><label>Realised P&amp;L</label><input type="number" id="es-india-rpnl" step="0.01"></div>
-          <div class="fg" style="margin-top:8px"><label>Wins</label><input type="number" id="es-india-wins" step="1" min="0"></div>
-          <div class="fg" style="margin-top:8px"><label>Losses</label><input type="number" id="es-india-losses" step="1" min="0"></div>
-          <div class="fg" style="margin-top:8px"><label>Peak Portfolio</label><input type="number" id="es-india-peak" step="0.01"></div>
-        </div>
-        <div>
-          <div class="es-col-title">US ($)</div>
-          <div class="fg"><label>Cash</label><input type="number" id="es-us-cash" step="0.01"></div>
-          <div class="fg" style="margin-top:8px"><label>Realised P&amp;L</label><input type="number" id="es-us-rpnl" step="0.01"></div>
-          <div class="fg" style="margin-top:8px"><label>Wins</label><input type="number" id="es-us-wins" step="1" min="0"></div>
-          <div class="fg" style="margin-top:8px"><label>Losses</label><input type="number" id="es-us-losses" step="1" min="0"></div>
-          <div class="fg" style="margin-top:8px"><label>Peak Portfolio</label><input type="number" id="es-us-peak" step="0.01"></div>
-        </div>
-      </div>
-      <div style="margin-top:14px;display:flex;gap:10px">
-        <button class="btn btn-blue" onclick="saveEditState()">Apply State Changes</button>
-      </div>
-      <p style="font-size:10px;color:var(--muted);margin-top:8px">
-        Position fields (qty, entry, stop-loss, target) are editable via the Edit button in each position row.
-      </p>
-
-      <div class="sec" style="margin-top:24px"><span class="sec-title" style="color:var(--red)">Danger Zone</span></div>
-      <div style="display:flex;gap:10px;flex-wrap:wrap">
-        <button class="btn btn-red btn-sm" onclick="resetMkt('india')">Reset India State</button>
-        <button class="btn btn-red btn-sm" onclick="resetMkt('us')">Reset US State</button>
-        <button class="btn btn-red btn-sm" onclick="resetMkt('all')">Reset Everything</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- Logs pane -->
-  <div class="pane" id="pane-logs">
-
-    <!-- Decision Log -->
-    <div class="sec">
-      <span class="sec-title">Decision Log</span>
-      <span class="sec-badge" id="dlog-count">0 entries</span>
-      <span style="margin-left:auto;font-size:10px;color:var(--muted)">why the bot does what it does</span>
-    </div>
-    <div style="display:flex;align-items:center;gap:6px;margin-bottom:8px;flex-wrap:wrap">
-      <button class="btn btn-muted btn-sm log-filter-btn on" id="df-ALL"    onclick="setDlogFilter('ALL',this)">ALL</button>
-      <button class="btn btn-muted btn-sm log-filter-btn"   id="df-SCAN"   onclick="setDlogFilter('SCAN',this)">SCAN</button>
-      <button class="btn btn-muted btn-sm log-filter-btn"   id="df-ENTRY"  onclick="setDlogFilter('ENTRY',this)">ENTRY</button>
-      <button class="btn btn-muted btn-sm log-filter-btn"   id="df-EXIT"   onclick="setDlogFilter('EXIT',this)">EXIT</button>
-      <button class="btn btn-muted btn-sm log-filter-btn"   id="df-FILTER" onclick="setDlogFilter('FILTER',this)">FILTER</button>
-      <button class="btn btn-muted btn-sm log-filter-btn"   id="df-RISK"   onclick="setDlogFilter('RISK',this)">RISK</button>
-      <button class="btn btn-muted btn-sm log-filter-btn"   id="df-INDEX"  onclick="setDlogFilter('INDEX',this)">INDEX</button>
-      <button class="btn btn-muted btn-sm log-filter-btn"   id="df-CYCLE"  onclick="setDlogFilter('CYCLE',this)">CYCLE</button>
-      <button class="btn btn-muted btn-sm log-filter-btn"   id="df-RL"     onclick="setDlogFilter('RL',this)" style="color:#c060ff">RL</button>
-      <label style="display:flex;align-items:center;gap:5px;font-size:10px;color:var(--muted);
-                    margin-left:8px;text-transform:none;letter-spacing:0;cursor:pointer">
-        <input type="checkbox" id="dlog-autoscroll" checked> Auto-scroll
-      </label>
-      <span id="dlog-live-dot" style="margin-left:4px;font-size:9px;color:var(--muted)">● live</span>
-    </div>
-    <div class="dlog-box" id="dlog-box">
-      <div class="drow"><span class="al-ts">—</span><span class="dcat dcat-CYCLE">CYCLE</span><span class="dsym"></span><span class="dmsg muted">No decisions yet — start the agent</span></div>
-    </div>
-
-    <div class="sec" style="margin-top:18px">
-      <span class="sec-title">Agent System Log</span>
-      <span class="sec-badge" id="alog-count">0 entries</span>
-      <span style="margin-left:auto;font-size:10px;color:var(--muted)">→ <span class="mono" style="color:var(--blue)">apex.log</span></span>
-    </div>
-    <div style="display:flex;align-items:center;gap:6px;margin-bottom:8px;flex-wrap:wrap">
-      <button class="btn btn-muted btn-sm log-filter-btn on"  onclick="setLogFilter('ALL',this)">ALL</button>
-      <button class="btn btn-muted btn-sm log-filter-btn"     onclick="setLogFilter('INFO',this)">INFO</button>
-      <button class="btn btn-muted btn-sm log-filter-btn"     onclick="setLogFilter('WARNING',this)">WARN</button>
-      <button class="btn btn-muted btn-sm log-filter-btn"     onclick="setLogFilter('ERROR',this)">ERROR</button>
-      <button class="btn btn-muted btn-sm log-filter-btn"     onclick="setLogFilter('DEBUG',this)">DEBUG</button>
-      <label style="display:flex;align-items:center;gap:5px;font-size:10px;color:var(--muted);
-                    margin-left:8px;text-transform:none;letter-spacing:0;cursor:pointer">
-        <input type="checkbox" id="auto-scroll" checked onchange="_autoScroll=this.checked"> Auto-scroll
-      </label>
-      <span id="log-live-dot" style="margin-left:4px;font-size:9px;color:var(--muted)">● live</span>
-    </div>
-    <div class="alog-box" id="agent-log" style="max-height:500px">
-      <div class="alog-row"><span class="al-ts">—</span><span class="al-lvl al-debug">—</span><span class="muted">No agent activity yet — start the agent</span></div>
-    </div>
-
-    <div class="sec" style="margin-top:18px"><span class="sec-title">All Trade Activity</span></div>
-    <div class="log-box" style="max-height:320px" id="all-log">
-      <div class="log-row"><span class="lt">—</span><span class="muted">No trades yet</span></div>
-    </div>
-  </div>
-
-  <!-- Agent Terminal pane -->
-  <div class="pane" id="pane-agent">
-    <div class="sec">
-      <span class="sec-title">RL Agent Terminal</span>
-      <span id="rl-status-badge" style="padding:2px 10px;border-radius:10px;font-size:11px;font-weight:700;background:#1a0040;color:#666">● CHECKING</span>
-      <span style="margin-left:auto;font-size:10px;color:var(--muted)">live PPO reasoning — updates every 4s</span>
-    </div>
-    <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap">
-      <button class="btn btn-muted btn-sm" onclick="clearAgentTerminal()">Clear</button>
-      <label style="display:flex;align-items:center;gap:5px;font-size:10px;color:var(--muted);text-transform:none;letter-spacing:0;cursor:pointer">
-        <input type="checkbox" id="agent-autoscroll" checked> Auto-scroll
-      </label>
-      <span id="agent-live-dot" style="font-size:9px;color:var(--muted)">● live</span>
-    </div>
-    <div id="agent-terminal" style="background:#0a0c10;border:1px solid #30363d;border-radius:6px;
-         padding:14px;height:500px;overflow-y:auto;font-family:'Courier New',monospace;
-         font-size:12px;color:#c9d1d9;line-height:1.6">
-      <span style="color:#484f58">—</span> <span style="color:#666">Agent not yet started or no RL decisions recorded</span>
-    </div>
-  </div>
-
-  <!-- Retraining Terminal pane -->
-  <div class="pane" id="pane-retrain">
-    <div class="sec">
-      <span class="sec-title">RL Retraining Terminal</span>
-      <span id="retrain-status-badge" style="padding:2px 10px;border-radius:10px;font-size:11px;font-weight:700;background:#1a1a1a;color:#8b949e">● IDLE</span>
-      <span style="margin-left:auto;font-size:10px;color:var(--muted)">auto-triggered after every 16 closed RL trades</span>
-    </div>
-    <div style="display:flex;gap:10px;margin-bottom:12px;flex-wrap:wrap">
-      <div style="background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:8px 14px;font-size:11px;min-width:160px">
-        <span style="color:var(--muted)">Trade buffer </span>
-        <span id="retrain-buf-count" style="color:var(--text);font-weight:600">0</span>
-        <span style="color:var(--muted)"> / 16</span>
-        <div id="retrain-buf-bar" style="margin-top:5px;height:4px;background:#21262d;border-radius:2px">
-          <div id="retrain-buf-fill" style="height:4px;background:#f0883e;border-radius:2px;width:0%;transition:width .4s"></div>
-        </div>
-      </div>
-      <div style="background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:8px 14px;font-size:11px;min-width:130px">
-        <span style="color:var(--muted)">Total updates </span>
-        <span id="retrain-total" style="color:var(--text);font-weight:600">0</span>
-      </div>
-      <div style="background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:8px 14px;font-size:11px;min-width:130px">
-        <span style="color:var(--muted)">Pending trades </span>
-        <span id="retrain-pending" style="color:var(--text);font-weight:600">0</span>
-      </div>
-    </div>
-    <div id="retrain-terminal" style="background:#0a0c10;border:1px solid #30363d;border-radius:6px;
-         padding:14px;height:450px;overflow-y:auto;font-family:'Courier New',monospace;
-         font-size:12px;color:#c9d1d9;line-height:1.7">
-      <span style="color:#484f58">—</span> <span style="color:#666">No retraining events yet — waiting for 16 closed RL trades to accumulate</span>
-    </div>
-  </div>
-
-  <!-- Footer -->
-  <div class="foot">
-    <span id="last-upd">Last update: —</span>
-    <div id="prog"><div id="prog-f"></div></div>
-    <span id="nxt-ref">Refreshing in 30s</span>
-  </div>
-</div>
-
-<div class="toasts" id="toasts"></div>
-
-<!-- Position edit modal -->
-<div class="modal-overlay" id="pos-edit-modal" onclick="if(event.target===this)closeEditPos()">
-  <div class="modal-box">
-    <div class="modal-title">Edit Position: <span id="epm-sym">—</span></div>
-    <input type="hidden" id="epm-mkt">
-    <input type="hidden" id="epm-sym-h">
-    <div class="fgrid">
-      <div class="fg"><label>Qty (shares)</label>
-        <input type="number" id="epm-qty" step="1" min="1"></div>
-      <div class="fg"><label>Entry Price</label>
-        <input type="number" id="epm-entry" step="0.01" min="0"></div>
-      <div class="fg"><label>Stop Loss</label>
-        <input type="number" id="epm-sl" step="0.01" min="0"></div>
-      <div class="fg"><label>Target</label>
-        <input type="number" id="epm-tgt" step="0.01" min="0"></div>
-    </div>
-    <div style="display:flex;gap:10px;margin-top:18px">
-      <button class="btn btn-blue" onclick="saveEditPos()">Save Changes</button>
-      <button class="btn btn-muted" onclick="closeEditPos()">Cancel</button>
-    </div>
-  </div>
-</div>
-
-<script>
-const INTERVAL = 30;
-let _progStart = null, _progTimer = null, _refreshTimer = null;
-let _cfg = {};        // latest config snapshot — set in doRefresh
-let _lastState = null; // last full /api/state response for SSE PnL recalc
-let _activeTab = "india";
-let _logPollTimer = null;
-let _sessPollTimer = null;
-let _agentPollTimer = null;
-let _retrainPollTimer = null;
-let _logFilter = "ALL";
-let _autoScroll = true;
-let _lastLogEntries = null;
-let _lastDlogEntries = [];
-let _dlogFilter = "ALL";
-let _sessFilter = "all";
-let _sessData   = [];
-
-// ── Utilities ──────────────────────────────────────────────────────────────
-
-// Format a UTC ISO timestamp string into local date + time.
-// Always shows "15 Apr 14:30:22" so the date is visible in the log.
-function fmtTs(ts) {
-  if (!ts || ts === "—") return ts;
-  const d = new Date(ts);
-  if (isNaN(d.getTime())) return ts;          // graceful fallback for legacy strings
-  const timePart = d.toLocaleTimeString(undefined, {hour:"2-digit", minute:"2-digit", second:"2-digit", hour12:false});
-  const datePart = d.toLocaleDateString(undefined, {day:"2-digit", month:"short"});
-  return datePart + "  " + timePart;
-}
-
-// Full date + time for the clock / last-update label.
-function fmtDt(ts) {
-  const d = ts ? new Date(ts) : new Date();
-  if (isNaN(d.getTime())) return ts;
-  return d.toLocaleDateString(undefined, {day:"2-digit", month:"short", year:"numeric"}) + "  " +
-         d.toLocaleTimeString(undefined, {hour:"2-digit", minute:"2-digit", second:"2-digit", hour12:false});
-}
-
-function fc(v, sym) {
-  if (v == null) return "—";
-  const a = Math.abs(v);
-  if (sym === "₹") {
-    if (a >= 1e7) return sym + (v/1e7).toFixed(2) + "Cr";
-    if (a >= 1e5) return sym + (v/1e5).toFixed(2) + "L";
-  }
-  if (a >= 1e6) return sym + (v/1e6).toFixed(2) + "M";
-  if (a >= 1e3) return sym + Math.abs(v).toLocaleString("en-IN",{maximumFractionDigits:0});
-  return sym + v.toFixed(2);
-}
-const sc  = v => v > 0 ? "green" : v < 0 ? "red" : "muted";
-const sgn = v => v >= 0 ? "+" : "";
-const disp = s => s.replace(".NS","");
-
-function toast(msg, ok=true) {
-  const d = document.createElement("div");
-  d.className = "toast " + (ok ? "tok" : "terr");
-  d.innerHTML = `<span>${ok?"✓":"✗"}</span>${msg}`;
-  document.getElementById("toasts").appendChild(d);
-  setTimeout(() => d.remove(), 3200);
-}
-
-function tab(name, el) {
-  _activeTab = name;
-  document.querySelectorAll(".tab").forEach(t => t.classList.remove("on"));
-  document.querySelectorAll(".pane").forEach(p => p.classList.remove("on"));
-  el.classList.add("on");
-  document.getElementById("pane-"+name).classList.add("on");
-  clearInterval(_logPollTimer);
-  clearInterval(_sessPollTimer);
-  clearInterval(_agentPollTimer);
-  clearInterval(_retrainPollTimer);
-  if (name === "logs") {
-    _logPollTimer = setInterval(pollLogs, 5000);
-    setInterval(pollDecisions, 4000);
-    pollLogs();
-    pollDecisions();
-  } else if (name === "sessions") {
-    _sessPollTimer = setInterval(pollSessions, 15000);
-    pollSessions();
-  } else if (name === "agent") {
-    _agentPollTimer = setInterval(pollAgentTerminal, 4000);
-    pollAgentTerminal();
-  } else if (name === "retrain") {
-    _retrainPollTimer = setInterval(pollRetrainTerminal, 5000);
-    pollRetrainTerminal();
-  }
-}
-
-async function pollLogs() {
-  try {
-    const r = await fetch("/api/logs");
-    if (!r.ok) return;
-    const entries = await r.json();
-    _lastLogEntries = entries;
-    renderAgentLog(entries);
-    const dot = document.getElementById("log-live-dot");
-    if (dot) { dot.style.color = "var(--green)"; setTimeout(()=>{ dot.style.color="var(--muted)"; }, 800); }
-  } catch(e) {}
-}
-
-function setLogFilter(lvl, el) {
-  _logFilter = lvl;
-  document.querySelectorAll(".log-filter-btn").forEach(b => b.classList.remove("on"));
-  el.classList.add("on");
-  if (_lastLogEntries) renderAgentLog(_lastLogEntries);
-}
-
-// ── Decision log ──────────────────────────────────────────────────────────
-async function pollDecisions() {
-  try {
-    const r = await fetch("/api/think");
-    if (!r.ok) return;
-    const entries = await r.json();
-    _lastDlogEntries = entries;
-    renderDlog(entries);
-    const dot = document.getElementById("dlog-live-dot");
-    if (dot) { dot.style.color = "var(--green)"; setTimeout(()=>{ dot.style.color="var(--muted)"; }, 800); }
-  } catch(e) {}
-}
-
-// ── Agent Terminal ────────────────────────────────────────────────────────
-const _RL_COLORS = {BUY:'#3fb950', SELL:'#f85149', HOLD:'#8b949e', WARNING:'#f0883e', online:'#3fb950', Cycle:'#58a6ff'};
-
-function renderAgentTerminal(entries) {
-  const el = document.getElementById('agent-terminal');
-  if (!el) return;
-  const badge = document.getElementById('rl-status-badge');
-  if (!entries || !entries.length) {
-    el.innerHTML = '<span style="color:#484f58">—</span> <span style="color:#666">No RL decisions yet — start the agent</span>';
-    if (badge) { badge.textContent = '● INACTIVE'; badge.style.color = '#f85149'; }
-    return;
-  }
-  const isActive = entries.some(e => Date.now() - new Date(e.ts).getTime() < 600000);
-  if (badge) {
-    badge.textContent = isActive ? '● ACTIVE' : '● INACTIVE';
-    badge.style.color  = isActive ? '#3fb950' : '#f85149';
-    badge.style.background = isActive ? '#0a2016' : '#2a0a0a';
-  }
-  el.innerHTML = entries.map(e => {
-    const colorKey = Object.keys(_RL_COLORS).find(k => e.msg && e.msg.includes(k));
-    const c = colorKey ? _RL_COLORS[colorKey] : '#58a6ff';
-    const ts = e.ts ? new Date(e.ts).toLocaleString(undefined,{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}).replace(',','') : '';
-    const sym = (e.sym && e.sym !== 'SYSTEM') ? `<span style="color:#58a6ff;margin-right:6px">${e.sym}</span>` : '';
-    return `<div style="margin-bottom:3px;border-bottom:1px solid #161b22;padding-bottom:3px">` +
-      `<span style="color:#484f58">${ts}</span>` +
-      `<span style="color:#8b949e;margin:0 6px;font-size:10px">[RL]</span>` +
-      sym +
-      `<span style="color:${c}">${e.msg || ''}</span></div>`;
-  }).join('');
-  const auto = document.getElementById('agent-autoscroll');
-  if (auto?.checked) el.scrollTop = el.scrollHeight;
-}
-
-async function pollAgentTerminal() {
-  try {
-    const r = await fetch('/api/think');
-    if (!r.ok) return;
-    const entries = await r.json();
-    const rl = entries.filter(e => e.cat === 'RL');
-    renderAgentTerminal(rl);
-    const dot = document.getElementById('agent-live-dot');
-    if (dot) { dot.style.color='var(--green)'; setTimeout(()=>{ dot.style.color='var(--muted)'; }, 800); }
-  } catch(e) {}
-}
-
-function clearAgentTerminal() {
-  fetch('/api/think/clear', {method:'POST'}).catch(()=>{});
-  const el = document.getElementById('agent-terminal');
-  if (el) el.innerHTML = '<span style="color:#484f58">—</span> <span style="color:#666">Cleared — waiting for next cycle</span>';
-  _lastDlogEntries = [];
-  const dbox = document.getElementById("dlog-box");
-  if (dbox) renderDlog([]);
-}
-
-// ── Retraining Terminal ───────────────────────────────────────────────────
-function renderRetrainTerminal(data) {
-  const el      = document.getElementById('retrain-terminal');
-  const badge   = document.getElementById('retrain-status-badge');
-  const bufCnt  = document.getElementById('retrain-buf-count');
-  const bufFill = document.getElementById('retrain-buf-fill');
-  const total   = document.getElementById('retrain-total');
-  const pending = document.getElementById('retrain-pending');
-  if (!el) return;
-
-  const thr  = data.threshold || 16;
-  const nc   = data.new_count  || 0;
-  const bufsz= data.buffer_size || 0;
-
-  if (bufCnt)  bufCnt.textContent  = nc;
-  if (bufFill) bufFill.style.width = Math.min(100, Math.round(nc / thr * 100)) + '%';
-  if (total)   total.textContent   = data.total_updates || 0;
-  if (pending) pending.textContent = bufsz;
-
-  if (badge) {
-    if (data.is_training) {
-      badge.textContent = '⟳ TRAINING'; badge.style.color = '#f0883e'; badge.style.background = '#2a1800';
-    } else if ((data.total_updates || 0) > 0) {
-      badge.textContent = '● UPDATED';  badge.style.color = '#3fb950'; badge.style.background = '#0a2016';
-    } else {
-      badge.textContent = '● IDLE';     badge.style.color = '#8b949e'; badge.style.background = '#1a1a1a';
-    }
-  }
-
-  const entries = data.log || [];
-  if (!entries.length) {
-    el.innerHTML = '<span style="color:#484f58">—</span> <span style="color:#666">No retraining events yet — waiting for 16 closed RL trades to accumulate</span>';
-    return;
-  }
-
-  el.innerHTML = [...entries].reverse().map(e => {
-    const ts = e.ts ? new Date(e.ts).toLocaleString(undefined,
-      {month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}
-    ).replace(',','') : '';
-
-    let color, prefix, icon;
-    if (e.event === 'started') {
-      color = '#58a6ff'; prefix = 'STARTED'; icon = '🔄';
-    } else if (e.event === 'completed') {
-      color = (e.improvement_pct || 0) >= 0 ? '#3fb950' : '#f0883e';
-      prefix = 'APPLIED'; icon = '✓';
-    } else if (e.event === 'failed') {
-      color = '#f85149'; prefix = 'FAILED'; icon = '✗';
-    } else if (e.event === 'skipped') {
-      color = '#8b949e'; prefix = 'SKIPPED'; icon = '○';
-    } else {
-      color = '#8b949e'; prefix = (e.event || '').toUpperCase(); icon = '·';
-    }
-
-    const tradesTag = e.trades
-      ? `<span style="color:#484f58;font-size:10px;margin-left:8px">${e.trades} trades</span>` : '';
-    const improvTag = e.improvement_pct !== undefined
-      ? `<span style="color:${(e.improvement_pct||0)>=0?'#3fb950':'#f85149'};font-size:10px;margin-left:8px">${e.improvement_pct>0?'+':''}${e.improvement_pct}%</span>` : '';
-    const errTag = e.error
-      ? `<div style="color:#f85149;font-size:10px;margin-left:16px;margin-top:2px">${e.error}</div>` : '';
-
-    return `<div style="margin-bottom:5px;border-bottom:1px solid #161b22;padding-bottom:5px">` +
-      `<span style="color:#484f58">${ts}</span>` +
-      `<span style="color:${color};margin:0 7px;font-weight:700">${icon} ${prefix}</span>` +
-      `<span style="color:${color}">${e.msg || ''}</span>` +
-      tradesTag + improvTag + errTag +
-      `</div>`;
-  }).join('');
-}
-
-async function pollRetrainTerminal() {
-  try {
-    const r = await fetch('/api/retrain/log');
-    if (!r.ok) return;
-    renderRetrainTerminal(await r.json());
-  } catch(e) {}
-}
-
-function setDlogFilter(cat, el) {
-  _dlogFilter = cat;
-  document.querySelectorAll('[id^="df-"]').forEach(b => b.classList.remove("on"));
-  if (el) el.classList.add("on");
-  renderDlog(_lastDlogEntries);
-}
-
-function renderDlog(entries) {
-  const box = document.getElementById("dlog-box");
-  const cnt = document.getElementById("dlog-count");
-  if (!box) return;
-  const all = entries || [];
-  const filtered = _dlogFilter === "ALL" ? all : all.filter(e => e.cat === _dlogFilter);
-  if (cnt) cnt.textContent = filtered.length + (filtered.length < all.length ? " / "+all.length : "") + " entries";
-  if (!filtered.length) {
-    box.innerHTML = `<div class="drow"><span class="al-ts">—</span><span class="dcat dcat-CYCLE">CYCLE</span><span class="dsym"></span><span class="dmsg muted">No ${_dlogFilter === "ALL" ? "" : _dlogFilter+" "}decisions yet</span></div>`;
-    return;
-  }
-  box.innerHTML = [...filtered].reverse().map(e => {
-    const cat = e.cat || "CYCLE";
-    const ts  = fmtTs(e.ts || "");
-    const sym = e.sym ? `<span class="dsym">${e.sym}</span>` : `<span class="dsym"></span>`;
-    return `<div class="drow">
-      <span class="al-ts">${ts}</span>
-      <span class="dcat dcat-${cat}">${cat}</span>
-      ${sym}
-      <span class="dmsg">${e.msg || ""}</span>
-    </div>`;
-  }).join("");
-  const auto = document.getElementById("dlog-autoscroll");
-  if (auto?.checked) box.scrollTop = 0;
-}
-
-// ── Clock (browser local time) ────────────────────────────────────────────
-function tick() {
-  document.getElementById("clock").textContent = fmtDt();
-}
-setInterval(tick, 1000); tick();
-
-// ── Progress bar ──────────────────────────────────────────────────────────
-function startProg() {
-  _progStart = Date.now();
-  clearInterval(_progTimer);
-  _progTimer = setInterval(() => {
-    const e = (Date.now()-_progStart)/1000;
-    document.getElementById("prog-f").style.width = Math.min(100, e/INTERVAL*100)+"%";
-    const r = Math.max(0, INTERVAL - Math.floor(e));
-    document.getElementById("nxt-ref").textContent = "Refresh in "+r+"s";
-  }, 500);
-}
-
-// ── Render stats cards ────────────────────────────────────────────────────
-function renderStats(d) {
-  const ic = d.config.india_capital, uc = d.config.us_capital;
-  [["india","₹",ic],["us","$",uc]].forEach(([mkt,sym,cap]) => {
-    const m  = d[mkt];
-    const pv = m.portfolio_value || 0;
-    const df = pv - cap, pct = df/cap*100;
-    const pnl = m.realised_pnl || 0;
-    const tot = (m.wins||0)+(m.losses||0);
-    const wr  = tot > 0 ? m.wins/tot*100 : 0;
-    const dd   = m.drawdown || 0;
-    const tpnl = m.total_pnl || 0;
-    const upnl = m.unrealised_pnl || 0;
-    document.getElementById(mkt+"-pv").textContent   = fc(pv,sym);
-    document.getElementById(mkt+"-pv").className     = "c-val mono "+sc(df);
-    document.getElementById(mkt+"-diff").innerHTML   = `<span class="${sc(df)}">${sgn(df)}${fc(df,sym)} (${sgn(pct)}${pct.toFixed(1)}%)</span>`;
-    document.getElementById(mkt+"-cash").textContent = fc(m.cash,sym);
-    document.getElementById(mkt+"-npos").textContent = Object.keys(m.positions||{}).length+" positions";
-    document.getElementById(mkt+"-pnl").textContent  = fc(pnl,sym);
-    document.getElementById(mkt+"-pnl").className    = "c-val mono "+sc(pnl);
-    document.getElementById(mkt+"-ntrades").textContent = tot+" trades";
-    document.getElementById(mkt+"-wr").textContent   = wr.toFixed(0)+"%";
-    document.getElementById(mkt+"-wr").className     = "c-val mono "+(wr>=50?"green":"red");
-    document.getElementById(mkt+"-wl").textContent   = (m.wins||0)+"W "+(m.losses||0)+"L";
-    document.getElementById(mkt+"-dd").textContent   = dd.toFixed(1)+"%";
-    document.getElementById(mkt+"-dd").className     = "c-val mono "+(dd>5?"red":"green");
-    document.getElementById(mkt+"-tpnl").textContent = (tpnl>=0?"+":"")+fc(tpnl,sym);
-    document.getElementById(mkt+"-tpnl").className   = "c-val mono "+sc(tpnl);
-    document.getElementById(mkt+"-upnl").innerHTML   =
-      `Float: <span class="${sc(upnl)}">${sgn(upnl)}${fc(upnl,sym)}</span>`;
-    // market open badge
-    const mb = document.getElementById(mkt+"-mkt");
-    mb.className = "badge "+(m.market_open?"b-open":"b-closed");
-    mb.textContent = m.market_open ? "OPEN" : "CLOSED";
-    // session info
-    const sl = document.getElementById(mkt+"-sess-lbl");
-    if (sl) {
-      const sessDate = m.session_date || "—";
-      const nTrades  = (m.trade_log||[]).length;
-      const pnlStr   = (m.realised_pnl||0) >= 0
-        ? "+" + fc(m.realised_pnl||0, sym) : fc(m.realised_pnl||0, sym);
-      sl.innerHTML = `Session <span class="mono" style="color:var(--muted)">${sessDate}</span>`
-        + `  ·  ${nTrades} trade${nTrades!==1?"s":""}  ·  `
-        + `<span class="${sc(m.realised_pnl||0)}">${pnlStr}</span>`;
-    }
-  });
-  // header badges
-  const nb = document.getElementById("nse-badge"), ub = document.getElementById("nyse-badge");
-  nb.className = "badge "+(d.india.market_open?"b-open":"b-closed");
-  nb.textContent = "NSE "+(d.india.market_open?"OPEN":"CLOSED");
-  ub.className = "badge "+(d.us.market_open?"b-open":"b-closed");
-  ub.textContent = "NYSE "+(d.us.market_open?"OPEN":"CLOSED");
-}
-
-// ── EOD per-position cell ─────────────────────────────────────────────────
-function eodCell(p, cur, sym, mtc) {
-  if (mtc == null || mtc <= 0) return `<td class="muted" style="font-size:10px">—</td>`;
-  const harvestMin = _cfg.eod_harvest_min || 30;
-  const exitMin    = _cfg.eod_exit_min    || 15;
-  const isShort    = p.side === "short";
-  const pnl        = isShort ? (p.entry - cur) * p.qty : (cur - p.entry) * p.qty;
-  const needPct    = isShort
-    ? ((cur / p.entry) - 1) * 100   // % drop needed to break even for shorts
-    : ((p.entry / cur) - 1) * 100;  // % rise needed to break even for longs
-  let badge = "", note = "";
-
-  if (mtc <= exitMin) {
-    badge = `<span style="color:var(--red);font-size:10px;font-weight:700">⚡ FORCE EXIT</span>`;
-  } else if (mtc <= harvestMin) {
-    if (pnl > 0) {
-      badge = `<span style="color:var(--green);font-size:10px;font-weight:700">✓ HARVESTING</span>`;
-    } else {
-      badge = `<span style="color:var(--orange);font-size:10px;font-weight:700">⏳ HOLDING</span>`;
-      if (needPct > 0.05)
-        note = `<div style="color:var(--yellow);font-size:9px">need +${needPct.toFixed(1)}% → ${sym}${p.entry.toFixed(2)} BE</div>`;
-    }
-  } else {
-    const m = Math.floor(mtc);
-    badge = `<span style="color:var(--muted);font-size:10px">${m}m left</span>`;
-    if (pnl < 0 && mtc < 60 && needPct > 0.05)
-      note = `<div style="color:var(--yellow);font-size:9px">+${needPct.toFixed(1)}% to BE</div>`;
-  }
-  return `<td>${badge}${note}</td>`;
-}
-
-// ── Render positions table ────────────────────────────────────────────────
-function renderPos(positions, prices, sym, bodyId, countId, mkt, mtc) {
-  const cnt = Object.keys(positions||{}).length;
-  document.getElementById(countId).textContent = cnt;
-  const tb = document.getElementById(bodyId);
-  if (!cnt) {
-    tb.innerHTML = `<tr><td colspan="10" style="text-align:center;padding:18px;color:var(--muted)">No open positions</td></tr>`;
-    return;
-  }
-  tb.innerHTML = Object.entries(positions).map(([s,p]) => {
-    const cur      = prices[s] || p.entry;
-    const isShort  = p.side === "short";
-    const pnl      = isShort ? (p.entry - cur) * p.qty : (cur - p.entry) * p.qty;
-    const pct      = pnl / (p.entry * p.qty) * 100;
-    const c        = pnl >= 0 ? "green" : "red";
-    const sideBadge = `<span class="side-badge ${isShort ? 'side-short' : 'side-long'}">${isShort ? 'SHORT' : 'LONG'}</span>`;
-    const btnLabel  = isShort ? "Cover" : "Sell";
-    return `<tr>
-      <td class="mono" style="font-weight:700;color:var(--blue)">${disp(s)} ${sideBadge}</td>
-      <td class="mono">${p.qty}</td>
-      <td class="mono">${sym}${p.entry.toFixed(2)}</td>
-      <td class="mono">${sym}${cur.toFixed(2)}</td>
-      <td class="mono ${c}">${pnl>=0?"+":""}${sym}${Math.abs(pnl).toFixed(0)} (${pct>=0?"+":""}${pct.toFixed(1)}%)</td>
-      <td class="mono">${sym}${p.stop_loss.toFixed(2)}</td>
-      <td class="mono">${sym}${p.target.toFixed(2)}</td>
-      <td class="muted" style="font-size:11px">${fmtTs(p.entered_at||"")}</td>
-      ${eodCell(p, cur, sym, mtc)}
-      <td style="white-space:nowrap">
-        <button class="btn btn-muted btn-sm" style="margin-right:4px"
-          onclick="editPos('${mkt}','${s}',${p.qty},${p.entry},${p.stop_loss},${p.target})">Edit</button>
-        <button class="btn btn-red btn-sm" onclick="sellPos('${mkt}','${s}')">${btnLabel}</button>
-      </td>
-    </tr>`;
-  }).join("");
-}
-
-// ── EOD header badges + per-market banners ────────────────────────────────
-function renderEodHeader(d) {
-  [["india","NSE"],["us","NYSE"]].forEach(([mkt, label]) => {
-    const mtc        = d[mkt+"_mtc"];
-    const nPos       = Object.keys(d[mkt].positions||{}).length;
-    const harvestMin = d.config.eod_harvest_min || 30;
-    const exitMin    = d.config.eod_exit_min    || 15;
-    const badge      = document.getElementById(mkt+"-eod");
-    const banner     = document.getElementById(mkt+"-eod-banner");
-    const phase      = document.getElementById(mkt+"-eod-phase");
-    const detail     = document.getElementById(mkt+"-eod-detail");
-
-    if (mtc == null || mtc <= 0) {
-      badge.style.display  = "none";
-      banner.style.display = "none";
-      return;
-    }
-
-    // Header badge (visible whenever market is open and within 60 min of close)
-    if (mtc <= 60) {
-      badge.style.display = "";
-      badge.textContent   = `${label} EOD ${Math.floor(mtc)}m`;
-      badge.className     = "badge " + (mtc <= exitMin ? "b-eod-exit" : "b-eod-warn");
-    } else {
-      badge.style.display = "none";
-    }
-
-    // Banner above positions table
-    if (nPos > 0 && mtc <= harvestMin) {
-      banner.style.display = "flex";
-      if (mtc <= exitMin) {
-        banner.className   = "eod-banner eod-exit";
-        phase.textContent  = "⚡ FORCE EXIT";
-        phase.style.color  = "var(--red)";
-        detail.textContent = `Closing all ${nPos} position${nPos>1?"s":""} — ${Math.floor(mtc)} min until ${label} close`;
-      } else {
-        banner.className   = "eod-banner eod-warn";
-        phase.textContent  = "⏳ EOD HARVEST";
-        phase.style.color  = "var(--orange)";
-        detail.textContent =
-          `Selling profitable positions now. Force exit in ${Math.floor(mtc-exitMin)} min. No new buys.`;
-      }
-    } else if (nPos > 0 && mtc <= 60) {
-      banner.style.display = "flex";
-      banner.className     = "eod-banner eod-warn";
-      phase.textContent    = "EOD approaching";
-      phase.style.color    = "var(--muted)";
-      detail.textContent   =
-        `${Math.floor(mtc)} min until ${label} close — profit harvest starts in ${Math.floor(mtc-harvestMin)} min`;
-    } else {
-      banner.style.display = "none";
-    }
-  });
-}
-
-// ── Render signal board ───────────────────────────────────────────────────
-function renderSig(analyses, positions, sym, bodyId) {
-  const tb = document.getElementById(bodyId);
-  if (!analyses||!analyses.length) {
-    tb.innerHTML = `<tr><td colspan="11" style="text-align:center;padding:18px;color:var(--muted)">No scan data — start the agent</td></tr>`;
-    return;
-  }
-  tb.innerHTML = analyses.map(a => {
-    const inP  = positions&&positions[a.symbol];
-    const conf = a.confidence;
-    const cc   = conf>65?"var(--green)":conf>40?"var(--yellow)":"var(--muted)";
-    const actC = a.score>25?"act-buy":a.score<-25?"act-sell":"act-hold";
-    const actT = a.score>25?"BUY":a.score<-25?"SELL":"HOLD";
-    const rsiC = a.rsi<35?"var(--green)":a.rsi>65?"var(--red)":"inherit";
-    const macd = (a.signals?.MACD?.signal||"").split(" ")[0];
-    const bb   = (a.signals?.BB?.signal||"").split(" ")[0];
-    const ema  = (a.signals?.EMA?.signal||"").split(" ")[0];
-    const vol  = (a.signals?.Vol?.signal||"").split(" ")[0];
-    const hw   = a.hist_win_days   ?? 0;
-    const ht   = a.hist_total_days ?? 0;
-    const hArr = hw > ht/2 ? "↑" : hw < ht/2 ? "↓" : "→";
-    const hTxt = ht > 0 ? `${hw}/${ht}${hArr}` : "–";
-    const hClr = hw > ht/2 ? "var(--green)" : hw < ht/2 ? "var(--red)" : "var(--muted)";
-    const nc   = a.news_count ?? 0;
-    const ns   = a.news_score ?? 0;
-    const nArr = ns > 0 ? "↑" : ns < 0 ? "↓" : "→";
-    const nTxt = nc > 0 ? `${nc}${nArr}` : "–";
-    const nClr = ns > 0 ? "var(--green)" : ns < 0 ? "var(--red)" : "var(--muted)";
-    return `<tr>
-      <td class="mono" style="font-weight:600${inP?";color:var(--blue)":""}">${disp(a.symbol)}${inP?" *":""}</td>
-      <td class="mono">${sym}${(a.price||0).toFixed(2)}</td>
-      <td class="mono" style="color:${rsiC}">${(a.rsi||0).toFixed(0)}</td>
-      <td class="muted">${macd}</td>
-      <td class="muted">${bb}</td>
-      <td class="muted">${ema}</td>
-      <td class="muted">${vol}</td>
-      <td class="mono" style="color:${hClr};font-weight:600">${hTxt}</td>
-      <td class="mono" style="color:${nClr};font-weight:600">${nTxt}</td>
-      <td><div class="cbar"><div class="cbar-bg"><div class="cbar-fg" style="width:${conf}%;background:${cc}"></div></div>
-          <span class="mono" style="color:${cc};font-size:11px">${conf.toFixed(0)}%</span></div></td>
-      <td><span class="${actC}">${actT}</span></td>
-    </tr>`;
-  }).join("");
-}
-
-// ── Render trade log ──────────────────────────────────────────────────────
-function renderLog(trades, id, n=20) {
-  const el = document.getElementById(id);
-  if (!trades||!trades.length) {
-    el.innerHTML = `<div class="log-row"><span class="lt">—</span><span class="muted">No trades yet</span></div>`;
-    return;
-  }
-  el.innerHTML = [...trades].reverse().slice(0,n).map(t => {
-    const c = t.kind==="BUY"?"lb":t.kind==="SELL"?"ls":"ll";
-    return `<div class="log-row"><span class="lt">${fmtTs(t.time)}</span><span class="${c}">${t.message}</span></div>`;
-  }).join("");
-}
-
-function renderAllLogs(il, ul) {
-  const all = [...(il||[]).map(t=>({...t,mkt:"NSE"})),
-               ...(ul||[]).map(t=>({...t,mkt:"NYSE"}))]
-    .sort((a,b)=>b.time.localeCompare(a.time)).slice(0,150);
-  const el = document.getElementById("all-log");
-  if (!all.length) { el.innerHTML=`<div class="log-row"><span class="lt">—</span><span class="muted">No trades yet</span></div>`; return; }
-  el.innerHTML = all.map(t=>{
-    const c = t.kind==="BUY"?"lb":t.kind==="SELL"?"ls":"ll";
-    return `<div class="log-row"><span class="lt">${fmtTs(t.time)}</span>
-      <span class="muted" style="min-width:44px;font-size:10px">${t.mkt}</span>
-      <span class="${c}">${t.message}</span></div>`;
-  }).join("");
-}
-
-function renderAgentLog(entries) {
-  if (entries) _lastLogEntries = entries;
-  const all = _lastLogEntries || [];
-  const el  = document.getElementById("agent-log");
-  const cnt = document.getElementById("alog-count");
-  if (!all.length) {
-    el.innerHTML = `<div class="alog-row"><span class="al-ts">—</span><span class="al-lvl al-debug">—</span><span class="muted">No agent activity yet — start the agent</span></div>`;
-    if (cnt) cnt.textContent = "0 entries";
-    return;
-  }
-  const filtered = _logFilter === "ALL" ? all
-    : all.filter(e => (e.level||"").toUpperCase() === _logFilter);
-  if (!filtered.length) {
-    el.innerHTML = `<div class="alog-row"><span class="al-ts">—</span><span class="al-lvl al-debug">—</span><span class="muted">No ${_logFilter} entries</span></div>`;
-    if (cnt) cnt.textContent = "0 / " + all.length + " entries";
-    return;
-  }
-  el.innerHTML = [...filtered].reverse().map(e => {
-    const lc = "al-"+(e.level||"info").toLowerCase();
-    return `<div class="alog-row">
-      <span class="al-ts">${fmtTs(e.ts||"")}</span>
-      <span class="al-lvl ${lc}">${e.level||""}</span>
-      <span style="color:var(--text);flex:1">${e.msg||""}</span>
-    </div>`;
-  }).join("");
-  if (cnt) cnt.textContent = filtered.length + (filtered.length < all.length ? " / "+all.length : "") + " entries";
-  if (_autoScroll) el.scrollTop = 0;
-}
-
-// ── Render agent badge + controls ─────────────────────────────────────────
-function renderAgent(a) {
-  const ab  = document.getElementById("agent-badge");
-  const bt  = document.getElementById("btn-toggle");
-  const bp  = document.getElementById("btn-pause");
-  if (a.running && !a.paused) {
-    ab.className  = "badge b-run"; ab.textContent = "● "+(a.status||"RUNNING").toUpperCase();
-    bt.className  = "btn btn-red"; bt.textContent = "■ Stop Agent";
-    bp.textContent = "⏸ Pause";
-  } else if (a.paused) {
-    ab.className  = "badge b-pause"; ab.textContent = "⏸ PAUSED";
-    bt.className  = "btn btn-red";   bt.textContent = "■ Stop Agent";
-    bp.textContent = "▶ Resume";
-  } else {
-    ab.className  = "badge b-idle"; ab.textContent = "IDLE";
-    bt.className  = "btn btn-green"; bt.textContent = "▶ Start Agent";
-    bp.textContent = "⏸ Pause";
-  }
-  if (a.last_update) document.getElementById("last-upd").textContent = "Last update: "+fmtDt(a.last_update);
-}
-
-// ── Load config into form ─────────────────────────────────────────────────
-function toggleSettings(el) {
-  const on = el.checked;
-  const lbl = document.getElementById('settings-toggle-label');
-  lbl.textContent = on ? '● ACTIVE' : '○ FULL LIBERTY';
-  lbl.style.color = on ? '#3fb950' : '#484f58';
-  document.querySelectorAll('.settings-input').forEach(inp => inp.disabled = !on);
-  fetch('/api/config', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({settings_enabled: on})
-  });
-}
-
-function loadCfg(c) {
-  document.getElementById("s-risk").value  = c.risk_per_trade;
-  document.getElementById("s-conf").value  = c.confidence_threshold;
-  document.getElementById("s-sl").value    = c.stop_loss_pct;
-  document.getElementById("s-tgt").value   = c.target_pct;
-  document.getElementById("s-chk").value   = c.check_interval_min;
-  document.getElementById("s-idle").value  = c.idle_interval_min;
-  document.getElementById("s-ip").value    = c.india_max_positions;
-  document.getElementById("s-up").value    = c.us_max_positions;
-  document.getElementById("s-eod-h").value = c.eod_harvest_min;
-  document.getElementById("s-eod-e").value = c.eod_exit_min;
-  document.getElementById("s-rl-exit").value = c.rl_exit_confidence ?? 55;
-  // Sync settings toggle state
-  const stToggle = document.getElementById('settings-toggle');
-  if (stToggle && c.settings_enabled !== undefined) {
-    const on = !!c.settings_enabled;
-    stToggle.checked = on;
-    const lbl = document.getElementById('settings-toggle-label');
-    if (lbl) { lbl.textContent = on ? '● ACTIVE' : '○ FULL LIBERTY'; lbl.style.color = on ? '#3fb950' : '#484f58'; }
-    document.querySelectorAll('.settings-input').forEach(inp => inp.disabled = !on);
-  }
-}
-
-// ── Load editable state into form ─────────────────────────────────────────
-function loadEditState(d) {
-  const fill = (id, val, decimals=2) =>
-    { const el = document.getElementById(id); if(el) el.value = (val||0).toFixed ? (val||0).toFixed(decimals) : (val||0); };
-  fill("es-india-cash",   d.india.cash);
-  fill("es-india-rpnl",   d.india.realised_pnl);
-  fill("es-india-wins",   d.india.wins,    0);
-  fill("es-india-losses", d.india.losses,  0);
-  fill("es-india-peak",   d.india.peak_portfolio || d.india.portfolio_value);
-  fill("es-us-cash",      d.us.cash);
-  fill("es-us-rpnl",      d.us.realised_pnl);
-  fill("es-us-wins",      d.us.wins,    0);
-  fill("es-us-losses",    d.us.losses,  0);
-  fill("es-us-peak",      d.us.peak_portfolio || d.us.portfolio_value);
-}
-
-async function saveEditState() {
-  const gf = id => parseFloat(document.getElementById(id).value);
-  const gi = id => parseInt(document.getElementById(id).value);
-  const body = {
-    india: { cash: gf("es-india-cash"), realised_pnl: gf("es-india-rpnl"),
-             wins: gi("es-india-wins"), losses: gi("es-india-losses"),
-             peak_portfolio: gf("es-india-peak") },
-    us:    { cash: gf("es-us-cash"),    realised_pnl: gf("es-us-rpnl"),
-             wins: gi("es-us-wins"),    losses: gi("es-us-losses"),
-             peak_portfolio: gf("es-us-peak") },
-  };
-  const r = await fetch("/api/edit/state", {
-    method: "POST", headers: {"Content-Type": "application/json"},
-    body: JSON.stringify(body),
-  });
-  const d = await r.json();
-  toast(d.ok ? "Portfolio state updated" : "Update failed", d.ok);
-  if (d.ok) setTimeout(doRefresh, 300);
-}
-
-// ── Position editing ──────────────────────────────────────────────────────
-function editPos(mkt, sym, qty, entry, sl, tgt) {
-  document.getElementById("epm-sym").textContent = disp(sym);
-  document.getElementById("epm-mkt").value = mkt;
-  document.getElementById("epm-sym-h").value = sym;
-  document.getElementById("epm-qty").value   = qty;
-  document.getElementById("epm-entry").value = entry.toFixed(2);
-  document.getElementById("epm-sl").value    = sl.toFixed(2);
-  document.getElementById("epm-tgt").value   = tgt.toFixed(2);
-  document.getElementById("pos-edit-modal").classList.add("open");
-}
-
-function closeEditPos() {
-  document.getElementById("pos-edit-modal").classList.remove("open");
-}
-
-async function saveEditPos() {
-  const mkt = document.getElementById("epm-mkt").value;
-  const sym = document.getElementById("epm-sym-h").value;
-  const body = {
-    qty:       parseInt(document.getElementById("epm-qty").value),
-    entry:     parseFloat(document.getElementById("epm-entry").value),
-    stop_loss: parseFloat(document.getElementById("epm-sl").value),
-    target:    parseFloat(document.getElementById("epm-tgt").value),
-  };
-  const r = await fetch(`/api/edit/position/${mkt}/${sym}`, {
-    method: "POST", headers: {"Content-Type": "application/json"},
-    body: JSON.stringify(body),
-  });
-  const d = await r.json();
-  toast(d.ok ? "Position updated" : d.msg, d.ok);
-  closeEditPos();
-  if (d.ok) setTimeout(doRefresh, 300);
-}
-
-// ── Sessions ──────────────────────────────────────────────────────────────
-async function pollSessions() {
-  try {
-    const r = await fetch("/api/sessions");
-    if (!r.ok) return;
-    _sessData = await r.json();
-    renderSessions(_sessData);
-  } catch(e) {}
-}
-
-function setSessFilter(f, el) {
-  _sessFilter = f;
-  document.querySelectorAll(".sess-filter").forEach(b => b.classList.remove("on"));
-  el.classList.add("on");
-  renderSessions(_sessData);
-}
-
-function toggleSessBody(safeId) {
-  const el = document.getElementById("sb-"+safeId);
-  if (el) el.classList.toggle("open");
-}
-
-function renderSessions(sessions) {
-  const filtered = _sessFilter === "all" ? sessions
-    : sessions.filter(s => s.market === _sessFilter);
-  const cnt = document.getElementById("sess-count");
-  if (cnt) cnt.textContent = filtered.length + " session" + (filtered.length !== 1 ? "s" : "");
-  const tc = document.getElementById("sess-tab-cnt");
-  if (tc) tc.textContent = sessions.length > 0 ? "("+sessions.length+")" : "";
-  const el = document.getElementById("sess-list");
-  if (!filtered.length) {
-    el.innerHTML = `<div style="text-align:center;padding:36px;color:var(--muted)">No past sessions yet — sessions are archived automatically when the calendar date changes</div>`;
-    return;
-  }
-  el.innerHTML = filtered.map(s => {
-    const sm      = s.market === "india" ? "₹" : "$";
-    const safe    = (s.id||"").replace(/[^a-zA-Z0-9]/g,"_");
-    const pnlCls  = (s.net_pnl||0) >= 0 ? "green" : "red";
-    const tot     = (s.wins||0) + (s.losses||0);
-    const wr      = tot > 0 ? (s.wins/tot*100).toFixed(0)+"%" : "—";
-    const mktCls  = s.market === "india" ? "sess-mkt-india" : "sess-mkt-us";
-    const mktLbl  = s.market === "india" ? "NSE" : "NYSE";
-    const sign    = (s.net_pnl||0) >= 0 ? "+" : "";
-    const trades  = s.trades || [];
-    const trHtml  = trades.length
-      ? [...trades].reverse().map(t => {
-          const c = t.kind==="BUY"?"lb":t.kind==="SELL"?"ls":"ll";
-          return `<div class="log-row"><span class="lt">${fmtTs(t.time)}</span><span class="${c}">${t.message}</span></div>`;
-        }).join("")
-      : `<div class="log-row"><span class="muted" style="padding:4px 10px">No trades this session</span></div>`;
-    return `<div class="sess-card">
-      <div class="sess-hdr" onclick="toggleSessBody('${safe}')">
-        <span class="sess-date">${s.date||"—"}</span>
-        <span class="sess-mkt ${mktCls}">${mktLbl}</span>
-        <div style="flex:1;display:flex;flex-wrap:wrap;gap:16px;align-items:center;padding:0 6px">
-          <span class="mono" style="font-size:12px;color:var(--muted)">
-            ${sm}${(s.start_cash||0).toLocaleString(undefined,{maximumFractionDigits:0})}
-            → ${sm}${(s.end_cash||0).toLocaleString(undefined,{maximumFractionDigits:0})}
-          </span>
-          <span class="mono ${pnlCls}" style="font-size:14px;font-weight:700">
-            ${sign}${sm}${Math.abs(s.net_pnl||0).toLocaleString(undefined,{maximumFractionDigits:0})}
-            <span style="font-size:11px;font-weight:400;color:inherit;opacity:.8">
-              (${sign}${(s.pnl_pct||0).toFixed(1)}%)
-            </span>
-          </span>
-          <span class="muted" style="font-size:11px">
-            ${s.wins||0}W ${s.losses||0}L · ${wr} WR · ${s.n_trades||trades.length} trade${(s.n_trades||trades.length)!==1?"s":""}
-          </span>
-        </div>
-        <span style="color:var(--muted);font-size:14px;padding-left:4px">›</span>
-      </div>
-      <div class="sess-body" id="sb-${safe}">
-        <div class="sess-metrics">
-          <div class="sess-m">
-            <span class="sess-m-l">Start Capital</span>
-            <span class="sess-m-v">${sm}${(s.start_cash||0).toLocaleString(undefined,{maximumFractionDigits:0})}</span>
-          </div>
-          <div class="sess-m">
-            <span class="sess-m-l">End Cash</span>
-            <span class="sess-m-v">${sm}${(s.end_cash||0).toLocaleString(undefined,{maximumFractionDigits:0})}</span>
-          </div>
-          <div class="sess-m">
-            <span class="sess-m-l">End Portfolio</span>
-            <span class="sess-m-v">${sm}${(s.end_portfolio||s.end_cash||0).toLocaleString(undefined,{maximumFractionDigits:0})}</span>
-          </div>
-          <div class="sess-m">
-            <span class="sess-m-l">Net P&amp;L</span>
-            <span class="sess-m-v ${pnlCls}">${sign}${sm}${Math.abs(s.net_pnl||0).toLocaleString(undefined,{maximumFractionDigits:0})}</span>
-          </div>
-          <div class="sess-m">
-            <span class="sess-m-l">Wins / Losses</span>
-            <span class="sess-m-v">${s.wins||0}W / ${s.losses||0}L</span>
-          </div>
-          <div class="sess-m">
-            <span class="sess-m-l">Win Rate</span>
-            <span class="sess-m-v">${wr}</span>
-          </div>
-          <div class="sess-m">
-            <span class="sess-m-l">Archived at</span>
-            <span class="sess-m-v muted" style="font-size:11px">${fmtTs(s.archived_at||"")}</span>
-          </div>
-        </div>
-        <div class="log-box" style="max-height:200px;border-radius:0;border:none;background:#0a0e14">
-          ${trHtml}
-        </div>
-      </div>
-    </div>`;
-  }).join("");
-}
-
-async function closeSessionNow(market) {
-  if (!confirm(`Archive current ${market.toUpperCase()} session and reset to starting capital?\n\nAll open positions will be force-closed at current prices.`)) return;
-  const r = await fetch("/api/sessions/close/"+market, {method:"POST"});
-  const d = await r.json();
-  toast(d.msg, d.ok);
-  if (d.ok) { setTimeout(doRefresh, 400); setTimeout(pollSessions, 600); }
-}
-
-// ── Main refresh ──────────────────────────────────────────────────────────
-async function doRefresh() {
-  try {
-    const r = await fetch("/api/state");
-    const d = await r.json();
-    _cfg = d.config;
-    _lastState = d;
-    renderStats(d);
-    renderAgent(d.agent);
-    loadCfg(d.config);
-    loadEditState(d);
-    renderEodHeader(d);
-    renderPos(d.india.positions, d.signals.india_prices, "₹", "india-pos", "india-pc", "india", d.india_mtc);
-    renderPos(d.us.positions,    d.signals.us_prices,    "$",  "us-pos",    "us-pc",    "us",    d.us_mtc);
-    renderSig(d.signals.india, d.india.positions, "₹", "india-sig");
-    renderSig(d.signals.us,    d.us.positions,    "$",  "us-sig");
-    renderLog(d.india.trade_log, "india-log");
-    renderLog(d.us.trade_log,    "us-log");
-    renderAllLogs(d.india.trade_log, d.us.trade_log);
-    renderAgentLog(d.agent_log || []);
-    if (d.decision_log) { _lastDlogEntries = d.decision_log; renderDlog(d.decision_log); }
-    // update sessions tab badge + refresh sessions data in background
-    const tc = document.getElementById("sess-tab-cnt");
-    if (tc) tc.textContent = d.sessions_count > 0 ? "("+d.sessions_count+")" : "";
-    if (_activeTab === "sessions") pollSessions();
-    startProg();
-  } catch(e) { toast("Refresh failed: "+e.message, false); }
-}
-
-// ── SSE live price updates ─────────────────────────────────────────────────
-(function startPriceSSE() {
-  const src = new EventSource('/api/prices/stream');
-  src.onmessage = (e) => {
-    try {
-      const prices = JSON.parse(e.data);
-      if (!_lastState) return;
-      // recalculate PnL for each market using cached positions + fresh prices
-      ['india', 'us'].forEach(mkt => {
-        const sym  = mkt === 'india' ? '₹' : '$';
-        const m    = _lastState[mkt];
-        const cap  = mkt === 'india' ? _cfg.india_capital : _cfg.us_capital;
-        if (!m) return;
-        // merge: latest prices override signal prices
-        const merged = Object.assign({}, _lastState.signals[mkt+'_prices'], prices);
-        let upnl = 0;
-        Object.entries(m.positions || {}).forEach(([s, p]) => {
-          const cur = merged[s] || p.entry;
-          upnl += p.side === 'short'
-            ? (p.entry - cur) * p.qty
-            : (cur - p.entry) * p.qty;
-        });
-        const pv    = m.cash + Object.entries(m.positions||{}).reduce((acc,[s,p])=>{
-          const cur = merged[s]||p.entry;
-          return acc + (p.side==='short' ? (p.entry-cur)*p.qty : cur*p.qty);
-        }, 0);
-        const tpnl  = (m.realised_pnl||0) + upnl;
-        const df    = pv - cap, pct = cap > 0 ? df/cap*100 : 0;
-        const fc    = (v,s) => s+(Math.abs(v)<1e6 ? Math.abs(v).toLocaleString(undefined,{maximumFractionDigits:0}) : (Math.abs(v)/1e5).toFixed(1)+'L');
-        const sc    = v => v>=0?'green':'red';
-        const sgn   = v => v>=0?'+':'-';
-        const el    = id => document.getElementById(mkt+'-'+id);
-        if (el('pv'))   { el('pv').textContent = fc(pv,sym); el('pv').className='c-val mono '+sc(df); }
-        if (el('diff')) el('diff').innerHTML = `<span class="${sc(df)}">${sgn(df)}${fc(df,sym)} (${sgn(pct)}${Math.abs(pct).toFixed(1)}%)</span>`;
-        if (el('tpnl')) { el('tpnl').textContent=(tpnl>=0?'+':'')+fc(tpnl,sym); el('tpnl').className='c-val mono '+sc(tpnl); }
-        if (el('upnl')) el('upnl').innerHTML=`Float: <span class="${sc(upnl)}">${sgn(upnl)}${fc(upnl,sym)}</span>`;
-      });
-    } catch(_) {}
-  };
-  src.onerror = () => { src.close(); setTimeout(startPriceSSE, 5000); };
-})();
-
-function scheduleRefresh() {
-  clearTimeout(_refreshTimer);
-  _refreshTimer = setTimeout(()=>{ doRefresh(); scheduleRefresh(); }, INTERVAL*1000);
-}
-
-// ── Controls ──────────────────────────────────────────────────────────────
-async function toggleAgent() {
-  const running = document.getElementById("btn-toggle").textContent.includes("Stop");
-  const url = running ? "/api/agent/stop" : "/api/agent/start";
-  const r = await fetch(url,{method:"POST"});
-  const d = await r.json();
-  toast(d.msg, d.ok);
-  setTimeout(doRefresh, 400);
-}
-
-async function pauseAgent() {
-  const r = await fetch("/api/agent/pause",{method:"POST"});
-  const d = await r.json();
-  if (d.ok) toast(d.paused ? "Agent paused" : "Agent resumed");
-  else toast(d.msg, false);
-  setTimeout(doRefresh, 300);
-}
-
-async function sellPos(market, symbol) {
-  if (!confirm("Force sell "+disp(symbol)+"?")) return;
-  const r = await fetch("/api/sell/"+market+"/"+symbol,{method:"POST"});
-  const d = await r.json();
-  toast(d.msg, d.ok);
-  setTimeout(doRefresh, 400);
-}
-
-async function saveConfig() {
-  const p = {
-    risk_per_trade:       parseFloat(document.getElementById("s-risk").value),
-    confidence_threshold: parseInt(document.getElementById("s-conf").value),
-    stop_loss_pct:        parseFloat(document.getElementById("s-sl").value),
-    target_pct:           parseFloat(document.getElementById("s-tgt").value),
-    check_interval_min:   parseInt(document.getElementById("s-chk").value),
-    idle_interval_min:    parseInt(document.getElementById("s-idle").value),
-    india_max_positions:  parseInt(document.getElementById("s-ip").value),
-    us_max_positions:     parseInt(document.getElementById("s-up").value),
-    eod_harvest_min:      parseInt(document.getElementById("s-eod-h").value),
-    eod_exit_min:         parseInt(document.getElementById("s-eod-e").value),
-    rl_exit_confidence:   parseInt(document.getElementById("s-rl-exit").value),
-  };
-  const r = await fetch("/api/config",{method:"POST",
-    headers:{"Content-Type":"application/json"},body:JSON.stringify(p)});
-  const d = await r.json();
-  toast(d.ok ? "Settings saved — applies next cycle" : "Save failed", d.ok);
-}
-
-async function resetMkt(market) {
-  if (!confirm("Reset "+market+" paper state? This erases all positions, trades and P&L.")) return;
-  const r = await fetch("/api/reset/"+market,{method:"POST"});
-  const d = await r.json();
-  toast(d.msg, d.ok);
-  setTimeout(doRefresh, 300);
-}
-
-// ── Boot ──────────────────────────────────────────────────────────────────
-doRefresh();
-scheduleRefresh();
-startProg();
-</script>
-</body>
-</html>"""
 
 # ─── GUNICORN / WSGI STARTUP ──────────────────────────────────────────────────
 # Runs when gunicorn (or any WSGI server) imports this module.
@@ -3992,12 +2859,18 @@ startProg();
 
 def _on_startup():
     global _state
-    with _lock:
-        _state = load_state()
+    _state = load_state()
     start_price_updater()
     apex_log.info("Apex started — Supabase storage, dual-loop active")
 
-_on_startup()
+
+# APEX_SKIP_AUTOSTART=1 imports the module without touching Supabase or spawning
+# the price-updater thread. Required by the test suite; also lets a liveness probe
+# import the app without side effects.
+if os.getenv("APEX_SKIP_AUTOSTART", "").lower() not in ("1", "true", "yes"):
+    _on_startup()
+else:
+    apex_log.info("APEX_SKIP_AUTOSTART set — state load and price updater skipped")
 
 # ─── ENTRY POINT ──────────────────────────────────────────────────────────────
 

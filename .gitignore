@@ -2,6 +2,24 @@
 graphify-out/
 .graphify_*
 
+# Secrets — never commit
 .env
 error.txt
 session.txt
+
+# Python build/test artifacts
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Runtime state and logs — these carried live position sizes, entry prices and
+# cash balances into the repo.
+apex.log
+*.log
+apex_dual_state.json

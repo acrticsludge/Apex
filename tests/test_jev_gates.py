@@ -85,14 +85,14 @@ class TestJEVGates:
 
     def test_halt_gate_disabled(self, mock_jev_decisions, base_cfg):
         """jev_risk_enabled = False → should not halt even if noul high."""
-        original_cfg = jev.cfg
+        saved = dict(jev._jev_flags)
         try:
-            jev.cfg = {**base_cfg, "jev_risk_enabled": False}
+            jev.configure({**base_cfg, "jev_risk_enabled": False})
             decisions = mock_jev_decisions.copy()
             decisions["halt_new_buys"] = {"noul": 0.9, "confidence": 0.9}
             assert jev.should_halt(decisions) is False
         finally:
-            jev.cfg = original_cfg
+            jev.configure(saved)
 
     # ─── Test get_position_action ────────────────────────────────────────────
 
@@ -112,14 +112,14 @@ class TestJEVGates:
 
     def test_position_action_disabled(self, mock_jev_decisions, base_cfg):
         """jev_action_enabled = False → returns None."""
-        original_cfg = jev.cfg
+        saved = dict(jev._jev_flags)
         try:
-            jev.cfg = {**base_cfg, "jev_action_enabled": False}
+            jev.configure({**base_cfg, "jev_action_enabled": False})
             action, conf = jev.get_position_action(mock_jev_decisions)
             assert action is None
             assert conf == 0.0
         finally:
-            jev.cfg = original_cfg
+            jev.configure(saved)
 
     # ─── Test get_regime_scaling ─────────────────────────────────────────────
 
@@ -169,13 +169,13 @@ class TestJEVGates:
 
     def test_regime_scaling_disabled(self, mock_jev_decisions, base_cfg):
         """jev_regime_enabled = False → no scaling."""
-        original_cfg = jev.cfg
+        saved = dict(jev._jev_flags)
         try:
-            jev.cfg = {**base_cfg, "jev_regime_enabled": False}
+            jev.configure({**base_cfg, "jev_regime_enabled": False})
             scaling = jev.get_regime_scaling(mock_jev_decisions)
             assert scaling == {"risk_mult": 1.0, "pos_delta": 0, "sl_mult": 1.0}
         finally:
-            jev.cfg = original_cfg
+            jev.configure(saved)
 
     # ─── Test get_portfolio_stress_scaling ──────────────────────────────────
 

@@ -1,0 +1,252 @@
+:root{
+  --bg:#0d1117;--card:#161b22;--card2:#1c2128;--border:#30363d;
+  --text:#e6edf3;--muted:#8b949e;
+  --green:#3fb950;--red:#f85149;--yellow:#d29922;
+  --blue:#58a6ff;--orange:#f0883e;--purple:#bc8cff;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+     background:var(--bg);color:var(--text);font-size:13px;line-height:1.5}
+
+/* ── Header ── */
+.hdr{background:var(--card);border-bottom:1px solid var(--border);
+     padding:10px 20px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;position:sticky;top:0;z-index:100}
+.logo{font-size:15px;font-weight:700;letter-spacing:2px;color:var(--blue)}
+.logo b{color:var(--orange)}
+.hdr-right{margin-left:auto;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+#clock{font-family:monospace;color:var(--muted);font-size:12px}
+
+/* ── Badges ── */
+.badge{padding:2px 10px;border-radius:20px;font-size:10px;font-weight:700;
+       letter-spacing:.6px;white-space:nowrap}
+.b-open  {background:#0d2318;color:var(--green);border:1px solid #1a4a2a}
+.b-closed{background:#1e1a0a;color:var(--yellow);border:1px solid #3a2f10}
+.b-run   {background:#0d1e3a;color:var(--blue);border:1px solid #1a3a6a;animation:pulse 2s infinite}
+.b-pause {background:#2a1800;color:var(--orange);border:1px solid #5a3500}
+.b-idle  {background:var(--card2);color:var(--muted);border:1px solid var(--border)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.55}}
+
+/* ── Buttons ── */
+.btn{padding:5px 14px;border-radius:6px;border:1px solid;cursor:pointer;
+     font-size:11px;font-weight:700;letter-spacing:.4px;transition:filter .15s}
+.btn:hover{filter:brightness(1.2)}
+.btn-green{background:#0d2318;color:var(--green);border-color:#1a4a2a}
+.btn-red  {background:#2a0d0d;color:var(--red);border-color:#5a1a1a}
+.btn-blue {background:#0d1e3a;color:var(--blue);border-color:#1a3a6a}
+.btn-muted{background:var(--card2);color:var(--muted);border-color:var(--border)}
+.btn-sm{padding:3px 9px;font-size:10px}
+
+/* ── Layout ── */
+.main{padding:14px 18px;max-width:1700px;margin:0 auto}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px}
+.g5{display:grid;grid-template-columns:repeat(6,1fr);gap:8px}
+
+/* ── Cards ── */
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:12px}
+.c-title{font-size:10px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);margin-bottom:4px}
+.c-val{font-size:20px;font-weight:700;font-family:monospace}
+.c-sub{font-size:11px;margin-top:1px}
+
+/* ── Market section header ── */
+.mkt-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+.mkt-name{font-size:13px;font-weight:700}
+
+/* ── Section divider ── */
+.sec{display:flex;align-items:center;gap:8px;margin:14px 0 8px;
+     padding-bottom:5px;border-bottom:1px solid var(--border)}
+.sec-title{font-size:12px;font-weight:600;letter-spacing:.4px}
+.sec-badge{font-size:10px;padding:1px 7px;border-radius:10px;
+           background:var(--card2);color:var(--muted);border:1px solid var(--border)}
+
+/* ── Tabs ── */
+.tabs{display:flex;border-bottom:1px solid var(--border);margin-bottom:14px}
+.tab{padding:7px 16px;cursor:pointer;font-size:12px;font-weight:500;
+     border-bottom:2px solid transparent;color:var(--muted);transition:all .15s}
+.tab:hover{color:var(--text)}
+.tab.on{color:var(--blue);border-bottom-color:var(--blue)}
+.pane{display:none}.pane.on{display:block}
+
+/* ── Tables ── */
+.tbl-wrap{overflow-x:auto;border-radius:6px;border:1px solid var(--border)}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{padding:6px 10px;text-align:left;color:var(--muted);font-weight:500;
+   font-size:10px;text-transform:uppercase;letter-spacing:.5px;
+   border-bottom:1px solid var(--border);background:var(--card2);white-space:nowrap}
+td{padding:6px 10px;border-bottom:1px solid #21262d;white-space:nowrap}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:#1c2330}
+
+/* ── Badges inside table ── */
+.act-buy {display:inline-block;padding:1px 8px;border-radius:4px;font-size:10px;font-weight:700;
+          background:#0d2318;color:var(--green);border:1px solid #1a4a2a}
+.act-sell{display:inline-block;padding:1px 8px;border-radius:4px;font-size:10px;font-weight:700;
+          background:#2a0d0d;color:var(--red);border:1px solid #5a1a1a}
+.act-hold{display:inline-block;padding:1px 8px;border-radius:4px;font-size:10px;font-weight:700;
+          background:var(--card2);color:var(--muted);border:1px solid var(--border)}
+
+/* ── Confidence bar ── */
+.cbar{display:inline-flex;align-items:center;gap:5px}
+.cbar-bg{width:48px;height:4px;border-radius:2px;background:var(--card2);overflow:hidden}
+.cbar-fg{height:100%;border-radius:2px}
+
+/* ── Trade log ── */
+.log-box{background:var(--card);border:1px solid var(--border);border-radius:6px;
+         max-height:200px;overflow-y:auto}
+.log-row{padding:5px 10px;border-bottom:1px solid #21262d;
+         font-family:monospace;font-size:11px;display:flex;gap:10px}
+.log-row:last-child{border-bottom:none}
+.lt{color:var(--muted);min-width:62px}
+.lb{color:var(--green)}.ls{color:var(--blue)}.ll{color:var(--red)}
+
+/* ── Agent system log ── */
+.alog-box{background:#0a0e14;border:1px solid var(--border);border-radius:6px;
+          max-height:400px;overflow-y:auto}
+.alog-row{padding:4px 10px;border-bottom:1px solid #161b22;
+          font-family:monospace;font-size:11px;display:flex;gap:8px;align-items:baseline}
+.alog-row:last-child{border-bottom:none}
+.al-ts{color:#444c56;min-width:120px;font-size:10px}
+.al-lvl{min-width:52px;font-size:9px;font-weight:700;letter-spacing:.5px;text-transform:uppercase}
+.al-info{color:var(--blue)}.al-debug{color:#444c56}.al-warning{color:var(--yellow)}.al-error{color:var(--red)}
+
+/* ── Decision / thinking log ── */
+.dlog-box{background:#0a0e14;border:1px solid var(--border);border-radius:6px;
+          max-height:420px;overflow-y:auto}
+.drow{padding:3px 10px;border-bottom:1px solid #161b22;
+      font-family:monospace;font-size:11px;display:flex;gap:8px;align-items:baseline;flex-wrap:nowrap}
+.drow:last-child{border-bottom:none}
+.drow:hover{background:#12161f}
+.dcat{min-width:48px;font-size:9px;font-weight:700;letter-spacing:.4px;
+      text-transform:uppercase;padding:1px 5px;border-radius:3px;white-space:nowrap}
+.dcat-CYCLE {background:#1e1e1e;color:#666}
+.dcat-SCAN  {background:#0d2040;color:#4a9eff}
+.dcat-FILTER{background:#2e1800;color:#f0900a}
+.dcat-ENTRY {background:#0a2016;color:#27c46b}
+.dcat-EXIT  {background:#2a0a0a;color:#e05454}
+.dcat-RISK  {background:#3a0000;color:#ff4444;font-weight:900}
+.dcat-INDEX {background:#1a0a30;color:#b47fff}
+.dcat-RL    {background:#1a0040;color:#c060ff;font-weight:900}
+.dcat-JEV   {background:#0d3a2a;color:#3fb950;font-weight:700}
+.dsym{color:#bbb;min-width:88px;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dmsg{color:#ddd;flex:1;white-space:pre-wrap;word-break:break-word}
+/* Position side badges */
+.side-badge{font-size:9px;font-weight:700;padding:1px 5px;border-radius:3px;vertical-align:middle;letter-spacing:.5px}
+.side-long {background:#0a2016;color:#27c46b;border:1px solid #1a4a2a}
+.side-short{background:#2a0a0a;color:#e05454;border:1px solid #4a1a1a}
+
+/* ── Settings form ── */
+.fg{display:flex;flex-direction:column;gap:4px}
+label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
+input[type=number]{background:var(--card2);border:1px solid var(--border);
+  border-radius:5px;color:var(--text);padding:5px 9px;font-size:13px;
+  font-family:monospace;width:100%;transition:border-color .2s}
+input:focus{outline:none;border-color:var(--blue)}
+.fgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+
+/* ── Footer / refresh bar ── */
+.foot{display:flex;align-items:center;gap:10px;padding:8px 0;
+      font-size:10px;color:var(--muted);border-top:1px solid var(--border);margin-top:14px}
+#prog{flex:1;height:3px;background:var(--card2);border-radius:2px;overflow:hidden}
+#prog-f{height:100%;background:var(--blue);width:0;transition:width linear}
+
+/* ── Toast ── */
+.toasts{position:fixed;bottom:18px;right:18px;display:flex;flex-direction:column;gap:7px;z-index:9999}
+.toast{background:var(--card2);border:1px solid var(--border);border-radius:7px;
+       padding:9px 14px;font-size:12px;animation:tin .25s ease;
+       display:flex;align-items:center;gap:8px;max-width:300px}
+.tok{border-left:3px solid var(--green)}.terr{border-left:3px solid var(--red)}
+@keyframes tin{from{transform:translateX(110%);opacity:0}to{transform:translateX(0);opacity:1}}
+
+.green{color:var(--green)}.red{color:var(--red)}.yellow{color:var(--yellow)}
+.blue{color:var(--blue)}.muted{color:var(--muted)}.mono{font-family:monospace}
+
+/* ── EOD ── */
+.b-eod-warn{background:#1a1000;color:var(--orange);border:1px solid #5a3500}
+.b-eod-exit{background:#2a0d0d;color:var(--red);border:1px solid #5a1a1a}
+.eod-banner{border-radius:6px;padding:8px 14px;margin-bottom:8px;font-size:11px;
+            display:flex;align-items:center;gap:10px;border:1px solid}
+.eod-warn{background:#1a1000;border-color:#5a3500}
+.eod-exit{background:#200a0a;border-color:#6a1a1a}
+
+/* ── Log filter ── */
+.log-filter-btn.on{background:#0d1e3a;color:var(--blue);border-color:#1a3a6a}
+
+/* ── Mobile responsive ── */
+@media (max-width:640px){
+  /* Main padding */
+  .main{padding:10px 10px}
+
+  /* Header: hide clock to save room, tighten gaps */
+  .hdr{padding:8px 10px;gap:6px}
+  #clock{display:none}
+  .hdr-right{gap:5px}
+  .logo{font-size:13px}
+
+  /* Market summary: stack India / US vertically */
+  .g2{grid-template-columns:1fr}
+
+  /* Stats row: 3 columns instead of 6 */
+  .g5{grid-template-columns:repeat(3,1fr)}
+
+  /* Smaller stat values so they fit in 3-col */
+  .c-val{font-size:16px}
+
+  /* Tabs: horizontal scroll, no wrapping */
+  .tabs{overflow-x:auto;flex-wrap:nowrap;-webkit-overflow-scrolling:touch;
+        scrollbar-width:none}
+  .tabs::-webkit-scrollbar{display:none}
+  .tab{white-space:nowrap;flex-shrink:0;padding:7px 12px}
+
+  /* Settings: single-column forms */
+  .fgrid{grid-template-columns:1fr}
+  .es-grid{grid-template-columns:1fr}
+
+  /* Modal: full-width on small screens */
+  .modal-box{min-width:unset;width:calc(100vw - 24px);padding:16px}
+
+  /* Agent log timestamp: slightly narrower */
+  .al-ts{min-width:90px}
+
+  /* Toasts: keep inside viewport */
+  .toasts{right:10px;bottom:10px;max-width:calc(100vw - 20px)}
+  .toast{max-width:100%}
+}
+
+/* Extra-narrow phones (< 400px): 2-col stats */
+@media (max-width:400px){
+  .g5{grid-template-columns:repeat(2,1fr)}
+  .btn{padding:4px 8px;font-size:10px}
+}
+
+/* ── Position / state edit modal ── */
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);
+               z-index:600;align-items:center;justify-content:center}
+.modal-overlay.open{display:flex}
+.modal-box{background:var(--card);border:1px solid var(--border);border-radius:10px;
+           padding:24px;min-width:340px;max-width:600px;width:100%;max-height:90vh;overflow-y:auto}
+.modal-title{font-size:13px;font-weight:700;margin-bottom:18px;color:var(--text)}
+.modal-title span{color:var(--blue)}
+.es-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+.es-col-title{font-size:11px;font-weight:700;color:var(--muted);margin-bottom:10px;
+              text-transform:uppercase;letter-spacing:.5px;padding-bottom:5px;
+              border-bottom:1px solid var(--border)}
+
+/* ── Session cards ── */
+.sess-card{background:var(--card);border:1px solid var(--border);border-radius:8px;
+           margin-bottom:8px;overflow:hidden}
+.sess-hdr{display:flex;align-items:center;gap:12px;padding:10px 14px;
+          cursor:pointer;user-select:none;transition:background .1s}
+.sess-hdr:hover{background:var(--card2)}
+.sess-date{font-size:13px;font-weight:700;font-family:monospace;min-width:90px;color:var(--text)}
+.sess-mkt{font-size:10px;font-weight:700;padding:2px 8px;border-radius:12px;
+          min-width:48px;text-align:center;white-space:nowrap}
+.sess-mkt-india{background:#0d1e3a;color:var(--blue);border:1px solid #1a3a6a}
+.sess-mkt-us{background:#1a0d2a;color:var(--purple);border:1px solid #3a1a5a}
+.sess-body{display:none;border-top:1px solid var(--border);background:#0a0e14}
+.sess-body.open{display:block}
+.sess-metrics{display:flex;gap:24px;padding:10px 14px;flex-wrap:wrap;
+              border-bottom:1px solid var(--border)}
+.sess-m{display:flex;flex-direction:column;gap:2px}
+.sess-m-l{font-size:9px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted)}
+.sess-m-v{font-size:13px;font-weight:600;font-family:monospace}
+.sess-filter.on{background:#0d1e3a;color:var(--blue);border-color:#1a3a6a}
+.sess-label{font-size:10px;color:var(--muted);margin-top:2px}

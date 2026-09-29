@@ -95,6 +95,12 @@ def fetch_daily_sentiment(
         logger.info("Finnhub sentiment disabled or API key missing for %s; using neutral sentiment.", ticker)
         return pd.Series(dtype="float64", name="sentiment")
 
+    # Finnhub free plan is US-only — NSE/BSE (.NS/.BO) always 403.
+    # Skip the request entirely to avoid log spam.
+    if ticker.endswith((".NS", ".BO")):
+        logger.debug("Finnhub skip for %s (NSE/BSE needs paid plan); using neutral sentiment.", ticker)
+        return pd.Series(dtype="float64", name="sentiment")
+
     articles: list[dict] = []
     chunk_start = start_date.normalize()
 
@@ -154,7 +160,12 @@ def add_sentiment_feature(
             refresh_cache=refresh_cache,
         )
     except requests.RequestException as exc:
-        logger.warning("Finnhub sentiment request failed for %s: %s", ticker, exc)
+        # Never log the URL — it contains ?token=SECRET. Log status only.
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if status in (401, 403):
+            logger.debug("Finnhub %s for %s — check key/plan; using neutral sentiment.", status, ticker)
+        else:
+            logger.warning("Finnhub sentiment request failed for %s (status=%s)", ticker, status)
         daily_sentiment = pd.Series(dtype="float64", name="sentiment")
 
     aligned = (

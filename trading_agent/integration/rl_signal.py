@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 import time
@@ -9,6 +10,19 @@ import time
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+_warned: set[str] = set()
+
+
+def _warn_once(key: str, message: str) -> None:
+    """Log a degraded-mode condition once per key.
+
+    These fire on every symbol, so an unconditional warning would drown the log.
+    But silence is what let a dormant feature look healthy.
+    """
+    if key not in _warned:
+        _warned.add(key)
+        logger.warning(message)
 
 # ── Singletons loaded once on first call ─────────────────────────────────────
 _model = None
@@ -18,6 +32,19 @@ _feature_columns: list[str] = []
 # ── Per-ticker observation cache (TTL = 1 hour, daily bars don't change faster) ──
 _obs_cache: dict[str, tuple[float, np.ndarray, float, float]] = {}  # (ts, obs, raw_atr, trend_5d_pct)
 _OBS_TTL = 3600
+
+
+def _registry_lock_for_inference():
+    """The registry's read lock, or a no-op when no model is registered.
+
+    Re-entrant, so nesting it with the update lock cannot deadlock.
+    """
+    from trading_agent.integration.model_registry import get_registry
+
+    reg = get_registry()
+    if reg is None:
+        return contextlib.nullcontext()
+    return reg.read_lock()
 
 
 def _ensure_loaded() -> bool:
@@ -31,6 +58,7 @@ def _ensure_loaded() -> bool:
 
         from trading_agent.config import settings
         from trading_agent.data.data_fetcher import load_saved_feature_columns
+        from trading_agent.integration.model_registry import bind
 
         if not settings.best_model_path.exists():
             logger.warning("RL model not found at %s", settings.best_model_path)
@@ -38,6 +66,7 @@ def _ensure_loaded() -> bool:
 
         _model = PPO.load(str(settings.best_model_path))
         _feature_columns = load_saved_feature_columns(settings)
+        bind(_model)
 
         if settings.scaler_path.exists():
             _scaler = joblib.load(str(settings.scaler_path))
@@ -90,8 +119,10 @@ def _build_observation(ticker: str) -> tuple[np.ndarray, float, float] | None:
             jev_decisions = _signals.get("jev_decisions", {}).get("india") or _signals.get("jev_decisions", {}).get("us")
             if jev_decisions and "trend_strength" in jev_decisions:
                 jev_trend_strength = jev_decisions["trend_strength"]["score"]
-        except Exception:
-            pass
+        except Exception as e:
+            # Not fatal, but it means the JEV trend column silently drops out of
+            # the feature frame, so it must be visible.
+            _warn_once("jev_trend_lookup", f"JEV trend_strength unavailable: {e}")
         
         frame = add_technical_indicators(raw, jev_trend_strength=jev_trend_strength)
 
@@ -184,16 +215,27 @@ def get_rl_signal(symbol: str, live_price: float) -> dict | None:
             jev_trend_strength = jev_decisions.get("trend_strength", {}).get("score", 0.0)
             jev_action = jev_decisions.get("position_action", {}).get("choice", "hold")
             jev_action_conf = jev_decisions.get("position_action", {}).get("confidence", 0.0)
-    except Exception:
-        pass
+        else:
+            _warn_once(
+                "jev_decisions_absent",
+                "No JEV decisions in the dashboard signal cache — the RL path is "
+                "running with regime='bullish', trend=0 and action='hold'. Publish "
+                "_signals['jev_decisions'] from the agent cycle to enable them.",
+            )
+    except Exception as e:
+        _warn_once("jev_decision_lookup", f"JEV decisions unavailable to RL path: {e}")
 
     try:
         import torch
 
-        obs_tensor, _ = _model.policy.obs_to_tensor(obs.reshape(1, -1))
-        with torch.no_grad():
-            dist = _model.policy.get_distribution(obs_tensor)
-            probs = dist.distribution.probs.detach().cpu().numpy()[0]
+        # The online learner swaps weights into this same policy object. Holding
+        # the registry lock for the whole forward pass is what stops inference
+        # reading a half-updated weight tensor.
+        with _registry_lock_for_inference():
+            obs_tensor, _ = _model.policy.obs_to_tensor(obs.reshape(1, -1))
+            with torch.no_grad():
+                dist = _model.policy.get_distribution(obs_tensor)
+                probs = dist.distribution.probs.detach().cpu().numpy()[0]
 
         action = int(np.argmax(probs))
         top_prob = float(probs[action])

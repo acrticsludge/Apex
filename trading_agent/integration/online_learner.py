@@ -28,9 +28,54 @@ _buffer:      deque[dict] = deque(maxlen=_BUFFER_MAXLEN)
 _pending:     dict[str, dict] = {}          # symbol → trade-open context
 _retrain_log: deque[dict]     = deque(maxlen=500)
 _update_lock  = threading.Lock()
+# Guards the plain-int counters below. They are read by the Flask request thread
+# (/api/retrain/log) and written by the agent thread, so the increments need to
+# be atomic read-modify-writes.
+_state_lock    = threading.Lock()
 _new_count    = 0      # experiences accumulated since last update trigger
 _is_training  = False
 _total_updates = 0     # cumulative completed updates
+
+
+def _make_training_model(model, registry):
+    """A private, independently trainable clone of the live model.
+
+    Uses the registry's deep copy so the update thread's gradients never touch
+    the object the agent thread infers from. Falls back to the live model only
+    when no registry is bound, which keeps the pre-registry path working.
+    """
+    if registry is None:
+        return model
+    return _clone_model(model)
+
+
+def _clone_model(model):
+    import copy as _copy
+
+    clone = _copy.deepcopy(model)
+    # The optimizer holds references to the original parameters, so it must be
+    # rebuilt against the clone's own parameters or .step() would still write to
+    # the live model's tensors.
+    try:
+        policy = clone.policy
+        policy.optimizer = type(policy.optimizer)(
+            policy.parameters(), lr=_FINE_TUNE_LR
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"Could not build a trainable clone: {exc}") from exc
+    return clone
+
+
+def stats() -> dict:
+    """Consistent snapshot of the counters for the dashboard."""
+    with _state_lock:
+        return {
+            "is_training": _is_training,
+            "new_count": _new_count,
+            "buffer_size": len(_buffer),
+            "total_updates": _total_updates,
+            "threshold": _UPDATE_THRESHOLD,
+        }
 
 
 def _rt_log(event: str, **kwargs) -> None:
@@ -90,12 +135,15 @@ def record_exit(symbol: str, exit_price: float, pnl: float,
     reward = float(max(-3.0, min(3.0, raw * stress_weight)))
 
     _buffer.append({"obs": obs, "action": action, "reward": reward, "regime": regime})  # Task 32: store regime
-    _new_count += 1
+    with _state_lock:
+        _new_count += 1
+        due = _new_count >= _UPDATE_THRESHOLD and not _is_training
+        if due:
+            _new_count = 0
     logger.debug("RL exit: %s  reward=%.3f  stress_weight=%.2f  buf=%d  new_count=%d",
                  symbol, reward, stress_weight, len(_buffer), _new_count)
 
-    if _new_count >= _UPDATE_THRESHOLD and not _is_training:
-        _new_count = 0
+    if due:
         threading.Thread(target=_run_update, daemon=True, name="rl-online-update").start()
 
 
@@ -106,14 +154,19 @@ def record_exit(symbol: str, exit_price: float, pnl: float,
 def _run_update() -> None:
     global _is_training, _total_updates
 
-    if _is_training:
-        return
-    _is_training = True
+    # Claim the update slot under the lock. This used to be a check-then-set
+    # race, so several update threads could run at once on one batch.
+    with _state_lock:
+        if _is_training:
+            return
+        _is_training = True
 
     try:
+        from trading_agent.integration.model_registry import get_registry
         import trading_agent.integration.rl_signal as _rl  # type: ignore
 
         model = _rl._model
+        registry = get_registry()
         if model is None:
             _rt_log("skipped", msg="Model not loaded — skipping online update")
             return
@@ -126,15 +179,21 @@ def _run_update() -> None:
         # Task 32: Stratify by regime for updates
         regimes = ["bullish", "bearish", "choppy", "crisis"]
         regime_batches = {r: [e for e in batch if e.get("regime", "bullish") == r] for r in regimes}
-        
+
         n = len(batch)
         _rt_log("started", trades=n,
                 msg=f"Triggered by {n} closed trades — computing gradients…")
-        logger.info("Online RL update: batch_size=%d, regime_dist=%s", n, 
+        logger.info("Online RL update: batch_size=%d, regime_dist=%s", n,
                     {r: len(v) for r, v in regime_batches.items()})
 
         import torch as th
         import torch.nn.functional as F
+
+        # Train a private copy. The live policy is only touched by publish(),
+        # which copies the finished weights in under the registry's exclusive
+        # lock — so a forward pass in another thread can never read a tensor
+        # that optimizer.step() is midway through writing.
+        work = _make_training_model(model, registry)
 
         with _update_lock:
             # Process each regime separately for stratified updates
@@ -142,7 +201,7 @@ def _run_update() -> None:
                 regime_batch = regime_batches[regime]
                 if len(regime_batch) < 2:  # Need at least 2 for gradient
                     continue
-                    
+
                 obs_t = th.tensor(
                     np.stack([e["obs"] for e in regime_batch]).astype(np.float32)
                 )
@@ -151,7 +210,7 @@ def _run_update() -> None:
 
                 # Baseline loss before touching weights
                 with th.no_grad():
-                    vals_old, lp_old, _ = model.policy.evaluate_actions(obs_t, act_t)
+                    vals_old, lp_old, _ = work.policy.evaluate_actions(obs_t, act_t)
                     vals_old = vals_old.squeeze(-1)
                     adv_pre  = ret_t - vals_old
                     loss_before = float((-(lp_old * adv_pre)).mean().abs())
@@ -159,7 +218,7 @@ def _run_update() -> None:
                 loss_after = loss_before
 
                 for _epoch in range(_N_EPOCHS):
-                    vals, log_probs, entropy = model.policy.evaluate_actions(obs_t, act_t)
+                    vals, log_probs, entropy = work.policy.evaluate_actions(obs_t, act_t)
                     vals = vals.squeeze(-1)
 
                     adv = ret_t - vals.detach()
@@ -168,7 +227,7 @@ def _run_update() -> None:
                     ratio   = th.exp(log_probs - lp_old.detach())
                     pg_loss = -th.min(
                         ratio * adv,
-                        th.clamp(ratio, 1 - _CLIP_EPS, 1 + _CL_EPS) * adv,
+                        th.clamp(ratio, 1 - _CLIP_EPS, 1 + _CLIP_EPS) * adv,
                     ).mean()
                     v_loss  = F.mse_loss(vals, ret_t)
                     e_loss  = -entropy.mean()
@@ -177,27 +236,30 @@ def _run_update() -> None:
                     if th.isnan(loss) or th.isinf(loss):
                         raise ValueError(f"Non-finite loss ({float(loss):.4f}) at epoch {_epoch}")
 
-                    for pg in model.policy.optimizer.param_groups:
+                    for pg in work.policy.optimizer.param_groups:
                         pg["lr"] = _FINE_TUNE_LR
 
-                    model.policy.optimizer.zero_grad()
+                    work.policy.optimizer.zero_grad()
                     loss.backward()
-                    th.nn.utils.clip_grad_norm_(model.policy.parameters(), 0.5)
-                    model.policy.optimizer.step()
+                    th.nn.utils.clip_grad_norm_(work.policy.parameters(), 0.5)
+                    work.policy.optimizer.step()
                     loss_after = float(loss.item())
 
             improvement = round(
                 (loss_before - loss_after) / (abs(loss_before) + 1e-9) * 100, 1
             )
 
-            # Backup previous weights then save updated model
+            # Backup previous weights, then persist and publish.
             from trading_agent.config import settings  # type: ignore
             backup = settings.best_model_path.parent / "best_model_pre_online.zip"
             if settings.best_model_path.exists():
                 shutil.copy2(str(settings.best_model_path), str(backup))
-            model.save(str(settings.best_model_path))
+            work.save(str(settings.best_model_path))
+            if registry is not None:
+                registry.publish(work.policy)
 
-        _total_updates += 1
+        with _state_lock:
+            _total_updates += 1
         _rt_log(
             "completed",
             trades=n,
@@ -218,4 +280,5 @@ def _run_update() -> None:
         logger.error("Online RL update failed: %s", exc, exc_info=True)
 
     finally:
-        _is_training = False
+        with _state_lock:
+            _is_training = False

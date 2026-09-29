@@ -21,9 +21,57 @@ from typing import Any, Literal, TypedDict
 
 import requests
 
-from apex_dashboard import cfg
-
 logger = logging.getLogger("apex.jev")
+
+# ─── Feature flags ────────────────────────────────────────────────────────────
+# Owned by the dashboard's `cfg` and pushed in via configure(). This module must
+# not import apex_dashboard: apex_dashboard imports this module, and a back-edge
+# raised ImportError under the production import order (gunicorn imports
+# apex_dashboard first), which the dashboard's guarded except then swallowed —
+# silently disabling every JEV gate in production.
+
+_jev_flags: dict[str, bool] = {}
+
+# Env is the cold-start default; configure() overrides it at runtime.
+_FLAG_ENV = {
+    "jev_enabled":            "JEV_ENABLED",
+    "jev_risk_enabled":       "JEV_RISK_ENABLED",
+    "jev_action_enabled":     "JEV_ACTION_ENABLED",
+    "jev_trend_enabled":      "JEV_TREND_ENABLED",
+    "jev_news_enabled":       "JEV_NEWS_ENABLED",
+    "jev_regime_enabled":     "JEV_REGIME_ENABLED",
+}
+
+
+def _env_bool(raw: str | None, default: bool = True) -> bool:
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+_jev_flags = {name: _env_bool(os.getenv(env)) for name, env in _FLAG_ENV.items()}
+
+
+def configure(flags: dict) -> None:
+    """Push the dashboard's feature flags into this module.
+
+    Called on import and whenever /api/config changes a jev_* key. Replaces the
+    whole flag set so a removed key cannot stay enabled.
+    """
+    global _jev_flags
+    for name, env in _FLAG_ENV.items():
+        if name in flags:
+            _jev_flags[name] = bool(flags[name])
+        else:
+            _jev_flags[name] = _env_bool(os.getenv(env))
+
+
+def flag(name: str) -> bool:
+    return _jev_flags.get(name, True)
+
+
+def jev_enabled() -> bool:
+    return flag("jev_enabled")
 
 # ─── Type Definitions ──────────────────────────────────────────────────────────
 
@@ -170,8 +218,10 @@ def build_market_state(
             "macd_hist": indicators.get("macd_hist", 0.0),
             "bb_pos": indicators.get("bb_pos", 0.5),  # position within BB [0,1]
             "ema_9_21": indicators.get("ema_9_21", "neutral"),
+            "ema_gap_pct": indicators.get("ema_gap_pct", 0.0),  # (ema9-ema21)/ema21*100
             "adx": indicators.get("adx", 20.0),
             "atr": indicators.get("atr", 0.0),
+            "atr_pct": indicators.get("atr_pct", 0.0),  # atr/price, cross-symbol norm
             "vol_ratio": indicators.get("vol_ratio", 1.0),
         },
         "news": news[:5],  # Top 5 most recent
@@ -350,7 +400,7 @@ def get_jev_decisions(
             return cached_decisions
     
     # Cache miss or expired — full call
-    if not cfg.get("jev_enabled", True):
+    if not flag("jev_enabled"):
         return None
     
     # Build combined state for all questions
@@ -381,7 +431,7 @@ def get_system_decisions(market_key: str, portfolio: dict, market: dict) -> JEVD
         if now - cached_ts < CACHE_TTL_SECONDS:
             return cached_decisions
     
-    if not cfg.get("jev_enabled", True):
+    if not flag("jev_enabled"):
         return None
     
     state = build_system_state(market_key, portfolio, market)
@@ -405,7 +455,7 @@ def get_system_decisions(market_key: str, portfolio: dict, market: dict) -> JEVD
 
 def should_halt(jev: JEVDecisions) -> bool:
     """Check if new entries should be halted."""
-    if not cfg.get("jev_risk_enabled", True):
+    if not flag("jev_risk_enabled"):
         return False
     return jev["halt_new_buys"]["noul"] >= HALT_NOUl_THRESHOLD
 
@@ -415,7 +465,7 @@ def get_position_action(jev: JEVDecisions) -> tuple[str | None, float]:
     Get position action if confidence exceeds threshold.
     Returns (action, confidence) or (None, 0.0).
     """
-    if not cfg.get("jev_action_enabled", True):
+    if not flag("jev_action_enabled"):
         return None, 0.0
     action = jev["position_action"]["choice"]
     conf = jev["position_action"]["confidence"]
@@ -429,7 +479,7 @@ def get_regime_scaling(jev: JEVDecisions) -> dict[str, float]:
     Get risk/position scaling factors based on regime.
     Returns dict with risk_mult, pos_delta, sl_mult.
     """
-    if not cfg.get("jev_regime_enabled", True):
+    if not flag("jev_regime_enabled"):
         return {"risk_mult": 1.0, "pos_delta": 0, "sl_mult": 1.0}
     
     regime = jev["regime"]["choice"]
@@ -449,7 +499,7 @@ def get_regime_scaling(jev: JEVDecisions) -> dict[str, float]:
 
 def get_portfolio_stress_scaling(jev: JEVDecisions) -> float:
     """Get risk reduction factor from portfolio stress (0.5 to 1.0)."""
-    if not cfg.get("jev_risk_enabled", True):
+    if not flag("jev_risk_enabled"):
         return 1.0
     stress = jev["portfolio_stress"]["score"]
     conf = jev["portfolio_stress"]["confidence"]
@@ -468,7 +518,7 @@ def get_portfolio_stress_scaling(jev: JEVDecisions) -> float:
 
 def get_effective_adx_min(base_adx_min: float, jev: JEVDecisions) -> float:
     """Calculate effective ADX minimum with JEV trend_strength adjustment."""
-    if not cfg.get("jev_trend_enabled", True):
+    if not flag("jev_trend_enabled"):
         return base_adx_min
     trend = jev["trend_strength"]
     if trend["confidence"] < TREND_CONF_THRESHOLD:
@@ -480,7 +530,7 @@ def get_effective_adx_min(base_adx_min: float, jev: JEVDecisions) -> float:
 
 def get_trailing_dist_mult(base_dist_mult: float, jev: JEVDecisions) -> float:
     """Calculate trailing stop distance multiplier with JEV trend adjustment."""
-    if not cfg.get("jev_trend_enabled", True):
+    if not flag("jev_trend_enabled"):
         return base_dist_mult
     trend = jev["trend_strength"]
     if trend["confidence"] < TREND_CONF_THRESHOLD:
@@ -491,7 +541,7 @@ def get_trailing_dist_mult(base_dist_mult: float, jev: JEVDecisions) -> float:
 
 def get_open_window_minutes(jev: JEVDecisions, default: int = 15) -> int:
     """Get market open observation window minutes by regime."""
-    if not cfg.get("jev_regime_enabled", True):
+    if not flag("jev_regime_enabled"):
         return default
     regime = jev["regime"]["choice"]
     conf = jev["regime"]["confidence"]
@@ -508,7 +558,7 @@ def get_open_window_minutes(jev: JEVDecisions, default: int = 15) -> int:
 
 def get_news_weight(jev: JEVDecisions) -> float:
     """Get news scoring weight based on JEV confidence."""
-    if not cfg.get("jev_news_enabled", True):
+    if not flag("jev_news_enabled"):
         return 1.0
     news = jev["news_bullishness"]
     if news["confidence"] < NEWS_CONF_THRESHOLD:
@@ -590,6 +640,50 @@ def extract_jev_features(jev: JEVDecisions) -> list[float]:
     ]
 
 
+# ─── Market context fetchers (v2) ────────────────────────────────────────────
+
+_VIX_SYMBOLS = {"us": "^VIX", "india": "^INDIAVIX"}
+_VIX_CACHE: dict[str, tuple[float, float]] = {}  # market_key -> (ts, value)
+_VIX_TTL_SECONDS = 300
+
+
+def fetch_vix(market_key: str) -> float:
+    """Fetch current VIX for a market, cached 5 min. Never raises — 20.0 fallback."""
+    now = time.time()
+    cached = _VIX_CACHE.get(market_key)
+    if cached and (now - cached[0]) < _VIX_TTL_SECONDS:
+        return cached[1]
+    symbol = _VIX_SYMBOLS.get(market_key)
+    if not symbol:
+        return 20.0
+    try:
+        import pandas as pd
+        import yfinance as yf
+        df = yf.download(symbol, period="1d", interval="1m",
+                         progress=False, auto_adjust=True)
+        if df is not None and not df.empty:
+            close = df["Close"]
+            if isinstance(close, pd.DataFrame):
+                close = close.iloc[:, 0]
+            val = float(close.dropna().iloc[-1])
+            if val > 0:
+                _VIX_CACHE[market_key] = (now, val)
+                return val
+    except Exception as e:
+        logger.debug("VIX fetch failed for %s: %s", market_key, type(e).__name__)
+    return _VIX_CACHE.get(market_key, (0, 20.0))[1]
+
+
+def calc_breadth(scores: list[float]) -> float:
+    """Watchlist breadth on [0,1]: 0.5 = neutral. Pure function of per-symbol scores."""
+    if not scores:
+        return 0.5
+    up = sum(1 for s in scores if s > 0)
+    down = sum(1 for s in scores if s < 0)
+    n = len(scores)
+    return round(0.5 + 0.5 * (up - down) / n, 4)
+
+
 # ─── Utility ───────────────────────────────────────────────────────────────────
 
 def reset_circuit() -> None:
@@ -609,7 +703,7 @@ def clear_cache() -> None:
 def get_jev_status() -> dict[str, Any]:
     """Get JEV integration status for monitoring."""
     return {
-        "enabled": cfg.get("jev_enabled", True),
+        "enabled": flag("jev_enabled"),
         "circuit_open": _circuit_open,
         "failure_count": _failure_count,
         "cache_size": len(_jev_cache),
