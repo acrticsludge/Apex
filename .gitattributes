@@ -1,0 +1,20 @@
+# Normalise line endings in the repository rather than the working tree.
+#
+# Without this, a file is CRLF on a Windows checkout and LF on the Linux CI
+# runner and Docker builder, so every diff carries whole-file noise. The working
+# tree normalises on the next checkout; files already committed keep their
+# existing bytes until something rewrites them.
+* text=auto eol=lf
+
+# Binary assets must never be line-ending translated.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.zip binary
+*.joblib binary
+*.safetensors binary
+
+# Keep the model artifacts out of any diff-aware tooling that mangles them.
+trading_agent/agent/model/* binary

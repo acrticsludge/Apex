@@ -1,4 +1,4 @@
-﻿"""Regression tests for the unvalidated-write and auth defects found in review.
+"""Regression tests for the unvalidated-write and auth defects found in review.
 
 The edit endpoints wrote client-supplied values straight into the live trading
 ledger. A negative qty made execute_sell subtract cash and inflate realised_pnl.

@@ -113,6 +113,23 @@ def test_dockerfile_copies_the_template_and_static_assets():
         assert (ROOT / required).is_dir(), f"{required} is missing from the repo"
 
 
+def test_no_source_file_carries_a_byte_order_mark():
+    """A UTF-8 BOM makes a .py file unparseable by ast.
+
+    Editors on Windows add one silently, and it only shows up in whatever code
+    happens to read the file as source rather than import it. This has broken a
+    commit twice, so it is now a gate rather than a surprise.
+    """
+    offenders = []
+    for path in sorted(ROOT.rglob("*.py")):
+        if any(part in {".venv", "venv", "__pycache__", "graphify-out", ".git"}
+               for part in path.parts):
+            continue
+        if path.read_bytes().startswith(b"\xef\xbb\xbf"):
+            offenders.append(str(path.relative_to(ROOT)))
+    assert not offenders, f"strip the UTF-8 BOM from: {offenders}"
+
+
 def test_pandas_ta_pin_is_preserved():
     """The trained feature columns were built against 0.4.71b0; silently
     upgrading it changes every indicator the model relies on."""
