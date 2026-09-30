@@ -3,8 +3,22 @@
 Apex deploys to Railway from the branch that is merged into the deploy
 environment. The Docker image runs gunicorn against `apex_dashboard:app`.
 
+**If this is your first deploy and you are not familiar with this codebase,
+read [`first-deploy-walkthrough.md`](first-deploy-walkthrough.md) instead.** It
+walks through the same material one click at a time. This runbook is the
+reference; that one is the tutorial.
+
 **Read the fail-closed note before your first deploy.** It will lock you out
 if you skip the secrets step.
+
+Before deploying anything, run:
+
+```powershell
+python preflight.py
+```
+
+It reads your `.env` and tells you whether this deploy is safe. Exit code 0 means
+go, 1 means fix the `!!` lines first.
 
 ---
 
