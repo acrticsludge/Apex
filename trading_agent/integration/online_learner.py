@@ -7,7 +7,6 @@ saves the updated model to disk.  No retraining loop or environment needed.
 from __future__ import annotations
 
 import logging
-import shutil
 import threading
 from collections import deque
 from datetime import datetime, timezone
@@ -249,12 +248,22 @@ def _run_update() -> None:
                 (loss_before - loss_after) / (abs(loss_before) + 1e-9) * 100, 1
             )
 
-            # Backup previous weights, then persist and publish.
+            # Back up the current weights, then persist and publish.
+            #
+            # The save goes through artifact_store rather than straight to
+            # settings.best_model_path. That path is git-tracked so the model
+            # ships in the image, which made it the default write target and
+            # meant every online update dirtied the working tree and was
+            # discarded on redeploy. The store writes to the runtime directory
+            # only, atomically, so a crash mid-save leaves the previous model
+            # intact instead of a half-written zip.
             from trading_agent.config import settings  # type: ignore
-            backup = settings.best_model_path.parent / "best_model_pre_online.zip"
-            if settings.best_model_path.exists():
-                shutil.copy2(str(settings.best_model_path), str(backup))
-            work.save(str(settings.best_model_path))
+            from trading_agent.integration import artifact_store
+
+            artifact_store.backup("best_model.zip", settings.model_dir)
+            artifact_store.write_atomic(
+                work.save, "best_model.zip", settings.model_dir
+            )
             if registry is not None:
                 registry.publish(work.policy)
 

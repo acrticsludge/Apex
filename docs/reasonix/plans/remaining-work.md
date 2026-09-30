@@ -69,13 +69,28 @@ The review's remaining HIGH items, none of which are cosmetic.
       — but it is the difference between "a leaked key exposes the ledger" and
       "a leaked key is scoped". Requires deciding on anon/authenticated policies
       and re-testing persistence.
-- [ ] **Rotate the committed model artifacts.** `best_model.zip` and
-      `scaler.joblib` are binary artifacts in git, written by the online learner
-      at runtime (`online_learner._run_update` saves to
-      `trading_agent/agent/model/`). On Railway that is an ephemeral container
-      filesystem, so the online update is lost on every redeploy. Move the
-      artifact to Supabase storage or a volume, and stop writing to a tracked
-      path.
+- [x] **Stop writing model artifacts to a tracked path.** Done in
+      `trading_agent/integration/artifact_store.py`, wired into the online
+      learner's save and rl_signal's load. An artifact now has an immutable
+      **baseline** (the model in the image, so a fresh deploy has something to
+      load) and a mutable **runtime** copy; reads prefer the runtime and fall
+      back to the baseline, writes only ever touch the runtime, and a newly
+      mounted volume is seeded from the baseline once and never re-seeded.
+      Saves go through a temp file and `os.replace`, so a crash mid-save leaves
+      the previous model rather than a truncated zip — which matters more on a
+      volume, because the volume outlives the process that corrupted it. The
+      `best_model_pre_online` backup now rotates instead of accumulating one
+      copy per update.
+      **Inert until you set `TRADING_AGENT_STORAGE_DIR`** — with it unset the
+      runtime directory *is* the tracked directory, so behaviour is unchanged
+      and the app logs once at boot that updates will not survive a redeploy.
+      Turn it on with a Railway volume at `/data`; see
+      [deployment runbook §1.4](../operations/deployment-runbook.md).
+- [ ] **Rotate the committed model artifacts.** Still worth doing, and now
+      decoupled from persistence: the baseline is what ships in the image, so
+      rotating it out of git means building the model in CI and shipping it as
+      an artifact instead. Separate question from where updates are written, and
+      lower priority than it was.
 - [ ] **Add an IP allowlist or tunnel** for the dashboard. It is a public
       Railway hostname today. Optional given auth is now fail-closed, but it is
       a meaningful second factor.

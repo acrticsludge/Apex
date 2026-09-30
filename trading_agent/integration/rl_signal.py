@@ -58,13 +58,28 @@ def _ensure_loaded() -> bool:
 
         from trading_agent.config import settings
         from trading_agent.data.data_fetcher import load_saved_feature_columns
+        from trading_agent.integration import artifact_store
         from trading_agent.integration.model_registry import bind
 
-        if not settings.best_model_path.exists():
-            logger.warning("RL model not found at %s", settings.best_model_path)
+        # A volume that has never been written to starts from the model in the
+        # image, so seed it before resolving. Never overwrites what is there.
+        artifact_store.seed_runtime(settings.model_dir)
+        artifact_store.warn_if_not_persistent(settings.model_dir)
+
+        # Prefer the runtime model, fall back to the committed baseline. Read
+        # the whole artifact set from one location: a runtime model with a
+        # baseline feature contract is a mismatched pair, and the contract
+        # check below is what catches it.
+        model_path = artifact_store.resolve("best_model.zip", settings.model_dir)
+        if model_path is None:
+            logger.warning(
+                "RL model not found — neither a runtime copy under %s nor the "
+                "baseline in the image",
+                settings.model_dir,
+            )
             return False
 
-        _model = PPO.load(str(settings.best_model_path))
+        _model = PPO.load(str(model_path))
         _feature_columns = load_saved_feature_columns(settings)
         if not _feature_columns:
             # The column contract is unknown. Refuse to load rather than infer
@@ -78,8 +93,9 @@ def _ensure_loaded() -> bool:
             return False
         bind(_model)
 
-        if settings.scaler_path.exists():
-            _scaler = joblib.load(str(settings.scaler_path))
+        scaler_path = artifact_store.resolve("scaler.joblib", settings.model_dir)
+        if scaler_path is not None:
+            _scaler = joblib.load(str(scaler_path))
 
         expected = _model.observation_space.shape[0]
         if len(_feature_columns) != expected:

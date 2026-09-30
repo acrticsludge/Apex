@@ -145,7 +145,12 @@ class FakeModel:
         self.saved_to = None
 
     def save(self, path):
+        # Writes a real file: the save path is atomic and verifies the artifact
+        # exists before renaming it into place, so a save that records the path
+        # without writing would be rejected. Matching SB3's actual behaviour
+        # keeps this stub honest about what the production path requires.
         self.saved_to = path
+        Path(path).write_bytes(b"fake model")
 
 
 @pytest.fixture

@@ -29,6 +29,7 @@ Set these as Railway **service variables**, not in a committed file:
 | `SUPABASE_URL` | project URL | falls back to `apex_dual_state.json` (ephemeral on Railway) |
 | `SUPABASE_SERVICE_KEY` | service-role key | same |
 | `APEX_ENV` | `main` for prod, distinct per preview | preview stomps prod state |
+| `TRADING_AGENT_STORAGE_DIR` | `/data` with a volume mounted there | online RL updates are discarded on redeploy (see 1.4) |
 
 To use a hash instead of a plaintext password:
 
@@ -57,6 +58,53 @@ suite, a production-import-order assertion for the JEV subsystem, `pip-audit`,
 and a Docker build.
 
 ---
+
+### 1.4 Persisting online RL updates — OPTIONAL, recommended
+
+Without this, the app works exactly as before and the online learner still runs.
+What changes is that **every weight update it makes is thrown away on the next
+deploy**, because the container filesystem is ephemeral. The process restarts on
+whatever weights are committed in the image.
+
+The app says so once at boot, so you can tell which state you are in:
+
+```
+Online RL updates are writing to /app/trading_agent/agent/model, which is the
+git-tracked artifact directory. They will be discarded on redeploy. Set
+TRADING_AGENT_STORAGE_DIR to a mounted volume to make them persistent.
+```
+
+**To fix it:** add a Railway volume mounted at `/data`, then set
+`TRADING_AGENT_STORAGE_DIR=/data`. Nothing else changes.
+
+| | No volume | Volume at `/data` |
+|---|---|---|
+| App starts | ✅ uses the committed model | ✅ seeds the volume from the committed model, then uses it |
+| Online updates | ✅ applied in memory, ❌ lost on redeploy | ✅ applied and persisted |
+| Worktree on the host | ✅ stays clean | ✅ stays clean |
+| Cost | — | volume's monthly cost |
+
+How it works
+([`artifact_store.py`](../../trading_agent/integration/artifact_store.py)):
+an artifact has an immutable **baseline** — the model in the image, committed, so
+a fresh deploy has something to load — and a mutable **runtime** copy that
+updates land in. Reads prefer the runtime copy and fall back to the baseline.
+Writes only ever touch the runtime copy, and go through a temporary file and a
+rename, so a crash mid-save leaves the previous model intact rather than a
+half-written zip. A freshly mounted volume is seeded from the baseline on first
+use and is never re-seeded, so a redeploy cannot undo a deploy's worth of
+learning.
+
+Nothing is written outside `/data`, and no credential is involved. Rolling back
+by redeploying an older image is unaffected: the volume keeps the newer model,
+and the loader prefers it, so a rollback does **not** restore the older weights.
+To roll the model back, delete the artifact on the volume or redeploy with
+`TRADING_AGENT_STORAGE_DIR` unset.
+
+**If you skip this**, the only consequence is that the model does not learn
+across deploys. It is not a correctness or security problem, which is why it is
+optional rather than a blocker.
+
 
 ## 2. Deploying
 
