@@ -316,35 +316,26 @@ def test_slippage_is_counted_on_both_sides(fills):
     assert pnl == pytest.approx(-0.1 * qty - 0.1 * qty)  # entry and exit drag both present
 
 
-def test_entry_commission_is_missing_from_realised_pnl(fills):
-    """A pre-existing accounting asymmetry, pinned so it cannot change silently.
+def test_entry_commission_now_reaches_realised_pnl(fills):
+    """The asymmetry this test used to document has been fixed.
 
-    Entry commission is deducted from cash when the position opens, but
-    realised_pnl is computed only from the exit side:
-    `net_proceeds - entry * qty`. So the entry cost never reaches P&L, the win
-    /loss counters, the daily loss limit or the drawdown kill-switch — all four
-    read as one side cheaper than the trade actually was.
-
-    Slippage does not have this problem, which is precisely why it is modelled
-    as a fill price rather than as a fee.
+    It was written to pin the old behaviour: entry commission was deducted from
+    cash at open but never reached realised_pnl, so P&L, the win rate and both
+    kill-switches read one side cheaper than the trade was. The full accounting
+    is now covered by tests/test_commission_accounting.py; this remains as the
+    cross-check from the slippage side, because a flat round trip should cost
+    exactly the same either way it is modelled.
     """
     fills.cfg["commission_pct"] = 0.001
     fills.cfg["slippage_pct"] = 0.0
     m = _mstate()
     fills.execute_buy("A.NS", 100.0, m, atr=2.0)
     qty = m["positions"]["A.NS"]["qty"]
-    entry_commission = 100.0 * qty * 0.001
-
-    # Cash was charged for it...
-    spent = 1_000_000.0 - m["cash"] - qty * 100.0
-    assert spent == pytest.approx(entry_commission)
-
-    # ...but P&L only reflects the exit side of a flat round trip.
     fills.execute_sell("A.NS", 100.0, "TEST", m)
-    assert m["realised_pnl"] == pytest.approx(-entry_commission)
-    assert m["realised_pnl"] != pytest.approx(-2 * entry_commission), (
-        "this test documents the asymmetry; if it now fails, P&L has started "
-        "charging both sides and the fix should land with it"
+    per_side = 0.001 * 100.0 * qty
+    assert m["realised_pnl"] == pytest.approx(-2 * per_side), (
+        f"a flat round trip should lose both sides of commission, got "
+        f"{m['realised_pnl']} against an expected {-2 * per_side}"
     )
 
 

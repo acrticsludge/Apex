@@ -190,21 +190,35 @@ correctness risk; all of it slows the next change.
       Modelling it as a fill price rather than a fee is deliberate: it is what
       makes both sides land in P&L. See the commission asymmetry below for the
       contrast.
-- [ ] **Charge entry commission to P&L.** Found while testing slippage, and
-      pre-existing. Entry commission is deducted from cash when a position opens,
-      but `realised_pnl` is computed from the exit side only
-      (`net_proceeds - entry * qty`). So the entry cost never reaches
-      `realised_pnl`, the win/loss counters, the daily loss limit or the
-      drawdown kill-switch — all four read one side cheaper than the trade
-      actually was. `test_entry_commission_is_missing_from_realised_pnl` pins the
-      current behaviour so a fix lands as a visible change rather than a silent
-      one. **Not fixed here**: it alters reported performance and the kill-switch
-      thresholds, which is a decision for the operator, not a refactor.
-- [ ] **Indian transaction costs are understated.** Indian equity carries STT
-      (~0.1% on the buy side for delivery), stamp duty and GST. The model applies
-      a single global 0.06% commission to both markets, so India is cheaper than
-      it is and the US is about right. Any conclusion drawn from the India
-      ledger is currently too favourable.
+- [x] **Charge entry commission to P&L.** Fixed. Entry commission was
+      deducted from cash when a position opened, but `realised_pnl` was computed
+      from the exit side alone, so the entry cost never reached P&L.
+
+      This was listed as needing a decision, and that was wrong. `daily_loss_pct`
+      is `realised_pnl / session_start_cash` and the drawdown kill-switch reads
+      the same ledger, so a cost missing from P&L makes **both fire later than
+      they should**. That is not a performance preference, it is a safety
+      mechanism being under-sensitive in exactly the direction that loses money.
+      There is no reading of the old behaviour under which it was desirable.
+
+      The entry cost is recorded on the position and charged at close. Positions
+      persisted before this change have no such key, so the lookup is
+      `.get(..., 0.0)` and an existing ledger opens and closes unchanged. Covered
+      by `tests/test_commission_accounting.py` (12 tests), including that a trade
+      grossing positive and netting negative counts as a loss.
+- [ ] **Per-market transaction costs ? blocked on data, not on engineering.**
+      A single global 0.06% commission is applied to both markets. US is roughly
+      right; Indian equity additionally carries STT, stamp duty, GST and exchange
+      charges, so the India ledger reads cheaper than it is and conclusions drawn
+      from it are optimistic.
+
+      Deliberately not implemented. The mechanism is straightforward -- per-market
+      keys and a lookup at the four execution sites -- but the *values* must come
+      from the operator's broker and depend on segment (delivery vs intraday) and
+      on rates that change. Inventing plausible numbers that look authoritative
+      would be worse than leaving the honest global default in place.
+      **Needs:** the charge schedule from the broker's contract note. Once
+      supplied, the change is small.
 - [x] **Alert on a stalled or dead agent.** The log line
       `Agent has failed N consecutive cycles` existed and nothing watched it.
       `apex_alert.py` now raises a webhook on repeated cycle failures,
@@ -243,9 +257,8 @@ correctness risk; all of it slows the next change.
 - [ ] **Add mutation testing** on the risk gates. A test that asserts a gate is
       applied would pass even if the gate were inverted; mutation testing is
       what catches that.
-- [ ] **Alert on `Agent has failed N consecutive cycles`.** The log line exists;
-      nothing watches it. This is the single highest-value observability gap
-      for an unattended trading bot.
+- [x] ~~**Alert on `Agent has failed N consecutive cycles`.**~~ Done, see the
+      alerting entry above. Removed here so the same gap is not tracked twice.
 
 ---
 

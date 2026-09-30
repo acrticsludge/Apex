@@ -1121,6 +1121,12 @@ def execute_buy(symbol: str, price: float, mstate: dict, atr: float = None, rcfg
         "side":         "long",
         "qty":          qty,
         "entry":        price,
+        # The entry cost is carried on the position and charged to P&L at exit.
+        # It is already out of cash, but realised_pnl is computed from the exit
+        # side alone, so without this the daily loss limit and the drawdown
+        # kill-switch both read a trade as cheaper than it was — and both fire
+        # later than they should. Apportioned on a partial exit.
+        "entry_commission": commission,
         "stop_loss":    sl,
         "target":       tgt,
         "atr":          atr or 0.0,
@@ -1180,6 +1186,7 @@ def execute_short(symbol: str, price: float, mstate: dict, atr: float = None, rc
         "side":        "short",
         "qty":         qty,
         "entry":       price,
+        "entry_commission": commission,
         "stop_loss":   sl,
         "target":      tgt,
         "atr":         atr or 0.0,
@@ -1237,7 +1244,13 @@ def execute_sell(symbol: str, price: float, reason: str, mstate: dict):
     proceeds   = pos["qty"] * price
     commission = proceeds * cfg.get("commission_pct", 0.0)
     net_proceeds = proceeds - commission
-    pnl = net_proceeds - pos["entry"] * pos["qty"]
+    # The entry cost was already taken from cash at open. realised_pnl is built
+    # from the exit side alone, so it has to be charged here or the ledger never
+    # sees it — which leaves the daily loss limit and the drawdown kill-switch
+    # reading the trade as cheaper than it was, and firing later than they should.
+    # `.get` because positions persisted before this change have no such key, and
+    # the position is closed whole on this path, so the whole cost belongs here.
+    pnl = net_proceeds - pos["entry"] * pos["qty"] - pos.get("entry_commission", 0.0)
     mstate["cash"]         += net_proceeds
     mstate["realised_pnl"] += pnl
     if pnl >= 0:
@@ -1272,7 +1285,9 @@ def execute_cover(symbol: str, price: float, reason: str, mstate: dict):
     price = _fill_price(price, "buy")
     gross_pnl  = (pos["entry"] - price) * pos["qty"]    # positive when price fell
     commission = price * pos["qty"] * cfg.get("commission_pct", 0.0)
-    net_pnl    = gross_pnl - commission
+    # As on the long side: the entry cost left cash at open but never reached
+    # realised_pnl, so both kill-switches were under-sensitive.
+    net_pnl    = gross_pnl - commission - pos.get("entry_commission", 0.0)
     mstate["cash"]         += net_pnl
     mstate["realised_pnl"] += net_pnl
     if net_pnl >= 0:
