@@ -19,7 +19,7 @@ engineering work that can be planned and executed against the test suite.
 | Security | Auth fails closed; all client-writable values validated; 20 advisories cleared |
 | Supply chain | 22 exact pins with constraint tests; Dependabot; pip-audit gates CI |
 | CI | 3 jobs: suite, import-order assertion + audit, Docker build + secret scan |
-| Tests | 421 cases green locally on the pinned stack and on CI, covering the entry decision, the Supabase path, model artifacts, the learner validation gate and execution costs |
+| Tests | 468 cases green locally on the pinned stack and on CI, covering the entry decision, the Supabase path, model artifacts, the learner validation gate, execution costs and alerting |
 | Deployment | **never deployed.** The changes have not run against a live market. |
 | Documentation | architecture overview, 5 ADRs, runbook (this cycle) |
 
@@ -205,6 +205,39 @@ correctness risk; all of it slows the next change.
       a single global 0.06% commission to both markets, so India is cheaper than
       it is and the US is about right. Any conclusion drawn from the India
       ledger is currently too favourable.
+- [x] **Alert on a stalled or dead agent.** The log line
+      `Agent has failed N consecutive cycles` existed and nothing watched it.
+      `apex_alert.py` now raises a webhook on repeated cycle failures,
+      on recovery, and on the agent loop exiting — and `/healthz` exposes liveness
+      for an external monitor.
+      The loop-exit alert is the one that matters most, because it covers a case
+      nothing else can see: a thread that dies outright writes nothing anywhere.
+      The process keeps serving 200s while no trading happens. Age of the last
+      cycle is the only evidence such a death leaves.
+      Two design constraints, both load-bearing:
+      * Escalation, not repetition. A repeated event alerts at 1, 3, 10, 30 and
+        100 occurrences, then stops. Alerting every cycle for six hours trains
+        the operator to ignore the channel, which is the same as having no
+        alerting. Recovery resets the ladder, so the next incident's first
+        occurrence is not silent.
+      * Monitoring may never take the service down. `alert()` never raises,
+        never retries, and caps its timeout at 30s. The loop additionally wraps
+        every call in `_notify`, because an exception raised inside an `except`
+        block propagates straight out of the thread — so a bug in alerting would
+        otherwise stop trading. That was a real defect the tests caught.
+      `/healthz` is unauthenticated because a monitor has no session and behind
+      the login redirect it would catch nothing. That obliges it to stay minimal:
+      liveness booleans and timings only. It deliberately excludes the alerting
+      error string, because a webhook connection error carries the provider's
+      hostname. Verified by a test asserting no ledger, credential, environment
+      or webhook field appears on the response.
+      **To turn it on:** set `APEX_ALERT_WEBHOOK_URL` (Slack, Discord, ntfy and
+      PagerDuty all accept a plain JSON POST). With it unset, alerting logs a
+      notice once and says so — alerting that is silently off looks configured.
+- [ ] **Watch `/healthz` from something.** The endpoint exists; nothing polls
+      it yet. A free monitor (UptimeRobot, healthchecks.io) pointed at
+      `https://<host>/healthz` turns the silent-thread-death case into an email.
+      Until then, liveness is only visible to whoever opens the dashboard.
 - [ ] **Adopt a lockfile** (`uv.lock` or `pip-compile`) so the transitive graph
       is hash-verified rather than inferred from exact pins. See ADR-005.
 - [ ] **Add mutation testing** on the risk gates. A test that asserts a gate is

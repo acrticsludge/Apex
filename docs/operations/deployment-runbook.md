@@ -106,6 +106,56 @@ across deploys. It is not a correctness or security problem, which is why it is
 optional rather than a blocker.
 
 
+### 1.5 Getting told when it stops — RECOMMENDED
+
+Without this, an unattended bot can fail silently and you will not know until
+you log in.
+
+Set one variable:
+
+| Variable | Value | If missing |
+|---|---|---|
+| `APEX_ALERT_WEBHOOK_URL` | a webhook URL | no alerts; a notice is logged once at boot |
+| `APEX_ALERT_TIMEOUT` | seconds, default 5, capped at 30 | — |
+
+Slack, Discord, ntfy and PagerDuty all accept a plain JSON POST, so a normal
+incoming-webhook URL is enough. The payload is:
+
+```json
+{"event": "agent_cycle_failures", "level": "error",
+ "message": "Agent has failed 12 consecutive cycle(s) — trading may be stalled",
+ "occurrences": 12, "env": "main", "at": "2026-09-30T12:00:00+00:00"}
+```
+
+You are alerted for three conditions:
+
+| Event | Meaning |
+|---|---|
+| `agent_cycle_failures` | Cycles are failing repeatedly. Trading is stalled. |
+| `agent_recovered` | It came back. Worth knowing after a stall. |
+| `agent_stopped` | The loop exited — either you stopped it, or the thread died. **The thread-dying case is why this exists**: a background thread that stops writes nothing anywhere, so the process keeps serving while no trading happens. |
+
+A repeated event alerts at 1, 3, 10, 30 and 100 occurrences, then goes quiet.
+That is deliberate — hundreds of identical notifications teach you to ignore the
+channel. Recovery resets the counter, so the next incident's first failure is
+never the silent one.
+
+**For the case alerting cannot see**, `/healthz` reports whether the agent is
+actually cycling. It needs no third party and no login:
+
+```
+GET /healthz   ->  200 when healthy, 503 when not
+```
+
+Point a free monitor at it (UptimeRobot, healthchecks.io, Better Stack — all
+have free tiers) and email yourself. It is unauthenticated because a monitor has
+no session, and it returns only liveness booleans and timings — no positions, no
+ledger, no keys, and deliberately not the alerting error string, which would
+carry the webhook provider's hostname.
+
+Nothing here changes trading behaviour. With the variable unset the app behaves
+exactly as before.
+
 ## 2. Deploying
 
 1. Merge to the deploy branch. Railway rebuilds from the Dockerfile.

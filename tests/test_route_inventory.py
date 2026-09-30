@@ -15,6 +15,10 @@ EXPECTED_ROUTES = {
     ("/login", "GET"),
     ("/login", "POST"),
     ("/logout", "GET"),
+    # liveness for an external monitor. Unauthenticated by necessity — a monitor
+    # has no session — and kept to liveness booleans and timings. The auth guard
+    # exempts exactly this path; see the route for what that obliges.
+    ("/healthz", "GET"),
     # reads
     ("/api/state", "GET"),
     ("/api/logs", "GET"),
@@ -74,7 +78,13 @@ def test_route_is_reachable(client, path, method):
             .replace("<path:filename>", "app.js")
     )
     r = client.open(concrete, method=method)
-    assert r.status_code < 500, f"{method} {concrete} -> {r.status_code}"
+    # /healthz answers 503 when the agent is not cycling. That is the endpoint
+    # reporting an unhealthy bot, not a server fault, so it is the one route
+    # where 5xx is a valid response. Every other route must stay under 500.
+    allowed = (503,) if concrete == "/healthz" else ()
+    assert r.status_code < 500 or r.status_code in allowed, (
+        f"{method} {concrete} -> {r.status_code}"
+    )
 
 
 # Every API route that is safe over GET. Anything else must be POST-only, so a

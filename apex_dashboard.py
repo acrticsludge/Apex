@@ -159,6 +159,7 @@ if _JEV_AVAILABLE:
 
 from apex_universe import INDIA_WATCHLIST, US_WATCHLIST  # canonical, shared with trading_agent
 from apex_market import EDT, IST  # canonical calendar; see MARKET HOURS below
+import apex_alert  # outbound alerting + liveness; leaf module, no dashboard imports
 from apex_config import (  # ledger/config guards live in a leaf module
     CONFIG_BOUNDS,
     POSITION_EDIT_SPEC,
@@ -232,6 +233,10 @@ _agent   = {
     "running": False, "paused": False,
     "status":  "idle", "last_update": None, "next_check": None,
     "india_open": False, "us_open": False,
+    # Read by /healthz. A plain int on the agent thread, written only there, so
+    # a torn read is not possible on CPython and no lock is needed on the polling
+    # side — the worst case is one stale sample.
+    "consecutive_failures": 0,
 }
 
 # ── Per-cycle JEV risk-gate overrides ─────────────────────────────────────────
@@ -2120,6 +2125,24 @@ def start_price_updater():
 
 # ─── AGENT THREAD ─────────────────────────────────────────────────────────────
 
+def _notify(event: str, message: str, level: str = "error", **fields) -> None:
+    """Fire-and-forget alert from the trading loop. Never raises.
+
+    `apex_alert.alert` already promises not to, but it is called from inside the
+    loop's `except` block. An exception raised there does not get caught by the
+    handler that raised the original failure — it propagates straight out of the
+    thread. So a bug in the alerting code would stop trading, which is the worst
+    possible outcome for a monitoring call.
+
+    Wrapping at the call site makes the loop's failure path unconditionally safe
+    rather than relying on the callee keeping its promise.
+    """
+    try:
+        apex_alert.alert(event, message, level=level, **fields)
+    except Exception as e:  # noqa: BLE001
+        apex_log.error("Alert '%s' raised (%s: %s) — continuing", event, type(e).__name__, e)
+
+
 def agent_loop():
     global _state
     # Loading is blocking I/O — done before taking the lock.
@@ -2153,6 +2176,10 @@ def agent_loop():
                 _prev_india_open, _prev_us_open
             )
             _prev_india_open, _prev_us_open, sleep_min = _cycle_failures
+            # Liveness: an external monitor polls /healthz and looks at this age.
+            # A thread that dies outright never beats again, which is the only
+            # evidence such a death leaves — it writes nothing anywhere.
+            apex_alert.heartbeat.beat()
             if consecutive_failures:
                 apex_log.info(
                     "Agent cycle recovered after %d failure(s)", consecutive_failures
@@ -2160,10 +2187,18 @@ def agent_loop():
                 think_log(
                     "CYCLE", f"Cycle recovered after {consecutive_failures} failure(s).", "SYSTEM"
                 )
+                _notify(
+                    "agent_recovered",
+                    f"Agent recovered after {consecutive_failures} failed cycle(s)",
+                    level="info", failures=consecutive_failures,
+                )
+                apex_alert.reset("agent_cycle_failures")
             consecutive_failures = 0
+            _agent["consecutive_failures"] = 0
         except Exception as e:  # noqa: BLE001
             consecutive_failures += 1
             _agent["status"] = "error"
+            _agent["consecutive_failures"] = consecutive_failures
             apex_log.exception("Agent cycle failed (%d in a row): %s", consecutive_failures, e)
             think_log("CYCLE", f"ERROR: cycle failed ({consecutive_failures}): {e}", "SYSTEM")
             if consecutive_failures == 1 or consecutive_failures % 10 == 0:
@@ -2171,6 +2206,15 @@ def agent_loop():
                     "Agent has failed %d consecutive cycles — trading may be stalled",
                     consecutive_failures,
                 )
+            # Escalating alert rather than one per cycle: a failure that persists
+            # for hours must not become hundreds of notifications nobody reads.
+            _notify(
+                "agent_cycle_failures",
+                f"Agent has failed {consecutive_failures} consecutive cycle(s) "
+                f"— trading may be stalled",
+                consecutive_failures=consecutive_failures,
+                error=f"{type(e).__name__}: {e}"[:200],
+            )
             time.sleep(30)   # back off rather than hot-looping on the failure
             continue
 
@@ -2183,6 +2227,15 @@ def agent_loop():
     _agent["status"]  = "stopped"
     _agent["running"] = False
     apex_log.info("Agent stopped")
+    # The loop ending is either an operator stop or the thread being killed. The
+    # operator knows about the first one; nobody knows about the second, and this
+    # is the last code that runs either way, so it is the only place that can say
+    # so.
+    _notify(
+        "agent_stopped",
+        "Trading agent loop exited — no further cycles will run",
+        level="warning", final_status=_agent["status"],
+    )
 
 
 def _run_one_cycle(prev_india_open: bool, prev_us_open: bool) -> tuple:
@@ -2517,6 +2570,10 @@ def _handle_unexpected(err):
 def _require_login():
     if request.path in ("/login", "/logout"):
         return None
+    # /healthz is polled by an external monitor with no session, and exists only
+    # to report liveness. It is kept deliberately minimal — see the route.
+    if request.path == "/healthz":
+        return None
     if not session.get("logged_in"):
         if request.path.startswith("/api/"):
             return jsonify({"ok": False, "msg": "Not authenticated"}), 401
@@ -2564,6 +2621,45 @@ def index():
     # render_template caches the compiled template by filename; the old inline
     # literal was re-tokenised on every request.
     return render_template("index.html")
+
+@app.route("/healthz")
+def healthz():
+    """Liveness for an external monitor. Unauthenticated, and deliberately minimal.
+
+    This is the half of alerting that does not need a third party, and it is the
+    one that catches the failure mode nothing else can see: an agent thread that
+    dies outright leaves the process serving perfectly while no trading happens.
+    There is no error to log when a thread simply stops existing — the only
+    evidence is that time passes with no cycle.
+
+    Why unauthenticated: a monitor has no browser session, and a login flow makes
+    the endpoint useless, which would leave exactly the failure this exists to
+    catch uncovered.
+
+    What that obliges. This returns liveness booleans and timings only. It does
+    NOT include the alerting error string, the environment name, or anything
+    from the ledger — a connection error from the webhook carries the provider's
+    hostname, so leaking it would hand an unauthenticated caller the alerting
+    destination. Diagnostic detail stays behind auth at /api/retrain/log and in
+    apex.log.
+
+    Returns 200 when healthy and 503 when not, so a plain HTTP monitor works.
+    """
+    snapshot = apex_alert.heartbeat.snapshot(
+        running=_agent["running"],
+        status=_agent["status"],
+        consecutive_failures=_agent.get("consecutive_failures", 0),
+    )
+    return jsonify({
+        "healthy":    snapshot["healthy"],
+        "running":    snapshot["agent_running"],
+        "status":     snapshot["agent_status"],
+        "failures":   snapshot["consecutive_failures"],
+        "cycle_age_s": snapshot["last_cycle_age_s"],
+        "stale":      snapshot["stale"],
+        "uptime_s":   snapshot["uptime_s"],
+        "alerting":   apex_alert.is_configured(),
+    }), (200 if snapshot["healthy"] else 503)
 
 @app.route("/api/state")
 def api_state():
