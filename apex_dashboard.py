@@ -2742,22 +2742,28 @@ def api_jev_status():
 
 @app.route("/api/retrain/log")
 def api_retrain_log():
+    """Retraining activity, including updates the validation gate held back.
+
+    `rejected_updates` is the number to watch. A run of rejections means the
+    learner is proposing changes that do not generalise, which is the gate
+    working — but a persistently high count with zero acceptances means online
+    learning is not actually learning and the feature set is probably the
+    problem, not the gate.
+    """
     try:
         from trading_agent.integration.online_learner import (
-            get_retrain_log, _new_count, _is_training, _buffer, _total_updates,
+            get_retrain_log, stats, _MIN_BATCH_FOR_VALIDATION,
         )
         return jsonify({
-            "log":           get_retrain_log(),
-            "is_training":   _is_training,
-            "new_count":     _new_count,
-            "buffer_size":   len(_buffer),
-            "total_updates": _total_updates,
-            "threshold":     16,
+            "log":               get_retrain_log(),
+            **stats(),
+            "min_batch_to_validate": _MIN_BATCH_FOR_VALIDATION,
         })
     except ImportError:
         return jsonify({
-            "log": [], "is_training": False,
-            "new_count": 0, "buffer_size": 0, "total_updates": 0, "threshold": 16,
+            "log": [], "is_training": False, "new_count": 0, "buffer_size": 0,
+            "total_updates": 0, "rejected_updates": 0, "threshold": 16,
+            "min_batch_to_validate": 0,
         })
 
 @app.route("/api/rl/decisions")

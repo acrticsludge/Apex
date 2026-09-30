@@ -22,6 +22,25 @@ _FINE_TUNE_LR     = 1e-5   # 30× slower than original 3e-4 — prevents forgett
 _CLIP_EPS         = 0.10   # tighter clip than training 0.2 for stability
 _N_EPOCHS         = 3      # gradient passes per update batch
 
+# ── Validation gate ──────────────────────────────────────────────────────────
+# An update used to be published whenever the training loss fell, which only
+# proves the policy fitted the batch harder. It is now held back unless the
+# candidate beats the incumbent on experiences neither of them trained on.
+#
+# The holdout is the most recent tail of the buffer, never a random sample: over
+# a time series a random split trains on the future and validates on the past,
+# which looks like progress and is not.
+_VAL_FRACTION     = 0.20   # share of the batch reserved for scoring
+_MIN_TRAIN        = 4      # below this the batch cannot support both sides
+_MIN_VALIDATION   = 2      # minimum scoring slice for the comparison to mean anything
+_MIN_BATCH_FOR_VALIDATION = 12   # smallest total batch worth splitting
+
+# How much better the candidate must be, in percent, before it is published.
+# Zero means "reject anything that is not an improvement". Raise it to stop
+# noise-level gains from random-walking the policy away from a good starting
+# point; the measured values are logged either way so it can be tuned from data.
+_MIN_VALIDATION_IMPROVEMENT_PCT = 0.0
+
 # ── State ─────────────────────────────────────────────────────────────────────
 _buffer:      deque[dict] = deque(maxlen=_BUFFER_MAXLEN)
 _pending:     dict[str, dict] = {}          # symbol → trade-open context
@@ -33,7 +52,63 @@ _update_lock  = threading.Lock()
 _state_lock    = threading.Lock()
 _new_count    = 0      # experiences accumulated since last update trigger
 _is_training  = False
-_total_updates = 0     # cumulative completed updates
+_total_updates = 0     # cumulative applied updates
+_total_rejected = 0    # cumulative updates held back by the validation gate
+
+
+def _split_train_validation(batch: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Split a batch into a training portion and a held-out scoring tail.
+
+    Walks forward: the validation slice is the *most recent* experiences, and
+    training only ever sees what came before them. Returns ``([], [])`` when the
+    batch is too small to support both sides, which the caller treats as "do not
+    update" rather than "update without validating".
+
+    Skipped batches are not consumed — ``_buffer`` keeps them, so the experiences
+    are picked up by the next update instead of being lost.
+    """
+    if len(batch) < _MIN_BATCH_FOR_VALIDATION:
+        return [], []
+
+    n_val = int(len(batch) * _VAL_FRACTION)
+    # Guarantee both sides clear their own minimum, whatever the fraction gives.
+    n_val = max(n_val, _MIN_VALIDATION)
+    n_val = min(n_val, len(batch) - _MIN_TRAIN)
+    if n_val < _MIN_VALIDATION or (len(batch) - n_val) < _MIN_TRAIN:
+        return [], []
+    return batch[: len(batch) - n_val], batch[len(batch) - n_val:]
+
+
+def _validation_metric(model, val_batch: list[dict]) -> float:
+    """Score a policy on held-out experiences. Lower is better.
+
+    Uses the same PPO surrogate objective the update optimises, so the incumbent
+    and the candidate are compared on one scale. Only the reported loss and
+    entropy terms are used — the advantage is normalised, not scaled by the
+    value estimate — which keeps the number comparable between two policies
+    without either of them moving it by changing its own critic.
+    """
+    import torch as th
+
+    if not val_batch:
+        return float("nan")
+
+    obs = th.tensor(np.stack([e["obs"] for e in val_batch]).astype(np.float32))
+    act = th.tensor([e["action"] for e in val_batch], dtype=th.long)
+    ret = th.tensor([e["reward"] for e in val_batch], dtype=th.float32)
+
+    was_training = model.policy.training
+    model.policy.eval()
+    try:
+        with th.no_grad():
+            _vals, log_probs, entropy = model.policy.evaluate_actions(obs, act)
+            # -log p(action) as a cross-entropy proxy, plus a small entropy
+            # bonus. Deterministic, data-only, and identical for both policies.
+            score = float(((-log_probs).mean() - 0.01 * entropy.mean()).item())
+    finally:
+        if was_training:
+            model.policy.train()
+    return score
 
 
 def _make_training_model(model, registry):
@@ -73,6 +148,7 @@ def stats() -> dict:
             "new_count": _new_count,
             "buffer_size": len(_buffer),
             "total_updates": _total_updates,
+            "rejected_updates": _total_rejected,
             "threshold": _UPDATE_THRESHOLD,
         }
 
@@ -151,7 +227,7 @@ def record_exit(symbol: str, exit_price: float, pnl: float,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _run_update() -> None:
-    global _is_training, _total_updates
+    global _is_training, _total_updates, _total_rejected
 
     # Claim the update slot under the lock. This used to be a check-then-set
     # race, so several update threads could run at once on one batch.
@@ -175,15 +251,30 @@ def _run_update() -> None:
             _rt_log("skipped", msg=f"Buffer too small ({len(batch)} < 4) — skipping")
             return
 
+        # Hold out the most recent experiences before anything trains, so the
+        # candidate and the incumbent can be scored on data neither has seen.
+        train_batch, val_batch = _split_train_validation(batch)
+        if not val_batch:
+            _rt_log(
+                "skipped",
+                msg=(f"Batch of {len(batch)} is too small to validate "
+                     f"(need {_MIN_BATCH_FOR_VALIDATION}) — skipping; the "
+                     f"experiences stay buffered for the next update"),
+            )
+            return
+
         # Task 32: Stratify by regime for updates
         regimes = ["bullish", "bearish", "choppy", "crisis"]
-        regime_batches = {r: [e for e in batch if e.get("regime", "bullish") == r] for r in regimes}
+        regime_batches = {r: [e for e in train_batch if e.get("regime", "bullish") == r] for r in regimes}
 
-        n = len(batch)
-        _rt_log("started", trades=n,
-                msg=f"Triggered by {n} closed trades — computing gradients…")
-        logger.info("Online RL update: batch_size=%d, regime_dist=%s", n,
-                    {r: len(v) for r, v in regime_batches.items()})
+        n = len(train_batch)
+        _rt_log("started", trades=len(batch), train_size=n, val_size=len(val_batch),
+                msg=(f"Triggered by {len(batch)} closed trades — "
+                     f"{n} to train, {len(val_batch)} held out for validation…"))
+        logger.info(
+            "Online RL update: batch_size=%d, train=%d, val=%d, regime_dist=%s",
+            len(batch), n, len(val_batch), {r: len(v) for r, v in regime_batches.items()},
+        )
 
         import torch as th
         import torch.nn.functional as F
@@ -195,6 +286,11 @@ def _run_update() -> None:
         work = _make_training_model(model, registry)
 
         with _update_lock:
+            # Score the incumbent on the holdout *before* training, so the
+            # comparison is like-for-like: same data, same objective, two
+            # different weight sets.
+            val_before = _validation_metric(model, val_batch)
+
             # Process each regime separately for stratified updates
             for regime in regimes:
                 regime_batch = regime_batches[regime]
@@ -248,6 +344,48 @@ def _run_update() -> None:
                 (loss_before - loss_after) / (abs(loss_before) + 1e-9) * 100, 1
             )
 
+            # Now score the candidate on the same held-out slice.
+            val_after = _validation_metric(work, val_batch)
+
+        # The decision. Every branch fails closed: a comparison that could not be
+        # made, or was not an improvement, leaves the live policy alone. NaN and
+        # inf are excluded explicitly because every NaN comparison is False
+        # (which would silently reject everything) and inf beats any finite value
+        # (which would silently accept everything).
+        finite = np.isfinite(val_before) and np.isfinite(val_after) and val_before > 0
+        val_improvement = (
+            round((val_before - val_after) / (abs(val_before) + 1e-9) * 100, 1)
+            if finite else None
+        )
+        accept = (
+            val_improvement is not None
+            and val_improvement > _MIN_VALIDATION_IMPROVEMENT_PCT
+        )
+
+        if not accept:
+            with _state_lock:
+                _total_rejected += 1
+            reason = (
+                "non-finite or non-positive validation score"
+                if not finite else
+                f"held out: {val_before:.4f} → {val_after:.4f} "
+                f"({val_improvement:+.1f}%, needed > "
+                f"{_MIN_VALIDATION_IMPROVEMENT_PCT:+.1f}%)"
+            )
+            _rt_log("rejected", trades=len(batch),
+                    training_improvement_pct=improvement,
+                    validation_before=val_before, validation_after=val_after,
+                    validation_improvement_pct=val_improvement, applied=False,
+                    msg=f"✗ HELD BACK — {reason}")
+            logger.info(
+                "Online RL update rejected: validation %.4f → %.4f (%+.1f%%); "
+                "training loss said %+.1f%%, which did not carry over",
+                val_before, val_after, val_improvement or 0.0, improvement,
+            )
+            return
+
+        # Only now may the live policy and the persisted artifact change.
+        with _update_lock:
             # Back up the current weights, then persist and publish.
             #
             # The save goes through artifact_store rather than straight to
@@ -271,17 +409,24 @@ def _run_update() -> None:
             _total_updates += 1
         _rt_log(
             "completed",
-            trades=n,
+            trades=len(batch),
             loss_before=round(loss_before, 4),
             loss_after=round(loss_after, 4),
             improvement_pct=improvement,
+            validation_before=val_before,
+            validation_after=val_after,
+            validation_improvement_pct=val_improvement,
             applied=True,
             msg=(
                 f"loss {loss_before:.3f} → {loss_after:.3f}  "
-                f"({improvement:+.1f}%)  ✓ APPLIED"
+                f"({improvement:+.1f}%)  |  held out: {val_before:.4f} → "
+                f"{val_after:.4f} ({val_improvement:+.1f}%)  ✓ APPLIED"
             ),
         )
-        logger.info("Online update complete: improvement=%.1f%%", improvement)
+        logger.info(
+            "Online update complete: training %+.1f%%, validation %+.1f%%",
+            improvement, val_improvement,
+        )
 
     except Exception as exc:
         _rt_log("failed", error=str(exc), applied=False,

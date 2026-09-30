@@ -1,7 +1,8 @@
 # Remaining Work Plan
 
 Created 2026-09-29, after the `feat/jev-integration` hardening work landed
-(tip `200e6c0c`, 293 tests green, CI 3/3).
+(tip `200e6c0c`, 293 tests green, CI 3/3). Kept current as work landed; the
+counts below are as of `583d4be` plus the online-learner validation gate.
 
 This plan covers what is left. It is ordered by risk, not by convenience.
 Phases 0 and 1 require a human; everything from Phase 2 onward is
@@ -18,7 +19,7 @@ engineering work that can be planned and executed against the test suite.
 | Security | Auth fails closed; all client-writable values validated; 20 advisories cleared |
 | Supply chain | 22 exact pins with constraint tests; Dependabot; pip-audit gates CI |
 | CI | 3 jobs: suite, import-order assertion + audit, Docker build + secret scan |
-| Tests | 208 functions / 293 cases, green locally on the pinned stack and on CI |
+| Tests | 396 cases green locally on the pinned stack and on CI, including the entry decision, the Supabase path and the model artifacts |
 | Deployment | **never deployed.** The changes have not run against a live market. |
 | Documentation | architecture overview, 5 ADRs, runbook (this cycle) |
 
@@ -152,6 +153,34 @@ correctness risk; all of it slows the next change.
       the re-entry cooldown, and the daily-loss and drawdown kill-switches.
       The halt path itself returns before any entry work, which the tests
       confirm — under a halt nothing is entered at all.
+- [x] **Gate the online learner on held-out validation.** Done in
+      `trading_agent/integration/online_learner.py`. An update used to be
+      published whenever the training loss fell, which only proves the policy
+      fitted the batch harder; the module had no held-out data at all. Now the
+      most recent 20% of the buffer is held out before training, the incumbent
+      and the candidate are both scored on that identical slice with the same
+      objective, and the update is applied only if the candidate wins by more
+      than `_MIN_VALIDATION_IMPROVEMENT_PCT`. The split is walk-forward, never
+      random: over a time series a random split trains on the future and
+      validates on the past, which looks like progress and is not. Every branch
+      fails closed, including NaN/inf, which are excluded explicitly because
+      every NaN comparison is False (silently rejecting everything) and inf beats
+      any finite value (silently accepting anything).
+      This was a gap the persistence work introduced: updates used to evaporate
+      on redeploy, so a bad one was self-cancelling. Now that they survive, an
+      unvalidated one is permanent.
+      Batches below `_MIN_BATCH_FOR_VALIDATION` (12) now skip rather than
+      training unvalidated, so the learner fires less often early on. Skipped
+      batches stay in the buffer and are used by the next update.
+      **Watch `rejected_updates`** in `/api/retrain/log`. A run of rejections is
+      the gate working. A persistently high count with no acceptances means the
+      learner is not learning and the feature set is the likely problem.
+- [ ] **Model slippage, not just commission.** `commission_pct` (0.06% per side)
+      is deducted correctly, but every fill happens at the quoted price. Real
+      fills do not, especially in thinner names, so paper P&L is optimistic and
+      position sizing is calibrated against a number the market will not
+      reproduce. A `slippage_pct` cfg entry plus one line in `execute_buy` /
+      `execute_short` is enough to make the performance numbers honest.
 - [ ] **Adopt a lockfile** (`uv.lock` or `pip-compile`) so the transitive graph
       is hash-verified rather than inferred from exact pins. See ADR-005.
 - [ ] **Add mutation testing** on the risk gates. A test that asserts a gate is

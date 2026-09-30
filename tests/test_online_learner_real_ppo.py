@@ -79,7 +79,7 @@ def _live_weights(model):
     return {k: v.detach().clone() for k, v in model.policy.state_dict().items()}
 
 
-def test_the_model_is_actually_trained_by_the_update(real_ppo, monkeypatch, tmp_path):
+def test_the_model_is_actually_trained_by_the_update(real_ppo, monkeypatch, tmp_path, accepting_updates):
     """Sanity: the harness exercises real gradients, not a no-op."""
     model, _ = real_ppo
     monkeypatch.setattr(rl, "_model", model, raising=False)
@@ -98,7 +98,7 @@ def test_the_model_is_actually_trained_by_the_update(real_ppo, monkeypatch, tmp_
     assert changed, "the update did not change a single weight — nothing was trained"
 
 
-def test_gradient_step_does_not_touch_the_live_policy(real_ppo, monkeypatch, tmp_path):
+def test_gradient_step_does_not_touch_the_live_policy(real_ppo, monkeypatch, tmp_path, accepting_updates):
     """The whole point: the live policy is only ever written by publish()."""
     model, _ = real_ppo
     monkeypatch.setattr(rl, "_model", model, raising=False)

@@ -97,7 +97,7 @@ def _worktree_dirty() -> bool:
 # ── The real save path targets the volume, never the repo ──────────────────
 
 def test_a_real_update_lands_in_the_volume_not_the_repo(
-    ppo, volume, clean_learner, monkeypatch
+    ppo, volume, clean_learner, monkeypatch, accepting_updates
 ):
     """The headline assertion, driven through online_learner._run_update.
 
@@ -126,7 +126,9 @@ def test_a_real_update_lands_in_the_volume_not_the_repo(
     assert not _worktree_dirty(), "the online update dirtied the worktree"
 
 
-def test_a_real_update_is_readable_as_a_model(ppo, volume, clean_learner, monkeypatch):
+def test_a_real_update_is_readable_as_a_model(
+    ppo, volume, clean_learner, monkeypatch, accepting_updates
+):
     """The saved artifact is a loadable model, not just bytes at the right path."""
     from stable_baselines3 import PPO
 
@@ -147,7 +149,7 @@ def test_a_real_update_is_readable_as_a_model(ppo, volume, clean_learner, monkey
 
 
 def test_an_update_backs_up_the_previous_model_once(
-    ppo, volume, clean_learner, monkeypatch
+    ppo, volume, clean_learner, monkeypatch, accepting_updates
 ):
     """One retained version, not one per update — the old code accumulated."""
     model_dir = _model_dir(volume)
@@ -167,7 +169,7 @@ def test_an_update_backs_up_the_previous_model_once(
 
 
 def test_a_failed_save_does_not_destroy_the_deployed_model(
-    ppo, volume, clean_learner, monkeypatch
+    ppo, volume, clean_learner, monkeypatch, accepting_updates
 ):
     """A crash mid-update must leave a working model behind. On a volume that
     outlives the process, a corrupted artifact would break every future boot."""

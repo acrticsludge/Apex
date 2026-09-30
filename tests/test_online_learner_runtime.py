@@ -206,7 +206,7 @@ def fake_torch(monkeypatch, tmp_path):
     monkeypatch.setattr(rl, "_model", None, raising=False)
 
 
-def _seed(ol, n=8, dim=6):
+def _seed(ol, n=16, dim=6):
     ol._buffer.clear()
     for i in range(n):
         ol._buffer.append({
@@ -228,12 +228,12 @@ def _reset_learner(ol):
 
 # ── The properties the fix must guarantee ────────────────────────────────────
 
-def test_update_leaves_live_weights_untouched_until_publish(fake_torch):
+def test_update_leaves_live_weights_untouched_until_publish(fake_torch, accepting_updates):
     """Gradients must not reach the object the agent thread infers from."""
     import trading_agent.integration.online_learner as ol
     _reset_learner(ol)
     model, registry, _ = fake_torch
-    _seed(ol, n=8)
+    _seed(ol, n=16)
 
     live_before = list(model.policy.state_dict()["w"])
     ol._run_update()
@@ -250,7 +250,7 @@ def test_gradient_steps_never_touch_the_live_optimizer(fake_torch):
     import trading_agent.integration.online_learner as ol
     _reset_learner(ol)
     model, registry, _ = fake_torch
-    _seed(ol, n=8)
+    _seed(ol, n=16)
 
     live_optimizer_steps = model.policy.optimizer.steps
     ol._run_update()
@@ -259,12 +259,12 @@ def test_gradient_steps_never_touch_the_live_optimizer(fake_torch):
     )
 
 
-def test_publish_is_the_only_mutation_and_is_atomic(fake_torch):
+def test_publish_is_the_only_mutation_and_is_atomic(fake_torch, accepting_updates):
     """Observe the live weights from a concurrent reader while publishing."""
     import trading_agent.integration.online_learner as ol
     _reset_learner(ol)
     model, registry, tmp = fake_torch
-    _seed(ol, n=8)
+    _seed(ol, n=16)
 
     seen = []
     stop = threading.Event()
@@ -298,7 +298,7 @@ def test_failed_update_does_not_corrupt_the_live_policy(fake_torch, monkeypatch)
     import trading_agent.integration.online_learner as ol
     _reset_learner(ol)
     model, registry, _ = fake_torch
-    _seed(ol, n=8)
+    _seed(ol, n=16)
 
     live_before = list(model.policy.state_dict()["w"])
     generation_before = registry.generation
@@ -315,10 +315,10 @@ def test_failed_update_does_not_corrupt_the_live_policy(fake_torch, monkeypatch)
     assert any(e["event"] == "failed" for e in ol.get_retrain_log())
 
 
-def test_update_slot_is_released_on_success(fake_torch):
+def test_update_slot_is_released_on_success(fake_torch, accepting_updates):
     import trading_agent.integration.online_learner as ol
     _reset_learner(ol)
-    _seed(ol, n=8)
+    _seed(ol, n=16)
     ol._run_update()
     assert ol._is_training is False
     assert ol._total_updates == 1
@@ -366,7 +366,7 @@ def test_only_one_update_thread_can_claim_the_slot(fake_torch):
     """
     import trading_agent.integration.online_learner as ol
     _reset_learner(ol)
-    _seed(ol, n=8)
+    _seed(ol, n=16)
 
     claims = []
     inside = threading.Event()
