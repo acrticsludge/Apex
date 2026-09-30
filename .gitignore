@@ -22,4 +22,9 @@ dist/
 # cash balances into the repo.
 apex.log
 *.log
+# RotatingFileHandler backups. '*.log' does not match 'apex.log.1', and these
+# carry the same position sizes and entry prices as the live log — apex.log.1
+# was committed by accident before this rule existed.
+*.log.*
+!*.log.example
 apex_dual_state.json
