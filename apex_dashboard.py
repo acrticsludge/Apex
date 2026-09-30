@@ -16,6 +16,7 @@ Controls everything end-to-end:
 import threading
 import json
 import os
+import sys
 
 try:
     from dotenv import load_dotenv
@@ -2876,9 +2877,28 @@ else:
 
 if __name__ == "__main__":
     import webbrowser
+
+    # The startup banner and the cycle logs contain box-drawing and arrow
+    # characters. A Windows console defaults to cp1252, which cannot encode
+    # them, so an unguarded print raises UnicodeEncodeError and the process
+    # dies before the server ever binds. Logging is unaffected — it writes to
+    # apex.log with an explicit utf-8 FileHandler — but stdout is not ours, so
+    # reconfigure it and let unencodable characters degrade instead of
+    # killing startup. No-op on a UTF-8 console.
+    for _stream in ("stdout", "stderr"):
+        _s = getattr(sys, _stream, None)
+        if _s is None:
+            continue
+        try:
+            _s.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError) as _enc_err:
+            # No-op on a UTF-8 console; on a non-reconfigurable stream the banner
+            # below still prints because it is pure ASCII.
+            print(f"[apex] stdout encoding unchanged ({_enc_err})", file=sys.stderr)
+
     # _on_startup() already ran at import time; no need to reload state here.
     url = "http://localhost:7000"
-    print(f"\n  Apex Dashboard  →  {url}")
+    print(f"\n  Apex Dashboard  ->  {url}")
     print("  Press Ctrl+C to stop\n")
     threading.Timer(1.2, lambda: webbrowser.open(url)).start()
     app.run(host="0.0.0.0", port=7000, debug=False,
