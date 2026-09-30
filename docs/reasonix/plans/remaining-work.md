@@ -19,7 +19,7 @@ engineering work that can be planned and executed against the test suite.
 | Security | Auth fails closed; all client-writable values validated; 20 advisories cleared |
 | Supply chain | 22 exact pins with constraint tests; Dependabot; pip-audit gates CI |
 | CI | 3 jobs: suite, import-order assertion + audit, Docker build + secret scan |
-| Tests | 396 cases green locally on the pinned stack and on CI, including the entry decision, the Supabase path and the model artifacts |
+| Tests | 421 cases green locally on the pinned stack and on CI, covering the entry decision, the Supabase path, model artifacts, the learner validation gate and execution costs |
 | Deployment | **never deployed.** The changes have not run against a live market. |
 | Documentation | architecture overview, 5 ADRs, runbook (this cycle) |
 
@@ -175,12 +175,36 @@ correctness risk; all of it slows the next change.
       **Watch `rejected_updates`** in `/api/retrain/log`. A run of rejections is
       the gate working. A persistently high count with no acceptances means the
       learner is not learning and the feature set is the likely problem.
-- [ ] **Model slippage, not just commission.** `commission_pct` (0.06% per side)
-      is deducted correctly, but every fill happens at the quoted price. Real
-      fills do not, especially in thinner names, so paper P&L is optimistic and
-      position sizing is calibrated against a number the market will not
-      reproduce. A `slippage_pct` cfg entry plus one line in `execute_buy` /
-      `execute_short` is enough to make the performance numbers honest.
+- [x] **Model slippage, not just commission.** `commission_pct` (0.06% per side)
+      was deducted correctly, but every fill happened at the quoted price. Real
+      fills do not, so paper P&L was optimistic by roughly the round-trip spread
+      — and the position cap, daily loss limit and drawdown kill-switch are all
+      calibrated against that number.
+      Now applied in `_fill_price()` as a **fill price** rather than as a fee:
+      `execute_buy` and `execute_cover` fill above the quote, `execute_sell` and
+      `execute_short` below. Everything downstream — position sizing, the cash
+      guard, stop, target, running high/low, the recorded entry — uses the fill,
+      so a long round trip pays slippage once on entry and once on exit with no
+      extra bookkeeping. Default 5bps per side (`slippage_pct`), editable in the
+      settings panel and bounded to [0, 0.05] by `apex_config`.
+      Modelling it as a fill price rather than a fee is deliberate: it is what
+      makes both sides land in P&L. See the commission asymmetry below for the
+      contrast.
+- [ ] **Charge entry commission to P&L.** Found while testing slippage, and
+      pre-existing. Entry commission is deducted from cash when a position opens,
+      but `realised_pnl` is computed from the exit side only
+      (`net_proceeds - entry * qty`). So the entry cost never reaches
+      `realised_pnl`, the win/loss counters, the daily loss limit or the
+      drawdown kill-switch — all four read one side cheaper than the trade
+      actually was. `test_entry_commission_is_missing_from_realised_pnl` pins the
+      current behaviour so a fix lands as a visible change rather than a silent
+      one. **Not fixed here**: it alters reported performance and the kill-switch
+      thresholds, which is a decision for the operator, not a refactor.
+- [ ] **Indian transaction costs are understated.** Indian equity carries STT
+      (~0.1% on the buy side for delivery), stamp duty and GST. The model applies
+      a single global 0.06% commission to both markets, so India is cheaper than
+      it is and the US is about right. Any conclusion drawn from the India
+      ledger is currently too favourable.
 - [ ] **Adopt a lockfile** (`uv.lock` or `pip-compile`) so the transitive graph
       is hash-verified rather than inferred from exact pins. See ADR-005.
 - [ ] **Add mutation testing** on the risk gates. A test that asserts a gate is

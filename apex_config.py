@@ -32,6 +32,11 @@ CONFIG_BOUNDS: dict = {
     "open_filter_min":           (int,   0,       240),
     "cooldown_after_sl_min":     (int,   0,       1440),
     "commission_pct":            (float, 0.0,     0.05),
+    # Slippage is a cost, not a rebate. The floor of 0.0 still permits turning it
+    # off, which is allowed because it is a modelling assumption the operator may
+    # legitimately want to see the effect of — but a negative value would make
+    # every trade profitable, so it is rejected rather than clamped.
+    "slippage_pct":              (float, 0.0,     0.05),
     "max_position_pct":          (float, 0.01,    1.0),
 }
 

@@ -17,6 +17,7 @@ import threading
 import json
 import os
 import sys
+from math import isfinite as _isfinite
 
 try:
     from dotenv import load_dotenv
@@ -130,6 +131,11 @@ cfg = {
     # ── Trade hygiene ────────────────────────────────────────────────────────
     "cooldown_after_sl_min":    60,   # re-entry blocked for 60 min after a stop-loss
     "commission_pct":        0.0006,  # 0.06% per side (buy + sell)
+    # Slippage: fills do not happen at the quote. 5bps per side, so a round trip
+    # costs ~10bps. Without this, paper P&L is optimistic and the position cap,
+    # daily loss limit and drawdown kill-switch are all calibrated against a
+    # number the market will not reproduce. Editable in the settings panel.
+    "slippage_pct":          0.0005,
     # ── Short selling ─────────────────────────────────────────────────────────
     "short_selling_enabled":       True,
     "short_confidence_threshold":    75,  # bearish confidence needed to short (0–100)
@@ -1019,6 +1025,35 @@ def _check_session_rotation(prices: dict):
 
 # ─── TRADE EXECUTION ──────────────────────────────────────────────────────────
 
+def _fill_price(price: float, direction: str) -> float:
+    """The price an order actually fills at, after slippage.
+
+    A buy pays up; a sell receives less. Recording the fill rather than the
+    quote is what makes slippage propagate: entry, stop, target, running
+    high/low and the cash guard all derive from what was really paid or
+    received, so a long round trip pays slippage once on entry and once on
+    exit, which is what a market would charge.
+
+    This is the only place slippage is applied. Four call sites each computing
+    their own adjustment is how one of them eventually ends up inverted, which
+    would make the cost a rebate.
+
+    A negative or non-finite setting is ignored rather than clamped: a negative
+    value would make every trade profitable, and silently clamping hides the
+    mistake. The cost can also not be allowed to drive a fill to zero or below,
+    which would corrupt every downstream calculation.
+    """
+    try:
+        slip = float(cfg.get("slippage_pct", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return price
+    if not _isfinite(slip) or slip <= 0:
+        return price
+    # Bound to below 100% so a bad setting cannot invert or zero the fill.
+    slip = min(slip, 0.5)
+    adj = price * (1.0 + slip) if direction == "buy" else price * (1.0 - slip)
+    return adj if adj > 0 else price
+
 def log_trade(mstate: dict, msg: str, kind: str):
     mstate["trade_log"].append({
         "time":    datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -1032,6 +1067,10 @@ def execute_buy(symbol: str, price: float, mstate: dict, atr: float = None, rcfg
     # rcfg is the effective config (base + this cycle's JEV gates). Defaulting to
     # cfg keeps ad-hoc/manual calls working.
     rcfg = rcfg if rcfg is not None else cfg
+    # Fill price, not quote: a buy pays up. Everything below — sizing, the cash
+    # guard, the stop, the target, the recorded entry — uses this price, so
+    # slippage is charged once here and once again on the matching sell.
+    price = _fill_price(price, "buy")
     # ── Position sizing: ATR-normalised risk, capped at max_position_pct ─────
     start_cash   = mstate.get("session_start_cash", price * 10)
     risk_dollars = start_cash * rcfg["risk_per_trade"]
@@ -1097,6 +1136,8 @@ def execute_buy(symbol: str, price: float, mstate: dict, atr: float = None, rcfg
 def execute_short(symbol: str, price: float, mstate: dict, atr: float = None, rcfg: dict | None = None):
     """Open a short position: sell-to-open, profit when price falls."""
     rcfg = rcfg if rcfg is not None else cfg
+    # Sell-to-open fills below the quote, and the matching cover fills above it.
+    price = _fill_price(price, "sell")
     start_cash   = mstate.get("session_start_cash", price * 10)
     risk_dollars = start_cash * rcfg["risk_per_trade"]
     atr_sl_mult  = cfg["atr_sl_mult"]
@@ -1185,6 +1226,9 @@ def execute_sell(symbol: str, price: float, reason: str, mstate: dict):
     pos = mstate["positions"].get(symbol)
     if not pos:
         return
+    # A sell receives less than the quote. Charged against the recorded entry,
+    # which was itself a slipped fill, so a flat round trip costs 2x slippage.
+    price = _fill_price(price, "sell")
     proceeds   = pos["qty"] * price
     commission = proceeds * cfg.get("commission_pct", 0.0)
     net_proceeds = proceeds - commission
@@ -1219,6 +1263,8 @@ def execute_cover(symbol: str, price: float, reason: str, mstate: dict):
     pos = mstate["positions"].get(symbol)
     if not pos or pos.get("side") != "short":
         return
+    # Buy-to-cover fills above the quote.
+    price = _fill_price(price, "buy")
     gross_pnl  = (pos["entry"] - price) * pos["qty"]    # positive when price fell
     commission = price * pos["qty"] * cfg.get("commission_pct", 0.0)
     net_pnl    = gross_pnl - commission
